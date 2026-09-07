@@ -1,0 +1,100 @@
+Screen {
+    layout: vertical;
+    background: $background;
+}
+
+#topbar {
+    height: 3;
+    padding: 0 2;
+    background: $surface;
+    border-bottom: solid $panel;
+    layout: horizontal;
+}
+#brand {
+    width: auto;
+    content-align: left middle;
+    height: 3;
+}
+#status {
+    width: 1fr;
+    content-align: right middle;
+    height: 3;
+}
+
+#urlbar {
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+    background: $surface;
+}
+
+#files {
+    height: 1fr;
+    margin: 0 1;
+    scrollbar-size: 1 1;
+}
+DataTable > .datatable--header {
+    background: $background;
+    color: $text-muted;
+    text-style: none;
+}
+DataTable > .datatable--cursor {
+    background: $primary 25%;
+    color: $text;
+}
+DataTable:focus > .datatable--cursor {
+    background: $primary 45%;
+}
+
+#empty {
+    height: 1fr;
+    content-align: center middle;
+    color: $text-muted;
+    display: none;
+}
+#empty.show { display: block; }
+#files.hide { display: none; }
+
+#dropzone {
+    height: 4;
+    margin: 0 1;
+    padding: 0 1;
+    border: round $panel;
+}
+#dropzone.armed { border: round $primary; }
+#dropzone.busy  { border: round $warning; }
+#drophint {
+    height: 1;
+    color: $text-muted;
+}
+#dropinput {
+    height: 1;
+    border: none;
+    padding: 0;
+    background: transparent;
+}
+#dropinput:focus { border: none; background: transparent; }
+Input > .input--placeholder { color: $text-muted 60%; }
+
+/* modals */
+ModalScreen { align: center middle; }
+.dialog {
+    width: auto;
+    min-width: 48;
+    max-width: 90%;
+    height: auto;
+    padding: 1 2;
+    background: $surface;
+    border: round $primary;
+}
+.dialog > .title { text-style: bold; margin-bottom: 1; }
+.dialog > .hint  { color: $text-muted; margin-top: 1; }
+.dialog OptionList { height: auto; max-height: 14; border: none; background: transparent; }
+.dialog .buttons { layout: horizontal; height: 3; margin-top: 1; align: right middle; }
+.dialog Button { margin-left: 1; min-width: 10; }
+#qr { width: auto; height: auto; }
+
+Help .dialog { width: 78; }
+PickPeer .dialog { width: 56; }
+Confirm .dialog { width: 64; }
+ShowQR .dialog { width: auto; }
