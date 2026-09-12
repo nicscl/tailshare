@@ -38,9 +38,10 @@ def cmd_status(_):
     print(f"share dir   {core.SHARE_DIR}  ({len(core.list_shared())} files)")
     print(f"server      {srv} on 127.0.0.1:{core.PORT}  launchd: {'loaded' if daemon.loaded() else 'not loaded'}")
     print(f"tailscale   {'ok · ' + ts.dns_name if ts.ok else 'offline · ' + ts.error}")
-    print(f"serve       {'/ → :%d' % core.PORT if core.serve_configured() else 'not configured'}")
+    routes = core.serve_routes() or {}
+    print(f"serve       http/80 {'ok' if routes.get('ip') else 'MISSING'} · https/443 {'ok' if routes.get('dns') else 'MISSING'}  (fix: tailshare install)")
     if ts.ok:
-        print(f"url         {ts.base_url}")
+        print(f"links       {ts.base_url}   [{core.LINK_MODE}; TAILSHARE_LINKS=dns for {ts.dns_url}]")
 
 
 def cmd_ls(_):

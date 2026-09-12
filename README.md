@@ -12,15 +12,19 @@ tailshare install    # one-time: launchd agent + tailscale serve
 ```
 iTerm2 drop / clipboard ──▶ ~/Public/ts-share ──▶ 127.0.0.1:8787 (tailshare serve)
                                                          │
-                                        tailscale serve ─┴─▶ https://macbook-air.<tailnet>.ts.net/
+                          tailscale serve --tcp=80 ──────┼─▶ http://100.x.y.z/          (default links)
+                          tailscale serve (https 443) ───┴─▶ https://macbook-air.<tailnet>.ts.net/
 ```
 
+* Links default to the tailnet IP (`http://100.x.y.z/file`), which works on any device with
+  no MagicDNS dependency. Press `L` in the TUI, or set `TAILSHARE_LINKS=dns`, for
+  `https://macbook-air.<tailnet>.ts.net/file` instead. Both routes are always configured.
 * Files land in `~/Public/ts-share` (override with `TAILSHARE_DIR`).
 * `tailshare serve` is a small HTTP server bound to localhost, with an index page that
   works on phones. `tailscale serve` fronts it with HTTPS, tailnet-only.
 * `tailshare install` writes `~/Library/LaunchAgents/com.nicholas.tailshare.plist`
-  (KeepAlive, RunAtLoad) so the server survives reboots, and points `tailscale serve /`
-  at the port. Logs: `~/Library/Logs/tailshare.log`.
+  (KeepAlive, RunAtLoad) so the server survives reboots, and sets up `tailscale serve`:
+  a raw TCP forward on port 80 (IP links) and the HTTPS proxy on 443 (DNS links). Logs: `~/Library/Logs/tailshare.log`.
 
 ## TUI
 
@@ -36,6 +40,7 @@ iTerm2 drop / clipboard ──▶ ~/Public/ts-share ──▶ 127.0.0.1:8787 (ta
 | `r` | reveal in Finder |
 | `⌫` | stop sharing (deletes the copy) |
 | `S` | start / restart the share server |
+| `L` | toggle IP / DNS links |
 | `?` | help · `q` quit |
 
 Folders are zipped before sharing. Name collisions get a `-2`, `-3` suffix.

@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .core import PORT, configure_serve, pids_on_port, serve_configured, server_status
+from .core import PORT, configure_serve, pids_on_port, serve_routes, server_status
 
 LABEL = "com.nicholas.tailshare"
 PLIST = Path("~/Library/LaunchAgents").expanduser() / f"{LABEL}.plist"
@@ -84,7 +84,8 @@ def start() -> tuple[bool, str]:
     else:
         return False, f"server did not come up; see {LOG}"
     notes.append("server running under launchd")
-    if not serve_configured():
+    routes = serve_routes()
+    if routes is None or not all(routes.values()):
         ok, msg = configure_serve()
         notes.append(msg if ok else f"tailscale serve failed: {msg}")
     return True, "; ".join(notes)

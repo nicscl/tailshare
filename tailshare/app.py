@@ -119,6 +119,7 @@ class Help(ModalScreen[None]):
 
 [b]Other[/b]
   [b]u[/b] · [b]U[/b]       copy · open the index page (all files)
+  [b]L[/b]           switch links between http://<tailnet ip>/ and https://<name>.ts.net/
   [b]S[/b]           start / restart the share server (launchd)
   [b]R[/b]  refresh          [b]/[/b]  type a path          [b]q[/b]  quit"""
 
@@ -162,6 +163,7 @@ class TailshareApp(App[None]):
         Binding("backspace", "delete", "delete", show=True, key_display="⌫"),
         Binding("delete", "delete", "delete", show=False),
         Binding("slash", "focus_input", "path", show=True, key_display="/"),
+        Binding("L", "toggle_links", "ip/dns links", show=False),
         Binding("u", "copy_index", "copy index url", show=False),
         Binding("U", "open_index", "open index", show=False),
         Binding("S", "start_server", "server", show=False),
@@ -177,6 +179,7 @@ class TailshareApp(App[None]):
         self.ts: core.TailscaleInfo = core.TailscaleInfo(False, error="…")
         self.srv: str = "…"
         self.serve_ok: bool | None = None
+        self.link_mode: str = core.LINK_MODE
         self._busy = 0
 
     # -- layout ---------------------------------------------------------------
@@ -261,14 +264,17 @@ class TailshareApp(App[None]):
     def refresh_status(self) -> None:
         srv = core.server_status()
         ts = core.tailscale_info()
-        serve_ok = core.serve_configured() if ts.ok else None
-        self.call_from_thread(self._apply_status, srv, ts, serve_ok)
+        ts.link_mode = self.link_mode
+        routes = core.serve_routes() if ts.ok else None
+        self.call_from_thread(self._apply_status, srv, ts, routes)
 
     @property
     def links_work(self) -> bool:
         return self.ts.ok and self.srv != "down" and self.serve_ok is not False
 
-    def _apply_status(self, srv: str, ts: core.TailscaleInfo, serve_ok: bool | None) -> None:
+    def _apply_status(self, srv: str, ts: core.TailscaleInfo, routes: dict[str, bool] | None) -> None:
+        self.routes = routes
+        serve_ok = None if routes is None else routes["dns" if self.link_mode == "dns" else "ip"]
         self.srv, self.ts, self.serve_ok = srv, ts, serve_ok
         if srv == "ours":
             s = "[green]●[/] server"
@@ -288,7 +294,10 @@ class TailshareApp(App[None]):
     def _update_urlbar(self) -> None:
         n = len(self.files)
         url = self.ts.base_url or "tailscale offline"
-        self.query_one("#urlbar", Static).update(f"{url}   [dim]·   {n} file{'s' if n != 1 else ''}   ·   u copy · U open[/]")
+        mode = "ip · L for dns" if self.link_mode != "dns" else "dns · L for ip"
+        self.query_one("#urlbar", Static).update(
+            f"{url}   [dim]·   {n} file{'s' if n != 1 else ''}   ·   {mode}   ·   u copy · U open[/]"
+        )
 
     def _url(self, f: SharedFile) -> str:
         return core.url_for(self.ts.base_url, f.name)
@@ -454,6 +463,14 @@ class TailshareApp(App[None]):
         if f is None or not self._need_ts():
             return
         self.push_screen(ShowQR(self._url(f), f.name))
+
+    def action_toggle_links(self) -> None:
+        self.link_mode = "dns" if self.link_mode != "dns" else "ip"
+        self.ts.link_mode = self.link_mode
+        routes = getattr(self, "routes", None)
+        self.serve_ok = None if routes is None else routes[self.link_mode]
+        self._update_urlbar()
+        self.notify(f"Links now use {escape(self.ts.base_url)}", timeout=2.5)
 
     def action_copy_index(self) -> None:
         if self._need_ts():

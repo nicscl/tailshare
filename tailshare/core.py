@@ -19,6 +19,8 @@ from pathlib import Path
 
 SHARE_DIR = Path(os.environ.get("TAILSHARE_DIR", "~/Public/ts-share")).expanduser()
 PORT = int(os.environ.get("TAILSHARE_PORT", "8787"))
+# "ip" → http://100.x.y.z/ (works everywhere, no DNS needed); "dns" → https://host.tailnet.ts.net/
+LINK_MODE = os.environ.get("TAILSHARE_LINKS", "ip").lower()
 HEALTH_PATH = "/__health"
 HEALTH_BODY = "tailshare ok"
 
@@ -301,9 +303,19 @@ class TailscaleInfo:
     peers: list[Peer] | None = None
     error: str = ""
 
+    link_mode: str = LINK_MODE
+
+    @property
+    def ip_url(self) -> str:
+        return f"http://{self.ip}/" if self.ip else ""
+
+    @property
+    def dns_url(self) -> str:
+        return f"https://{self.dns_name}/" if self.dns_name else ""
+
     @property
     def base_url(self) -> str:
-        return f"https://{self.dns_name}/" if self.dns_name else ""
+        return self.dns_url if self.link_mode == "dns" else (self.ip_url or self.dns_url)
 
 
 def _run_ts(*args: str, timeout: float = 15) -> subprocess.CompletedProcess:
@@ -354,8 +366,8 @@ def url_for(base_url: str, name: str) -> str:
     return base_url + urllib.parse.quote(name)
 
 
-def serve_configured() -> bool | None:
-    """True if `tailscale serve` maps / to our port. None if unknown."""
+def serve_routes() -> dict[str, bool] | None:
+    """Which `tailscale serve` routes reach our port: {"ip": tcp/80 forward, "dns": https/443 proxy}."""
     try:
         cp = _run_ts("serve", "status", "--json", timeout=8)
     except Exception:
@@ -366,21 +378,41 @@ def serve_configured() -> bool | None:
         cfg = json.loads(cp.stdout or "{}")
     except json.JSONDecodeError:
         return None
-    for host in (cfg.get("Web") or {}).values():
-        for path, h in (host.get("Handlers") or {}).items():
+    dns = False
+    for host, web in (cfg.get("Web") or {}).items():
+        if not host.endswith(":443"):
+            continue
+        for path, h in (web.get("Handlers") or {}).items():
             if path == "/" and str(h.get("Proxy", "")).endswith(f":{PORT}"):
-                return True
-    return False
+                dns = True
+    tcp80 = (cfg.get("TCP") or {}).get("80") or {}
+    ip = str(tcp80.get("TCPForward", "")).endswith(f":{PORT}")
+    return {"ip": ip, "dns": dns}
+
+
+def serve_configured() -> bool | None:
+    """True if the route for the active link mode reaches our port. None if unknown."""
+    routes = serve_routes()
+    if routes is None:
+        return None
+    return routes["dns" if LINK_MODE == "dns" else "ip"]
 
 
 def configure_serve() -> tuple[bool, str]:
-    try:
-        cp = _run_ts("serve", "--bg", "--yes", f"http://127.0.0.1:{PORT}", timeout=20)
-    except Exception as e:  # noqa: BLE001
-        return False, str(e)
-    if cp.returncode != 0:
-        return False, (cp.stderr or cp.stdout).strip()
-    return True, "tailscale serve → / → 127.0.0.1:%d" % PORT
+    """Ensure both routes: https://<dns>/ (443 proxy) and http://<ip>/ (raw TCP forward on 80)."""
+    notes = []
+    for label, args in (
+        ("https 443", ("serve", "--bg", "--yes", f"http://127.0.0.1:{PORT}")),
+        ("http 80", ("serve", "--bg", "--yes", "--tcp=80", f"tcp://127.0.0.1:{PORT}")),
+    ):
+        try:
+            cp = _run_ts(*args, timeout=20)
+        except Exception as e:  # noqa: BLE001
+            return False, f"{label}: {e}"
+        if cp.returncode != 0:
+            return False, f"{label}: {(cp.stderr or cp.stdout).strip()}"
+        notes.append(label)
+    return True, "tailscale serve routed (%s) → 127.0.0.1:%d" % (", ".join(notes), PORT)
 
 
 def taildrop_send(path: Path, peer: Peer) -> tuple[bool, str]:
