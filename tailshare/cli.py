@@ -36,7 +36,11 @@ def cmd_status(_):
     ts = core.tailscale_info()
     srv = core.server_status()
     print(f"share dir   {core.SHARE_DIR}  ({len(core.list_shared())} files)")
-    print(f"server      {srv} on 127.0.0.1:{core.PORT}  launchd: {'loaded' if daemon.loaded() else 'not loaded'}")
+    print(f"server      {srv} on {core.BIND}:{core.PORT}  launchd: {'loaded' if daemon.loaded() else 'not loaded'}")
+    if core.BASE_URL:  # no tailscale CLI / serve; the server is bound to a tailnet IP directly
+        print(f"tailscale   links set by TAILSHARE_BASE_URL (bound to {core.BIND})")
+        print(f"links       {core.BASE_URL}")
+        return
     print(f"tailscale   {'ok · ' + ts.dns_name if ts.ok else 'offline · ' + ts.error}")
     routes = core.serve_routes() or {}
     print(f"serve       http/80 {'ok' if routes.get('ip') else 'MISSING'} · https/443 {'ok' if routes.get('dns') else 'MISSING'}  (fix: tailshare install)")
@@ -78,9 +82,14 @@ def cmd_paste(args):
 
 
 def cmd_rm(args):
+    failed = False
     for name in args.names:
-        core.remove_shared(name)
-        print(f"removed {name}")
+        if core.remove_shared(name):
+            print(f"removed {name}")
+        else:
+            print(f"✗ not shared: {name}", file=sys.stderr)
+            failed = True
+    sys.exit(1 if failed else 0)
 
 
 def cmd_url(args):
