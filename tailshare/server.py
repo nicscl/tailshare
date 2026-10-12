@@ -1,4 +1,4 @@
-"""Local HTTP server for the share folder. Bound to 127.0.0.1; tailscale serve fronts it."""
+"""Local HTTP server for the share folder. Bound to 127.0.0.1 by default; tailscale serve fronts it."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import __version__
-from .core import HEALTH_BODY, HEALTH_PATH, PORT, SharedFile, ensure_share_dir, human_size, list_shared
+from .core import BIND, HEALTH_BODY, HEALTH_PATH, PORT, SharedFile, ensure_share_dir, human_size, list_shared
 
 INDEX_CSS = """
 :root{color-scheme:dark light;--bg:#0f1115;--fg:#e6e6e6;--mut:#8b90a0;--card:#171a21;--line:#252a35;--acc:#7dd3fc}
@@ -145,7 +145,7 @@ class Handler(SimpleHTTPRequestHandler):
         sys.stderr.write("%s %s %s\n" % (datetime.now().strftime("%H:%M:%S"), self.address_string(), fmt % args))
 
 
-def serve(port: int = PORT, bind: str = "127.0.0.1") -> None:
+def serve(port: int = PORT, bind: str = BIND) -> None:
     root = ensure_share_dir()
     httpd = ThreadingHTTPServer((bind, port), partial(Handler, directory=str(root)))
     httpd.daemon_threads = True

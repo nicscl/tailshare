@@ -122,6 +122,31 @@ tailshare status                        # server, launchd, tailscale, serve rout
 
 Set them before `tailshare install` so the launchd agent picks them up.
 
+## On an iPad (iSH)
+
+tailshare also runs inside [iSH](https://ish.app) on iOS, TUI included. There is no Tailscale CLI
+there, so instead of `tailscale serve` the server binds the iPad's tailnet IP directly (iOS lets iSH
+bind port 80). The server and TUI run only while iSH is in the foreground.
+
+```sh
+apk add python3 py3-pip && pip install --break-system-packages textual qrcode   # in iSH
+mkdir -p ~/tailshare && cd ~/tailshare           # copy the tailshare/ package folder here
+export TAILSHARE_BIND=100.x.y.z TAILSHARE_PORT=80 TAILSHARE_BASE_URL=http://100.x.y.z/
+export TAILSHARE_DIR=~/ts-share PYTHONPATH=~/tailshare TAILSHARE_POLL=5
+python3 -m tailshare                             # TUI; S starts the server, links are http://100.x.y.z/<file>
+```
+
+**Drag and drop on the iPad** goes through the Files app: iSH publishes its filesystem there, so open
+Files next to iSH in Split View and drop files onto *iSH › root › ts-share*. They are copied into
+iSH and appear in the TUI and on the index within a few seconds. Copying a link uses the iOS
+clipboard via `/dev/clipboard`. Reveal, Taildrop and launchd are not available on iOS and say so.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `TAILSHARE_BIND` | `127.0.0.1` | address the share server listens on |
+| `TAILSHARE_BASE_URL` | *(unset)* | link prefix to use when there is no Tailscale CLI, e.g. `http://100.x.y.z/` |
+| `TAILSHARE_POLL` | `2` | seconds between share-folder refreshes in the TUI; raise on slow hosts |
+
 ## Troubleshooting
 
 - **Link opens on the phone but not in Chrome on the Mac.** Chrome's Secure DNS can hide MagicDNS

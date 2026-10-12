@@ -8,6 +8,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,8 +20,21 @@ from pathlib import Path
 
 SHARE_DIR = Path(os.environ.get("TAILSHARE_DIR", "~/Public/ts-share")).expanduser()
 PORT = int(os.environ.get("TAILSHARE_PORT", "8787"))
+# Address the share server listens on. Default is loopback with `tailscale serve` in front.
+# On hosts without the Tailscale CLI (an iPad running iSH, say) bind the tailnet IP directly.
+BIND = os.environ.get("TAILSHARE_BIND", "127.0.0.1")
+# Where links should point when we cannot ask the Tailscale CLI, e.g. http://100.x.y.z/
+BASE_URL = os.environ.get("TAILSHARE_BASE_URL", "").strip()
+if BASE_URL and not BASE_URL.endswith("/"):
+    BASE_URL += "/"
 # "ip" → http://100.x.y.z/ (works everywhere, no DNS needed); "dns" → https://host.tailnet.ts.net/
 LINK_MODE = os.environ.get("TAILSHARE_LINKS", "ip").lower()
+# How often the TUI re-reads the share folder (seconds). Raise it on slow hosts such as iSH.
+POLL = float(os.environ.get("TAILSHARE_POLL", "2"))
+# A file whose mtime is this recent may still be being written (e.g. a Files-app drop on iOS).
+SETTLE = 1.0
+IS_MAC = sys.platform == "darwin"
+ISH_CLIPBOARD = Path("/dev/clipboard")  # iSH on iOS exposes the system pasteboard here
 HEALTH_PATH = "/__health"
 HEALTH_BODY = "tailshare ok"
 
@@ -101,6 +115,8 @@ def list_shared() -> list[SharedFile]:
         if p.name.startswith(".") or p.is_symlink() or not p.is_file():
             continue
         st = p.stat()
+        if time.time() - st.st_mtime < SETTLE and p.name not in _published:
+            continue  # still being written (renamed-in-place publishes are complete)
         out.append(SharedFile(p.name, st.st_size, st.st_mtime))
     out.sort(key=lambda f: f.mtime, reverse=True)
     return out
@@ -122,6 +138,7 @@ def unique_dest(name: str) -> Path:
 
 
 _publish_lock = threading.Lock()
+_published: set[str] = set()  # names this process moved into place; never half-written
 
 
 def _publish(stage: Path, name: str) -> SharedFile:
@@ -131,6 +148,7 @@ def _publish(stage: Path, name: str) -> SharedFile:
         now = time.time()
         os.utime(stage, (now, now))  # "newest first" reflects share time, not source mtime
         os.replace(stage, dest)
+        _published.add(dest.name)
     st = dest.stat()
     return SharedFile(dest.name, st.st_size, st.st_mtime)
 
@@ -165,10 +183,16 @@ def add_path(src: Path) -> SharedFile:
         raise
 
 
-def remove_shared(name: str) -> None:
+def remove_shared(name: str) -> bool:
+    """Delete a shared copy. Returns False if there is no such shared file."""
+    if not name or "/" in name or name.startswith("."):
+        return False
     p = SHARE_DIR / name
-    if p.is_file():
-        p.unlink()
+    if p.is_symlink() or not p.is_file():
+        return False
+    p.unlink()
+    _published.discard(name)
+    return True
 
 
 def parse_dropped_paths(text: str) -> tuple[list[Path], list[str]]:
@@ -259,13 +283,14 @@ def relative_time(ts: float) -> str:
 
 def server_status(timeout: float = 0.6) -> str:
     """'ours' | 'other' | 'down' for whatever listens on PORT."""
+    host = "127.0.0.1" if BIND in ("", "0.0.0.0", "127.0.0.1") else BIND
     try:
-        with socket.create_connection(("127.0.0.1", PORT), timeout=timeout):
+        with socket.create_connection((host, PORT), timeout=timeout):
             pass
     except OSError:
         return "down"
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}{HEALTH_PATH}", timeout=timeout) as r:
+        with urllib.request.urlopen(f"http://{host}:{PORT}{HEALTH_PATH}", timeout=timeout) as r:
             return "ours" if r.read().decode().startswith(HEALTH_BODY) else "other"
     except Exception:
         return "other"
@@ -293,6 +318,13 @@ class Peer:
     online: bool
     taildrop: bool
 
+    @property
+    def label(self) -> str:
+        """Display name. iOS devices report HostName "localhost", so use the DNS name's first label."""
+        if self.hostname and self.hostname != "localhost":
+            return self.hostname
+        return self.dns.split(".")[0] or self.hostname
+
 
 @dataclass
 class TailscaleInfo:
@@ -315,6 +347,8 @@ class TailscaleInfo:
 
     @property
     def base_url(self) -> str:
+        if BASE_URL:
+            return BASE_URL
         return self.dns_url if self.link_mode == "dns" else (self.ip_url or self.dns_url)
 
 
@@ -326,6 +360,9 @@ def _run_ts(*args: str, timeout: float = 15) -> subprocess.CompletedProcess:
 
 def tailscale_info() -> TailscaleInfo:
     if not TAILSCALE:
+        if BASE_URL:  # no CLI, but links are configured by hand
+            host = urllib.parse.urlparse(BASE_URL).hostname or ""
+            return TailscaleInfo(True, self_name=socket.gethostname(), ip=host, peers=[])
         return TailscaleInfo(False, error="tailscale CLI not found")
     try:
         cp = _run_ts("status", "--json", timeout=8)
@@ -351,7 +388,7 @@ def tailscale_info() -> TailscaleInfo:
                 taildrop=p.get("TaildropTarget") in (1, "available", True),
             )
         )
-    peers.sort(key=lambda p: (not p.online, p.hostname.lower()))
+    peers.sort(key=lambda p: (not p.online, p.label.lower()))
     ips = me.get("TailscaleIPs") or [""]
     return TailscaleInfo(
         True,
@@ -423,7 +460,7 @@ def taildrop_send(path: Path, peer: Peer) -> tuple[bool, str]:
         return False, str(e)
     if cp.returncode != 0:
         return False, (cp.stderr or cp.stdout).strip()
-    return True, f"sent to {peer.hostname}"
+    return True, f"sent to {peer.label}"
 
 
 # --------------------------------------------------------------------------- clipboard (macOS)
@@ -438,6 +475,8 @@ def _osascript(*lines: str, timeout: float = 20) -> subprocess.CompletedProcess:
 
 def clipboard_kind() -> str:
     """'file' | 'image' | 'text' | 'empty'."""
+    if not IS_MAC:
+        return "text" if clipboard_text().strip() else "empty"
     cp = _osascript("clipboard info")
     info = cp.stdout
     if "furl" in info:
@@ -450,7 +489,14 @@ def clipboard_kind() -> str:
 
 
 def clipboard_text() -> str:
-    return subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    if IS_MAC:
+        return subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    if ISH_CLIPBOARD.exists():
+        try:
+            return ISH_CLIPBOARD.read_text(errors="replace")
+        except OSError:
+            return ""
+    return ""
 
 
 def clipboard_files() -> list[Path]:
@@ -513,12 +559,26 @@ def paste_clipboard() -> list[SharedFile]:
 
 
 def copy_to_clipboard(text: str) -> bool:
-    return subprocess.run(["pbcopy"], input=text, text=True, check=False).returncode == 0
+    if IS_MAC:
+        return subprocess.run(["pbcopy"], input=text, text=True, check=False).returncode == 0
+    if ISH_CLIPBOARD.exists():
+        try:
+            ISH_CLIPBOARD.write_text(text)
+            return True
+        except OSError:
+            return False
+    return False
 
 
-def reveal_in_finder(path: Path) -> None:
+def reveal_in_finder(path: Path) -> bool:
+    if not IS_MAC:
+        return False
     subprocess.Popen(["open", "-R", str(path)])
+    return True
 
 
-def open_url(url: str) -> None:
+def open_url(url: str) -> bool:
+    if not IS_MAC:
+        return False
     subprocess.Popen(["open", url])
+    return True

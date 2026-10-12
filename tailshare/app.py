@@ -62,7 +62,7 @@ class PickPeer(ModalScreen[Peer | None]):
             opts = []
             for i, p in enumerate(self._peers):
                 dot = "[green]●[/]" if p.online else "[dim]○[/]"
-                label = f"{dot} {p.hostname}  [dim]{p.os}{'' if p.online else ' · offline'}[/]"
+                label = f"{dot} {escape(p.label)}  [dim]{p.os}{'' if p.online else ' · offline'}[/]"
                 opts.append(Option(label, id=str(i), disabled=not p.online))
             yield OptionList(*opts)
             yield Static("↑↓ pick · enter send · esc", classes="hint")
@@ -206,8 +206,8 @@ class TailshareApp(App[None]):
         self._set_hint()
         self.refresh_files()
         self.refresh_status()
-        self.set_interval(2.0, self.refresh_files)
-        self.set_interval(6.0, self.refresh_status)
+        self.set_interval(core.POLL, self.refresh_files)
+        self.set_interval(core.POLL * 3, self.refresh_status)
 
     # -- state ---------------------------------------------------------------------
     @property
@@ -295,6 +295,8 @@ class TailshareApp(App[None]):
         n = len(self.files)
         url = self.ts.base_url or "tailscale offline"
         mode = "ip · L for dns" if self.link_mode != "dns" else "dns · L for ip"
+        if core.BASE_URL:
+            mode = "fixed link"
         self.query_one("#urlbar", Static).update(
             f"{url}   [dim]·   {n} file{'s' if n != 1 else ''}   ·   {mode}   ·   u copy · U open[/]"
         )
@@ -377,7 +379,7 @@ class TailshareApp(App[None]):
             self.notify(f"{len(results)} files shared\n[dim]link to {name} {'copied' if copied else 'not copied'}[/]", title="Shared", timeout=5)
         if self.srv == "down":
             self.notify("Share server is offline, so the link will not open yet. Press S to start it.", severity="warning", timeout=6)
-        elif self.serve_ok is False:
+        elif self.serve_ok is False and not core.BASE_URL:
             self.notify("tailscale serve is not routed to the server. Press S to fix it.", severity="warning", timeout=6)
 
     def _begin_busy(self, hint: str) -> None:
@@ -451,12 +453,14 @@ class TailshareApp(App[None]):
         f = self._need()
         if f is None or not self._need_ts():
             return
-        core.open_url(self._url(f))
+        if not core.open_url(self._url(f)):
+            core.copy_to_clipboard(self._url(f))
+            self.notify(f"Link copied. Paste it in a browser:\n[dim]{escape(self._url(f))}[/]", title="Cannot open here", timeout=5)
 
     def action_reveal(self) -> None:
         f = self._need()
-        if f:
-            core.reveal_in_finder(f.path)
+        if f and not core.reveal_in_finder(f.path):
+            self.notify(f"[dim]{escape(str(f.path))}[/]", title="Shared copy lives at", timeout=5)
 
     def action_qr(self) -> None:
         f = self._need()
@@ -465,6 +469,9 @@ class TailshareApp(App[None]):
         self.push_screen(ShowQR(self._url(f), f.name))
 
     def action_toggle_links(self) -> None:
+        if core.BASE_URL:
+            self.notify("Links are fixed by TAILSHARE_BASE_URL", timeout=2.5)
+            return
         self.link_mode = "dns" if self.link_mode != "dns" else "ip"
         self.ts.link_mode = self.link_mode
         routes = getattr(self, "routes", None)
@@ -478,8 +485,9 @@ class TailshareApp(App[None]):
             self.notify(escape(self.ts.base_url), title="Index link copied", timeout=3)
 
     def action_open_index(self) -> None:
-        if self._need_ts():
-            core.open_url(self.ts.base_url)
+        if self._need_ts() and not core.open_url(self.ts.base_url):
+            core.copy_to_clipboard(self.ts.base_url)
+            self.notify(f"Index link copied:\n[dim]{escape(self.ts.base_url)}[/]", title="Cannot open here", timeout=5)
 
     def action_help(self) -> None:
         self.push_screen(Help())
@@ -507,6 +515,9 @@ class TailshareApp(App[None]):
         f = self._need()
         if f is None or not self._need_ts():
             return
+        if core.TAILSCALE is None:
+            self.notify("Taildrop needs the tailscale CLI, which this device does not have", severity="warning")
+            return
         peers = [p for p in (self.ts.peers or []) if p.taildrop or p.online]
         if not peers:
             self.notify("No devices on the tailnet", severity="warning")
@@ -514,7 +525,7 @@ class TailshareApp(App[None]):
 
         def done(peer: Peer | None) -> None:
             if peer:
-                self._begin_busy(f"Sending {f.name} to {peer.hostname}…")
+                self._begin_busy(f"Sending {f.name} to {peer.label}…")
                 self._send_worker(f, peer)
 
         self.push_screen(PickPeer(peers, f.name), done)
