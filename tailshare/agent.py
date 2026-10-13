@@ -116,7 +116,7 @@ def detect(hook: dict | None = None) -> Identity:
 # --------------------------------------------------------------------------- client
 
 
-def call(path: str, payload: dict | None = None, timeout: float = 5.0) -> dict:
+def call(path: str, payload: dict | None = None, timeout: float = 15.0) -> dict:
     try:
         return bus.request(LOCAL + path, payload, timeout)
     except bus.BusError:

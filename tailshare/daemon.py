@@ -44,7 +44,8 @@ def write_plist() -> Path:
         "ProgramArguments": [sys.executable, "-m", "tailshare", "serve"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
+        # Not "Background": macOS runs those at priority 4, and agents wait on the mailbox.
+        "ProcessType": "Standard",
         "StandardOutPath": str(LOG),
         "StandardErrorPath": str(LOG),
         "EnvironmentVariables": {k: v for k, v in os.environ.items() if k.startswith("TAILSHARE_")},
