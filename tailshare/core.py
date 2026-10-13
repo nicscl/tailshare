@@ -31,6 +31,8 @@ if BASE_URL and not BASE_URL.endswith("/"):
 LINK_MODE = os.environ.get("TAILSHARE_LINKS", "ip").lower()
 # How often the TUI re-reads the share folder (seconds). Raise it on slow hosts such as iSH.
 POLL = float(os.environ.get("TAILSHARE_POLL", "2"))
+# "0" leaves `tailscale serve` alone, e.g. when the machine already serves something on 80/443.
+SERVE = os.environ.get("TAILSHARE_SERVE", "1") != "0"
 # A file whose mtime is this recent may still be being written (e.g. a Files-app drop on iOS).
 SETTLE = 1.0
 IS_MAC = sys.platform == "darwin"
@@ -42,6 +44,8 @@ _TS_CANDIDATES = (
     shutil.which("tailscale"),
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",  # Homebrew tailscaled (launchd's PATH does not include it)
+    "/opt/tailscale/tailscale",  # Steam Deck installs
 )
 TAILSCALE = next((p for p in _TS_CANDIDATES if p and Path(p).exists()), None)
 
