@@ -10,7 +10,7 @@ import json
 import os
 import sys
 
-from . import __version__, agent, bus
+from . import __version__, agent, bus, sessions, sessions_cli
 
 TOOLS = [
     {
@@ -48,6 +48,36 @@ TOOLS = [
         "name": "inbox",
         "description": "Read (and mark read) new messages from other agents. Optionally wait up to 50 s for one.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "number", "minimum": 0, "maximum": 50}}},
+    },
+    {
+        "name": "find_sessions",
+        "description": (
+            "Search past and current Claude Code and Codex sessions on every machine of the user's tailnet, by "
+            "words from their prompts, replies, name or folder. Empty query: the most recent. Each hit has a ref "
+            "(host:id) for ask_session, and `tailshare sessions open <ref>` resumes it in a terminal."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "host": {"type": "string", "description": "only machines matching this glob"},
+                "harness": {"type": "string", "enum": ["", "claude", "codex"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+        },
+    },
+    {
+        "name": "ask_session",
+        "description": (
+            "Ask another session (from find_sessions) a question about its work, e.g. why it chose something. "
+            "A throwaway copy of it answers with no tools; the original session is not changed. Takes up to a few minutes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session": {"type": "string", "description": "ref: host:id or an id prefix"},
+                           "question": {"type": "string"}},
+            "required": ["session", "question"],
+        },
     },
 ]
 
@@ -88,6 +118,14 @@ def _tool(name: str, args: dict) -> str:
         if not msgs:
             return "no new messages"
         return "\n\n".join(agent.format_message(m) for m in msgs) + f"\n\n({agent.NOTE})"
+    if name == "find_sessions":
+        d = sessions_cli.search(str(args.get("query") or ""), str(args.get("host") or ""),
+                                str(args.get("harness") or ""), limit=int(args.get("limit") or 15))
+        return sessions_cli.format_results(d)
+    if name == "ask_session":
+        r = agent.call("/sessions/ask", {"ref": args["session"], "question": args["question"], "from": me["address"]},
+                       timeout=sessions.ASK_TIMEOUT + 60)
+        return f"{r['host']}:{r['id'][:8]} {r.get('name') or ''} answered:\n\n{r['answer']}\n\n({agent.NOTE})"
     raise ValueError(f"unknown tool {name}")
 
 

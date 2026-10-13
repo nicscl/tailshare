@@ -295,6 +295,8 @@ def _hook_out(event: str, text: str) -> None:
 
 def cmd_hook(args):
     """Claude Code hook entry point. Must never fail loudly or block the session."""
+    if os.environ.get("TAILSHARE_HOOKS") == "0":  # a throwaway session tailshare started to answer a question
+        sys.exit(0)
     try:
         data = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:

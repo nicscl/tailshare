@@ -265,6 +265,7 @@ class Bus:
         self._peer_ip = ""
         self._pruned = 0.0
         self.updater = None  # set by start_bus when self-update is available
+        self.sessions = None  # set by start_bus: sessions.Sessions (index, search, ask, launch)
 
     # -- agents ---------------------------------------------------------------
     def register(self, a: dict) -> dict:
@@ -481,12 +482,16 @@ class Bus:
 
         if self.updater is None or not ENABLED:
             raise BusError("auto-update is off on this machine", 409)
+        self.require_same_user(ip)
+        return self.updater.trigger()
+
+    def require_same_user(self, ip: str) -> None:
+        """Only machines owned by this machine's tailnet user may update it or read its sessions."""
         if self.net.user_for_ip(ip) is None:
             self.net.refresh()
         who = self.net.user_for_ip(ip)
         if not who or who != self.net.user:
             raise BusError(f"{ip} belongs to {who or 'nobody on this tailnet'}, not {self.net.user}", 403)
-        return self.updater.trigger()
 
     def update(self, everywhere: bool) -> dict:
         """`tailshare update [--all]`: tell peers to check, then update this machine (may restart)."""
@@ -680,6 +685,22 @@ class _Handler(BaseHTTPRequestHandler):
             raise BusError("expected a JSON object")
         return d
 
+    def _sessions(self, path: str, body: dict, local: bool, ip: str) -> dict:
+        s = self.bus.sessions
+        if s is None:
+            raise BusError("sessions are not available on this machine", 409)
+        if local:
+            routes = {"/sessions/search": s.search, "/sessions/resolve": lambda b: s.resolve(str(b.get("ref") or "")),
+                      "/sessions/ask": s.ask, "/sessions/launch": s.launch}
+        else:
+            self.bus.require_same_user(ip)  # transcripts are private to their owner
+            routes = {"/sessions/search": lambda b: {"results": s.search_local(b)}, "/sessions/ask": s.ask_local,
+                      "/sessions/launch": lambda b: s.launch_local(str(b.get("payload") or ""), str(b.get("signature") or ""))}
+        fn = routes.get(path)
+        if fn is None:
+            raise BusError("not found", 404)
+        return fn(body)
+
     def do_GET(self):  # noqa: N802
         self._dispatch("GET")
 
@@ -699,6 +720,8 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._body() if method == "POST" else {}
             b = self.bus
             path = url.path.removeprefix("/bus/v1")
+            if path.startswith("/sessions/") and method == "POST":
+                return self._reply(200, self._sessions(path, body, local, ip))
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello())
@@ -744,6 +767,12 @@ def start_bus() -> Bus | None:
     except Exception as e:  # noqa: BLE001
         log(f"not started: {e!r}")
         return None
+    try:
+        from . import sessions
+
+        b.sessions = sessions.start(b)
+    except Exception as e:  # noqa: BLE001
+        log(f"sessions not started: {e!r}")
     try:
         from .update import ENABLED, Updater
 
