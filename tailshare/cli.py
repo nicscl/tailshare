@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, core, daemon
+from . import __version__, agent, core, daemon
 
 
 def _base_url() -> str:
@@ -96,6 +96,12 @@ def cmd_url(args):
     print(core.url_for(_base_url(), args.name))
 
 
+def cmd_mcp(_):
+    from .mcp import serve
+
+    serve()
+
+
 def cmd_tui(_):
     from .app import TailshareApp
 
@@ -124,6 +130,8 @@ def main(argv: list[str] | None = None) -> None:
     u = sub.add_parser("url", help="print the URL of a shared file")
     u.add_argument("name")
     u.set_defaults(fn=cmd_url)
+    agent.add_parser(sub)
+    sub.add_parser("mcp", help="MCP server (stdio) for the agent bus").set_defaults(fn=cmd_mcp)
     p.set_defaults(fn=cmd_tui)
     args = p.parse_args(argv)
     args.fn(args)
