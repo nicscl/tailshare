@@ -93,7 +93,21 @@ def make_address(host: str, harness: str, folder: str, session: str = "") -> str
 
 
 def is_pattern(target: str) -> bool:
-    return any(c in target for c in "*?[")
+    """Patterns and @user targets reach the agents that exist now; exact addresses wait for theirs."""
+    return target.startswith("@") or any(c in target for c in "*?[")
+
+
+def split_target(target: str) -> tuple[str | None, str]:
+    """``@user/rest`` → (user, rest or "*"); anything else → (None, target)."""
+    if target.startswith("@"):
+        user, _, rest = target[1:].partition("/")
+        return user, rest or "*"
+    return None, target
+
+
+def handle(login: str) -> str:
+    """A tailnet login (nick@example.com) as a short user name (nick)."""
+    return slug(login.split("@")[0]) if login else ""
 
 
 def matches(address: str, target: str) -> bool:
@@ -105,6 +119,14 @@ def matches(address: str, target: str) -> bool:
     return any(fnmatchcase(a, t) for a in (address, base) for t in (target, target + "/*"))
 
 
+def target_matches(address: str, user: str, target: str) -> bool:
+    """`matches`, plus ``@user`` / ``@user/<address pattern>`` targets."""
+    want, rest = split_target(target)
+    if want is not None and not fnmatchcase(user or "", want):
+        return False
+    return matches(address, rest)
+
+
 # --------------------------------------------------------------------------- tailnet view
 
 
@@ -114,13 +136,20 @@ class Net:
 
     host: str = ""
     ip: str = ""
-    peers: dict[str, dict] = field(default_factory=dict)  # host -> {"ip", "port", "online"}
+    user: str = ""  # tailnet login that owns this machine
+    peers: dict[str, dict] = field(default_factory=dict)  # host -> {"ip", "port", "online", "user"}
     updated: float = 0.0
 
     def host_for_ip(self, ip: str) -> str | None:
         if ip == self.ip:
             return self.host
         return next((h for h, p in self.peers.items() if p["ip"] == ip), None)
+
+    def user_for_ip(self, ip: str) -> str | None:
+        """Tailnet login that owns the device at `ip` (None if it is not on the tailnet)."""
+        if ip == self.ip:
+            return self.user
+        return next((p.get("user", "") for p in self.peers.values() if p["ip"] == ip), None)
 
     def refresh(self) -> None:
         self.updated = time.time()
@@ -137,14 +166,17 @@ class Net:
             # iOS devices report HostName "localhost"; the MagicDNS label is the real name.
             return slug((n.get("DNSName") or "").split(".")[0] or n.get("HostName") or "")
 
+        logins = {str(k): v.get("LoginName", "") for k, v in (d.get("User") or {}).items()}
         me = d.get("Self") or {}
         self.host = name(me)
         self.ip = next(iter(me.get("TailscaleIPs") or []), "")
+        self.user = logins.get(str(me.get("UserID")), "")
         peers = {}
         for p in (d.get("Peer") or {}).values():
             ips = p.get("TailscaleIPs") or []
             if ips:
-                peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online"))}
+                peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online")),
+                                  "user": logins.get(str(p.get("UserID")), "")}
         self.peers = peers
 
 
@@ -153,10 +185,11 @@ class Net:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents(
   id TEXT PRIMARY KEY, address TEXT NOT NULL, harness TEXT, cwd TEXT, session TEXT,
-  pid INTEGER, first_seen REAL, last_seen REAL);
+  pid INTEGER, first_seen REAL, last_seen REAL, user TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL,
-  files TEXT NOT NULL DEFAULT '[]', created REAL NOT NULL, received REAL NOT NULL);
+  files TEXT NOT NULL DEFAULT '[]', created REAL NOT NULL, received REAL NOT NULL,
+  sender_user TEXT NOT NULL DEFAULT '');
 -- one row per recipient; agent is NULL while an exact address has no agent yet
 CREATE TABLE IF NOT EXISTS inbox(msg TEXT NOT NULL, agent TEXT, read REAL, UNIQUE(msg, agent));
 CREATE INDEX IF NOT EXISTS inbox_agent ON inbox(agent, read);
@@ -179,6 +212,9 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
+            for table, col in (("agents", "user"), ("messages", "sender_user")):  # added after 1st release
+                if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
     def q(self, sql: str, *args) -> list[sqlite3.Row]:
         with self.lock:
@@ -196,7 +232,7 @@ class Store:
 def _message(r: sqlite3.Row) -> dict:
     return {
         "id": r["id"], "sender": r["sender"], "target": r["target"], "body": r["body"],
-        "files": json.loads(r["files"]), "created": r["created"],
+        "files": json.loads(r["files"]), "created": r["created"], "sender_user": r["sender_user"],
     }
 
 
@@ -211,6 +247,7 @@ def _check_message(m: object) -> dict:
         and isinstance(m.get("files", []), list) and len(m.get("files", [])) <= 20
         and all(isinstance(f, str) and len(f) <= 500 for f in m.get("files", []))
         and isinstance(m.get("created"), (int, float))
+        and isinstance(m.get("sender_user", ""), str) and len(m.get("sender_user", "")) <= 64
     )
     if not ok:
         raise BusError("malformed message")
@@ -227,6 +264,7 @@ class Bus:
         self._peer_server: ThreadingHTTPServer | None = None
         self._peer_ip = ""
         self._pruned = 0.0
+        self.updater = None  # set by start_bus when self-update is available
 
     # -- agents ---------------------------------------------------------------
     def register(self, a: dict) -> dict:
@@ -236,6 +274,7 @@ class Bus:
         harness = slug(a.get("harness") or "cli")
         cwd = str(a.get("cwd") or "")
         session = str(a.get("session") or "").strip()
+        user = self._user_for(a)
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:
@@ -247,21 +286,36 @@ class Bus:
                 clash = any(r["address"].split(":")[0] == base for r in live)
                 address = f"{base}:{slug(aid)[:4]}" if clash else base
             self.store.x(
-                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen)"
-                " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
+                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user)"
+                " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
                 " harness=excluded.harness, cwd=excluded.cwd, session=excluded.session,"
-                " pid=excluded.pid, last_seen=excluded.last_seen",
-                aid, address, harness, cwd, session, int(a.get("pid") or 0), now, now,
+                " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user",
+                aid, address, harness, cwd, session, int(a.get("pid") or 0), now, now, user,
             )
-            self._claim(aid, address)
+            self._claim(aid, address, user)
         return self.agent(aid)
 
-    def _claim(self, aid: str, address: str) -> None:
+    def _user_for(self, a: dict) -> str:
+        """The human behind a session: set explicitly, else the tailnet user of the device that
+        SSH'd in, else the owner of this machine."""
+        if a.get("user"):
+            return slug(str(a["user"]))
+        ip = str(a.get("ssh_ip") or "")
+        if ip:
+            login = self.net.user_for_ip(ip)
+            if login is None and time.time() - self.net.updated > 5:
+                self.net.refresh()
+                login = self.net.user_for_ip(ip)
+            if login:
+                return handle(login)
+        return handle(self.net.user)
+
+    def _claim(self, aid: str, address: str, user: str = "") -> None:
         """Give an agent the messages that were waiting for its address."""
         pending = self.store.q(
             "SELECT inbox.rowid AS rid, m.target FROM inbox JOIN messages m ON m.id=inbox.msg WHERE inbox.agent IS NULL"
         )
-        hit = [r["rid"] for r in pending if matches(address, r["target"])]
+        hit = [r["rid"] for r in pending if target_matches(address, user, r["target"])]
         for rid in hit:
             self.store.x("UPDATE OR IGNORE inbox SET agent=? WHERE rowid=?", aid, rid)
         if hit:
@@ -275,7 +329,7 @@ class Bus:
 
     def _agent(self, r: sqlite3.Row) -> dict:
         return {
-            "id": r["id"], "address": r["address"], "harness": r["harness"], "session": r["session"],
+            "id": r["id"], "address": r["address"], "user": r["user"], "harness": r["harness"], "session": r["session"],
             "cwd": r["cwd"], "pid": r["pid"], "last_seen": r["last_seen"],
             "online": r["last_seen"] > time.time() - LIVE, "host": self.net.host,
         }
@@ -314,7 +368,7 @@ class Bus:
             raise BusError(f"message too long (max {MAX_BODY // 1024} KB)")
         if time.time() - self.net.updated > 15:
             self.net.refresh()
-        host_pat = target.split("/")[0]
+        host_pat = split_target(target)[1].split("/")[0]
         if is_pattern(host_pat):
             known = {r["host"] for r in self.store.q("SELECT host FROM peers WHERE last_ok IS NOT NULL")}
             hosts = sorted(h for h in known | {self.net.host} if fnmatchcase(h, host_pat))
@@ -323,8 +377,8 @@ class Bus:
         else:
             raise BusError(f"no machine named {host_pat!r} on the tailnet")
         m = {
-            "id": uuid.uuid4().hex, "sender": me["address"], "target": target, "body": body,
-            "files": list(files or []), "created": time.time(),
+            "id": uuid.uuid4().hex, "sender": me["address"], "sender_user": me["user"], "target": target,
+            "body": body, "files": list(files or []), "created": time.time(),
         }
         routes = []
         for h in hosts:
@@ -344,13 +398,16 @@ class Bus:
         now = time.time()
         with self.store.lock:
             n = self.store.x(
-                "INSERT OR IGNORE INTO messages(id, sender, target, body, files, created, received) VALUES(?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO messages(id, sender, target, body, files, created, received, sender_user)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 m["id"], m["sender"], m["target"], m["body"], json.dumps(m.get("files", [])), m["created"], now,
+                m.get("sender_user", ""),
             )
             if n == 0:
                 return False
-            agents = self.store.q("SELECT id, address FROM agents WHERE last_seen>?", now - KNOWN)
-            hits = [a["id"] for a in agents if a["address"] != m["sender"] and matches(a["address"], m["target"])]
+            agents = self.store.q("SELECT id, address, user FROM agents WHERE last_seen>?", now - KNOWN)
+            hits = [a["id"] for a in agents
+                    if a["address"] != m["sender"] and target_matches(a["address"], a["user"], m["target"])]
             if hits:
                 for aid in hits:
                     self.store.x("INSERT OR IGNORE INTO inbox(msg, agent) VALUES(?,?)", m["id"], aid)
@@ -397,10 +454,56 @@ class Bus:
     # -- peers ----------------------------------------------------------------
     def hello(self) -> dict:
         agents = [
-            {k: a[k] for k in ("address", "harness", "session", "online", "last_seen")}
+            {k: a[k] for k in ("address", "user", "harness", "session", "online", "last_seen")}
             for a in self.local_agents()
         ]
-        return {"v": PROTOCOL, "version": __version__, "host": self.net.host, "agents": agents}
+        return {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents}
+
+    def version(self) -> str:
+        from .update import describe
+
+        return describe()
+
+    def machines(self) -> list[dict]:
+        """This machine and every peer that has answered, with tailshare versions."""
+        out = [{"host": self.net.host, "ip": self.net.ip, "online": True, "version": self.version(),
+                "last_ok": time.time(), "agents": len(self.local_agents()), "self": True,
+                "update": self.updater.status if self.updater else None}]
+        for p in self.store.q("SELECT * FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
+            out.append({"host": p["host"], "ip": p["ip"], "version": p["version"], "last_ok": p["last_ok"],
+                        "online": bool(self.net.peers.get(p["host"], {}).get("online")),
+                        "agents": len(json.loads(p["agents"])), "self": False})
+        return out
+
+    def update_trigger(self, ip: str) -> dict:
+        """A peer asks this machine to check for an update. Only machines of the same tailnet user may."""
+        from .update import ENABLED
+
+        if self.updater is None or not ENABLED:
+            raise BusError("auto-update is off on this machine", 409)
+        if self.net.user_for_ip(ip) is None:
+            self.net.refresh()
+        who = self.net.user_for_ip(ip)
+        if not who or who != self.net.user:
+            raise BusError(f"{ip} belongs to {who or 'nobody on this tailnet'}, not {self.net.user}", 403)
+        return self.updater.trigger()
+
+    def update(self, everywhere: bool) -> dict:
+        """`tailshare update [--all]`: tell peers to check, then update this machine (may restart)."""
+        peers = {}
+        if everywhere:
+            for m in self.machines()[1:]:
+                p = self.net.peers.get(m["host"])
+                if not p or not p["online"]:
+                    peers[m["host"]] = "offline"
+                    continue
+                try:
+                    r = request(f"http://{p['ip']}:{p['port']}/bus/v1/update", {"v": PROTOCOL}, timeout=5)
+                    peers[m["host"]] = f"{r.get('result')} (now {r.get('version')})"
+                except Exception as e:  # noqa: BLE001
+                    peers[m["host"]] = f"failed: {e}"
+        mine = self.updater.check("requested") if self.updater else {"result": "self-update unavailable"}
+        return {"self": mine, "peers": peers}
 
     def accept(self, ip: str, body: dict) -> dict:
         """A peer mailbox hands over a message. The sender's host must be the connecting machine."""
@@ -601,6 +704,8 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._reply(200, b.hello())
                 if (method, path) == ("POST", "/deliver"):
                     return self._reply(200, b.accept(ip, body))
+                if (method, path) == ("POST", "/update"):
+                    return self._reply(200, b.update_trigger(ip))
             elif (method, path) == ("POST", "/register"):
                 return self._reply(200, b.register(body))
             elif (method, path) == ("POST", "/send"):
@@ -617,6 +722,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._reply(200, b.directory())
             elif (method, path) == ("GET", "/outbox"):
                 return self._reply(200, {"outbox": b.outbox()})
+            elif (method, path) == ("GET", "/machines"):
+                return self._reply(200, {"machines": b.machines()})
+            elif (method, path) == ("POST", "/update"):
+                return self._reply(200, b.update(bool(body.get("all"))))
             self._reply(404, {"error": "not found"})
         except BusError as e:
             self._reply(e.code, {"error": str(e)})
@@ -632,7 +741,15 @@ def start_bus() -> Bus | None:
     try:
         b = Bus(Store(STATE_DIR / "bus.db"), Net())
         b.start()
-        return b
     except Exception as e:  # noqa: BLE001
         log(f"not started: {e!r}")
         return None
+    try:
+        from .update import ENABLED, Updater
+
+        b.updater = Updater()
+        if ENABLED:
+            b.updater.start()
+    except Exception as e:  # noqa: BLE001
+        log(f"self-update not started: {e!r}")
+    return b

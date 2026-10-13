@@ -39,6 +39,8 @@ class Identity:
     cwd: str
     session: str = ""
     pid: int = 0
+    user: str = ""  # explicit TAILSHARE_USER; otherwise the mailbox works it out
+    ssh_ip: str = ""  # where an SSH login came from, to find the tailnet user behind it
 
 
 def _claude_transcript(session_id: str) -> Path | None:
@@ -93,8 +95,15 @@ def _codex_title(thread_id: str) -> str:
 
 
 def detect(hook: dict | None = None) -> Identity:
-    """Work out which agent session this process belongs to."""
-    hook = hook or {}
+    """Work out which agent session this process belongs to, and the human behind it."""
+    ident = _detect_session(hook or {})
+    ident.user = os.environ.get("TAILSHARE_USER", "")
+    ssh = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT") or ""
+    ident.ssh_ip = ssh.split()[0] if ssh.split() else ""
+    return ident
+
+
+def _detect_session(hook: dict) -> Identity:
     env = os.environ
     if env.get("TAILSHARE_AGENT_ID"):
         cwd = os.getcwd()
@@ -149,7 +158,8 @@ def ago(ts: float) -> str:
 
 def format_message(m: dict) -> str:
     when = time.strftime("%H:%M", time.localtime(m["created"]))
-    head = f"📨 from {m['sender']} · {when} · to {m['target']} · id {m['id'][:8]}"
+    who = f" ({m['sender_user']})" if m.get("sender_user") else ""
+    head = f"📨 from {m['sender']}{who} · {when} · to {m['target']} · id {m['id'][:8]}"
     lines = [head] + ["  " + ln for ln in (m["body"].splitlines() or [""])]
     lines += [f"  📎 {u}" for u in m.get("files", [])]
     return "\n".join(lines)
@@ -188,7 +198,9 @@ def cmd_ls(args):
     if not rows:
         print("no agents yet")
         return
+    rows.sort(key=lambda a: (a.get("user") or "~", a["address"]))
     w = max(len(a["address"]) for a in rows)
+    u = max(len(a.get("user") or "-") for a in rows)
     for a in rows:
         if a["address"] == me["address"]:
             state = "● you"
@@ -198,7 +210,7 @@ def cmd_ls(args):
             state = f"○ machine offline · seen {ago(a.get('last_seen', 0))}"
         else:
             state = f"○ seen {ago(a.get('last_seen', 0))}"
-        print(f"{a['address']:<{w}}  {state}")
+        print(f"{a.get('user') or '-':<{u}}  {a['address']:<{w}}  {state}")
 
 
 @_run
@@ -293,12 +305,13 @@ def cmd_hook(args):
             msgs = call(f"/inbox?agent={me['id']}")["messages"]
             t = exe()
             text = (
-                f"You are on the tailshare agent bus as `{me['address']}`. Other agents on the user's tailnet can message you.\n"
+                f"You are on the tailshare agent bus as `{me['address']}` (user {me.get('user') or 'unknown'}). "
+                "Other agents on the user's tailnet can message you.\n"
                 f"- To receive messages, start this with the Bash tool and run_in_background: `{t} agent watch --once`. "
                 "It exits when a message arrives, which wakes you; handle it, then start it again.\n"
                 f"- Send: `{t} agent send <address-or-pattern> \"text\"` (add `--file PATH` to attach a file). "
                 f"List agents: `{t} agent ls`. Addresses are host/harness/folder[/session]; "
-                "`*/*/<folder>` reaches every agent working in that folder.\n"
+                "`*/*/<folder>` reaches every agent working in that folder, `@<user>` every session of that person.\n"
                 f"- {NOTE}"
             )
             if msgs:
@@ -388,7 +401,7 @@ def add_parser(sub) -> None:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_ls)
     p = s.add_parser("send", help="send a message (queued if the machine is offline)")
-    p.add_argument("to", help="host/harness/folder[/session], or a pattern like */*/tailshare")
+    p.add_argument("to", help="host/harness/folder[/session], a pattern like */*/tailshare, or @user[/pattern]")
     p.add_argument("text", nargs="*", help="message text; omit or '-' to read stdin")
     p.add_argument("-f", "--file", action="append", help="share a file and attach its link (repeatable)")
     p.set_defaults(fn=cmd_send)

@@ -151,6 +151,24 @@ How messages reach an agent:
   also delivers anything waiting. `tailshare agent watch` (without `--once`) works under the Monitor tool.
 - **Any MCP client** (Claude Code, Codex): `tailshare mcp` exposes `whoami`, `agents`, `send` and `inbox`.
 
+**Users.** Every session has a human user: the tailnet user of the device that SSH'd in (from
+`SSH_CONNECTION`), otherwise the tailnet owner of the machine, or `TAILSHARE_USER` if set. `@nick` reaches
+every session of that person on every machine, `@nick/*/*/api` only their sessions in an `api` folder.
+
+**Updates.** Installs from git keep themselves current: every hour (`TAILSHARE_UPDATE_HOURS`) each server
+checks the branch it follows (`TAILSHARE_UPDATE_REF`, default `main`) on the repo it was installed from,
+installs the new commit, checks that it loads (rolling back if not) and restarts. `TAILSHARE_AUTOUPDATE=0`
+turns this off. Editable checkouts are never touched.
+
+```sh
+tailshare update          # update this machine now
+tailshare update --all    # ...and ask every other machine to update too
+tailshare machines        # every machine running tailshare, with its version
+```
+
+A request to update can only come from machines of the same tailnet user, and it only says "check now":
+what gets installed always comes from the repo recorded in that machine's own install.
+
 Details:
 
 - The mailbox listens on `127.0.0.1:8789` for local agents and on the tailnet IP `:8789` for other

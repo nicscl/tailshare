@@ -102,6 +102,33 @@ def cmd_mcp(_):
     serve()
 
 
+def cmd_update(args):
+    try:
+        r = agent.call("/update", {"all": args.all}, timeout=900)
+    except (agent.Offline, OSError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"this machine   {r['self'].get('result')}")
+    for host, status in sorted(r["peers"].items()):
+        print(f"{host:<14} {status}")
+    if args.all and r["peers"]:
+        print("watch them come up with: tailshare machines")
+
+
+def cmd_machines(_):
+    try:
+        rows = agent.call("/machines")["machines"]
+    except (agent.Offline, OSError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
+    w = max(len(m["host"]) for m in rows)
+    for m in rows:
+        state = "this machine" if m["self"] else ("online" if m["online"] else "offline") + f" · answered {core.relative_time(m['last_ok'])}"
+        print(f"{m['host']:<{w}}  {m['version'] or '?':<16} {m['agents']:>2} agents  {state}")
+        if m.get("update"):
+            print(f"{'':<{w}}  last update check: {m['update']['result']}")
+
+
 def cmd_tui(_):
     from .app import TailshareApp
 
@@ -131,6 +158,10 @@ def main(argv: list[str] | None = None) -> None:
     u.add_argument("name")
     u.set_defaults(fn=cmd_url)
     agent.add_parser(sub)
+    up = sub.add_parser("update", help="update tailshare from its git source now")
+    up.add_argument("--all", action="store_true", help="also tell every other machine to update")
+    up.set_defaults(fn=cmd_update)
+    sub.add_parser("machines", help="machines running tailshare, with versions").set_defaults(fn=cmd_machines)
     sub.add_parser("mcp", help="MCP server (stdio) for the agent bus").set_defaults(fn=cmd_mcp)
     p.set_defaults(fn=cmd_tui)
     args = p.parse_args(argv)
