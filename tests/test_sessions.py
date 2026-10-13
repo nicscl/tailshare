@@ -107,6 +107,17 @@ class Parsing(Fixture):
         s = sessions.parse_codex(self.codex_file, {})
         self.assertEqual((s["prompts"], s["first_prompt"]), (1, "migrate the replica database"))
 
+    def test_headless_runs_are_skipped(self):
+        recs = claude_records("/w/p")
+        for r in recs:
+            r["entrypoint"] = "sdk-cli"  # claude -p
+        jl(self.claude_file, recs)
+        self.assertIsNone(sessions.parse_claude(self.claude_file))
+        recs = codex_records("/w/p")
+        recs[0]["payload"]["source"] = "exec"  # codex exec
+        jl(self.codex_file, recs)
+        self.assertIsNone(sessions.parse_codex(self.codex_file, {}))
+
     def test_no_prompts_is_skipped(self):
         jl(self.claude_file, [{"type": "custom-title", "customTitle": "empty"}])
         self.assertIsNone(sessions.parse_claude(self.claude_file))
@@ -127,9 +138,11 @@ class Indexing(Fixture):
         # an appended transcript is re-read; a renamed Codex thread picks up its new name
         jl(self.claude_file, claude_records(str(self.proj), "teach it about idempotency keys"))
         jl(sessions.CODEX_HOME / "session_index.jsonl", [{"id": CODEX_ID, "thread_name": "Replica cutover"}])
-        self.assertEqual(self.index.scan(), 2)
+        self.assertEqual(self.index.scan(), 1)  # the rename does not re-read the Codex transcript
         self.assertEqual([h["id"] for h in self.index.search("idempotency")], [SID])
+        self.assertEqual(self.index.search("fix"), [])  # the old text is gone from search
         self.assertEqual(self.index.get(CODEX_ID)["name"], "Replica cutover")
+        self.assertEqual([h["id"] for h in self.index.search("cutover")], [CODEX_ID])
         # a deleted transcript leaves the index
         self.claude_file.unlink()
         self.index.scan()
