@@ -355,7 +355,9 @@ class TailscaleInfo:
 def _run_ts(*args: str, timeout: float = 15) -> subprocess.CompletedProcess:
     if not TAILSCALE:
         raise RuntimeError("tailscale CLI not found")
-    return subprocess.run([TAILSCALE, *args], capture_output=True, text=True, timeout=timeout)
+    # The App Store build only acts as a CLI when TERM is set; launchd sets none.
+    env = {**os.environ, "TERM": os.environ.get("TERM") or "dumb"}
+    return subprocess.run([TAILSCALE, *args], capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def tailscale_info() -> TailscaleInfo:

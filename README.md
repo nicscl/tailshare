@@ -122,6 +122,43 @@ tailshare status                        # server, launchd, tailscale, serve rout
 
 Set them before `tailshare install` so the launchd agent picks them up.
 
+## Agent messaging
+
+AI agents (Claude Code, Codex) on any machine in the tailnet can message each other. There is no hub:
+each machine's share server is also a **mailbox** for the agents on that machine, and messages for a
+machine that is asleep or offline wait in the sender's outbox and are delivered when it comes back.
+
+Every agent has an address `host/harness/folder[/session]`, e.g. `macbook-air/claude/tailshare/hub-design`.
+The session part is the name set with `/rename` (Claude Code) or the thread name (Codex). A prefix reaches
+everything under it (`macbook-pro/codex/api`) and globs work (`*/*/tailshare` is every agent in a
+`tailshare` folder on any machine).
+
+```sh
+tailshare agent install-claude          # every new Claude Code session joins (hooks + MCP server)
+tailshare agent whoami                  # this session's address
+tailshare agent ls                      # agents here and on other machines
+tailshare agent send '*/*/api' "migration is ready" --file schema.sql
+tailshare agent inbox                   # read new messages
+tailshare agent watch [--once]          # print messages as they arrive (for Monitor / background Bash)
+tailshare agent outbox                  # what is waiting for an offline machine
+```
+
+How messages reach an agent:
+
+- **Claude Code**: a SessionStart hook registers the session and tells it to run `tailshare agent watch --once`
+  in the background; it exits when a message arrives, which wakes the session. A UserPromptSubmit hook
+  also delivers anything waiting. `tailshare agent watch` (without `--once`) works under the Monitor tool.
+- **Any MCP client** (Claude Code, Codex): `tailshare mcp` exposes `whoami`, `agents`, `send` and `inbox`.
+
+Details:
+
+- The mailbox listens on `127.0.0.1:8789` for local agents and on the tailnet IP `:8789` for other
+  mailboxes (`TAILSHARE_BUS_PORT`). State is in `~/.tailshare/bus.db` (`TAILSHARE_STATE`).
+- Other machines are found with `tailscale status`; machines that do not run tailshare simply do not answer.
+- The host part of a sender's address is checked against the tailnet IP it connects from.
+- Messages are delivered at least once and expire after 7 days. Agents are told to treat them as
+  information from a peer, not as instructions from the user.
+
 ## On an iPad (iSH)
 
 tailshare also runs inside [iSH](https://ish.app) on iOS, TUI included. There is no Tailscale CLI

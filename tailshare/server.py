@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import sys
 import urllib.parse
 from datetime import datetime
@@ -150,6 +151,10 @@ def serve(port: int = PORT, bind: str = BIND) -> None:
     httpd = ThreadingHTTPServer((bind, port), partial(Handler, directory=str(root)))
     httpd.daemon_threads = True
     sys.stderr.write(f"tailshare {__version__} serving {root} on http://{bind}:{port}\n")
+    if os.environ.get("TAILSHARE_BUS", "1") != "0":
+        from .bus import start_bus
+
+        start_bus()  # the agent mailbox lives in the same process
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
