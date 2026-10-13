@@ -25,8 +25,14 @@ central index, the same as for messages.
   last activity, and searchable text: the user's prompts and the agent's replies (capped at 256 KB per
   session). Tool calls and tool output are **not** indexed: they are large, noisy and the likeliest place for
   secrets.
-- The index is refreshed every 60 s; only transcripts whose size or mtime changed are re-read (a full first
-  scan of ~180 sessions / 140 MB takes about 3 s).
+- Scripted runs are skipped: `claude -p` (entrypoint `sdk-cli`) and `codex exec` (source `exec`). A pipeline
+  can produce thousands a day (prismo had 29k) and nobody reopens them. `TAILSHARE_INDEX_HEADLESS=1` indexes
+  them anyway.
+- The index is refreshed every 60 s; only transcripts whose size or mtime changed are re-read, newest first,
+  so sessions in use show up first. Renaming a Codex thread updates the name in place. A full first scan of
+  ~180 sessions takes about 3 s; prismo's 29.7k transcripts take 17 s.
+- Search entries are keyed by rowid: FTS5 can only find rows by rowid or MATCH, so deleting by another
+  column reads the whole table (that made 0.3.0's first index on prismo take 24 minutes).
 - Search is SQLite FTS5 (prefix matching, accents ignored, name weighted above folder above text), with a
   substring fallback for Pythons built without FTS5.
 

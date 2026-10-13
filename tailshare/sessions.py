@@ -38,6 +38,10 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIGNERS = bus.STATE_DIR / "allowed_signers"
 NAMESPACE = "tailshare-launch"
 TEXT_CAP = 256 * 1024  # searchable text kept per session
+SCHEMA_VERSION = 2  # bump to rebuild the index from the transcripts
+# Scripted runs (`claude -p`, `codex exec`) are not sessions anyone reopens, and a pipeline can make
+# thousands a day. TAILSHARE_INDEX_HEADLESS=1 indexes them too.
+HEADLESS = os.environ.get("TAILSHARE_INDEX_HEADLESS") == "1"
 SCAN_EVERY = 60
 ASK_TIMEOUT = 300
 MAX_QUESTION = 8 * 1024
@@ -116,6 +120,8 @@ def parse_claude(path: Path) -> dict | None:
                 continue
             if t not in ("user", "assistant") or d.get("isSidechain"):
                 continue
+            if not HEADLESS and str(d.get("entrypoint") or "").startswith("sdk"):
+                return None  # claude -p
             s["cwd"] = s["cwd"] or str(d.get("cwd") or "")
             s["branch"] = str(d.get("gitBranch") or s["branch"])
             when = _ts(d.get("timestamp"))
@@ -180,6 +186,8 @@ def parse_codex(path: Path, titles: dict[str, str]) -> dict | None:
                 s["cwd"] = str(p.get("cwd") or "")
                 s["branch"] = str((p.get("git") or {}).get("branch") or "")
                 s["started"] = _ts(p.get("timestamp")) or s["started"]
+                if not HEADLESS and (p.get("source") == "exec" or p.get("originator") == "codex_exec"):
+                    return None  # codex exec
             elif t == "turn_context" and p.get("cwd") and not s["cwd"]:
                 s["cwd"] = str(p["cwd"])
             elif t == "response_item" and pt == "message" and p.get("role") in ("user", "assistant"):
@@ -215,15 +223,21 @@ class Index:
         self.lock = threading.RLock()
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                for t in ("sessions", "files", "nonces", "sessions_fts", "sessions_text"):
+                    self.db.execute(f"DROP TABLE IF EXISTS {t}")
+                self.db.execute("VACUUM")
+                self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.db.executescript(SCHEMA)
             try:
                 self.db.execute(
+                    # rowid = the sessions row's rowid: FTS5 can only look rows up by rowid or MATCH
                     "CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5("
-                    "id UNINDEXED, title, folder, text, tokenize='unicode61 remove_diacritics 2')"
+                    "title, folder, text, tokenize='unicode61 remove_diacritics 2')"
                 )
                 self.fts = True
             except sqlite3.OperationalError:  # a Python built without FTS5: plain substring search
-                self.db.execute("CREATE TABLE IF NOT EXISTS sessions_text(id TEXT PRIMARY KEY, title, folder, text)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS sessions_text(rowid INTEGER PRIMARY KEY, title, folder, text)")
                 self.fts = False
         self.text_table = "sessions_fts" if self.fts else "sessions_text"
 
@@ -239,10 +253,9 @@ class Index:
     def scan(self) -> int:
         """Re-read transcripts that changed since the last scan. Returns how many were read."""
         seen = {r["path"]: r for r in self.q("SELECT * FROM files WHERE path NOT LIKE 'meta:%'")}
-        titles: dict[str, str] | None = None
         titles_mtime = _mtime(CODEX_HOME / "session_index.jsonl")
-        renamed = titles_mtime != self._meta("codex_titles_mtime")
-        n = 0
+        titles = codex_titles() if titles_mtime != self._meta("codex_titles_mtime") else None
+        changed = []
         present = set()
         for harness, path in transcript_files():
             key = str(path)
@@ -252,8 +265,10 @@ class Index:
             except OSError:
                 continue
             old = seen.get(key)
-            if old and old["mtime"] == st.st_mtime and old["size"] == st.st_size and not (renamed and harness == "codex"):
-                continue
+            if not (old and old["mtime"] == st.st_mtime and old["size"] == st.st_size):
+                changed.append((st.st_mtime, harness, path, st))
+        changed.sort(key=lambda c: -c[0])  # newest first: the sessions in use show up first
+        for _, harness, path, st in changed:
             try:
                 if harness == "claude":
                     s = parse_claude(path)
@@ -262,12 +277,23 @@ class Index:
                     s = parse_codex(path, titles)
             except OSError:
                 continue
-            self._store(key, st, s)
-            n += 1
+            self._store(str(path), st, s)
         for gone in set(seen) - present:
             self._forget(gone)
-        self._set_meta("codex_titles_mtime", titles_mtime)
-        return n
+        if titles_mtime != self._meta("codex_titles_mtime"):
+            self._retitle(titles if titles is not None else codex_titles())
+            self._set_meta("codex_titles_mtime", titles_mtime)
+        return len(changed)
+
+    def _retitle(self, titles: dict[str, str]) -> None:
+        """A Codex thread was renamed: update names in place instead of re-reading transcripts."""
+        for r in self.q("SELECT rowid, id, title, ai_title FROM sessions WHERE harness='codex'"):
+            new = titles.get(r["id"], "")
+            if new != r["title"]:
+                with self.lock:
+                    self.db.execute("UPDATE sessions SET title=? WHERE rowid=?", (new, r["rowid"]))
+                    self.db.execute(f"UPDATE {self.text_table} SET title=? WHERE rowid=?",
+                                    (f"{new} {r['ai_title']}", r["rowid"]))
 
     def _store(self, key: str, st: os.stat_result, s: dict | None) -> None:
         with self.lock:
@@ -283,11 +309,15 @@ class Index:
                     s["folder"] = Path(s["cwd"]).name
                     cols = ("id", "harness", "path", "cwd", "folder", "title", "ai_title", "branch",
                             "first_prompt", "last_prompt", "prompts", "started", "updated")
-                    self.db.execute(f"INSERT OR REPLACE INTO sessions({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
-                                    tuple(s[c] for c in cols))
-                    self.db.execute(f"DELETE FROM {self.text_table} WHERE id=?", (s["id"],))
-                    self.db.execute(f"INSERT INTO {self.text_table}(id, title, folder, text) VALUES(?,?,?,?)",
-                                    (s["id"], f"{s['title']} {s['ai_title']}", s["folder"], s["text"]))
+                    # an upsert keeps the row's rowid, which is also its search entry's rowid
+                    self.db.execute(
+                        f"INSERT INTO sessions({','.join(cols)}) VALUES({','.join('?' * len(cols))})"
+                        f" ON CONFLICT(id) DO UPDATE SET {','.join(f'{c}=excluded.{c}' for c in cols[1:])}",
+                        tuple(s[c] for c in cols))
+                    rowid = self.db.execute("SELECT rowid FROM sessions WHERE id=?", (s["id"],)).fetchone()[0]
+                    self.db.execute(f"DELETE FROM {self.text_table} WHERE rowid=?", (rowid,))
+                    self.db.execute(f"INSERT INTO {self.text_table}(rowid, title, folder, text) VALUES(?,?,?,?)",
+                                    (rowid, f"{s['title']} {s['ai_title']}", s["folder"], s["text"]))
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
@@ -298,9 +328,10 @@ class Index:
             row = self.db.execute("SELECT id FROM files WHERE path=?", (key,)).fetchone()
             self.db.execute("DELETE FROM files WHERE path=?", (key,))
             if row and row["id"]:
-                if self.db.execute("SELECT 1 FROM sessions WHERE id=? AND path=?", (row["id"], key)).fetchone():
-                    self.db.execute("DELETE FROM sessions WHERE id=?", (row["id"],))
-                    self.db.execute(f"DELETE FROM {self.text_table} WHERE id=?", (row["id"],))
+                r = self.db.execute("SELECT rowid FROM sessions WHERE id=? AND path=?", (row["id"], key)).fetchone()
+                if r:
+                    self.db.execute("DELETE FROM sessions WHERE rowid=?", (r[0],))
+                    self.db.execute(f"DELETE FROM {self.text_table} WHERE rowid=?", (r[0],))
 
     def _meta(self, key: str) -> float | None:
         r = self.q("SELECT mtime FROM files WHERE path=?", f"meta:{key}")
@@ -326,9 +357,9 @@ class Index:
         if words and self.fts:
             match = " ".join(f'"{w}"*' for w in words)
             sql = (
-                "SELECT s.*, bm25(sessions_fts, 0, 10.0, 4.0, 1.0) AS score,"
-                " snippet(sessions_fts, 3, '[', ']', '…', 12) AS snippet"
-                " FROM sessions_fts JOIN sessions s ON s.id = sessions_fts.id"
+                "SELECT s.*, bm25(sessions_fts, 10.0, 4.0, 1.0) AS score,"
+                " snippet(sessions_fts, 2, '[', ']', '…', 12) AS snippet"
+                " FROM sessions_fts JOIN sessions s ON s.rowid = sessions_fts.rowid"
                 f" WHERE sessions_fts MATCH ? {''.join(' AND ' + w for w in where)}"
                 " ORDER BY score LIMIT ?"
             )
@@ -338,7 +369,7 @@ class Index:
                 where.append("(t.title LIKE ? OR t.folder LIKE ? OR t.text LIKE ?)")
                 args += [f"%{w}%"] * 3
             rows = self.q(
-                "SELECT s.*, 0.0 AS score, '' AS snippet FROM sessions s JOIN sessions_text t ON t.id = s.id"
+                "SELECT s.*, 0.0 AS score, '' AS snippet FROM sessions s JOIN sessions_text t ON t.rowid = s.rowid"
                 f" WHERE {' AND '.join(where)} ORDER BY s.updated DESC LIMIT ?", *args, limit)
         else:
             rows = self.q(f"SELECT s.*, 0.0 AS score, '' AS snippet FROM sessions s"
