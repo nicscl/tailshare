@@ -169,6 +169,22 @@ tailshare machines        # every machine running tailshare, with its version
 A request to update can only come from machines of the same tailnet user, and it only says "check now":
 what gets installed always comes from the repo recorded in that machine's own install.
 
+**Sessions.** Every mailbox also indexes the Claude Code and Codex sessions on its machine, so you can find
+an old session wherever it ran, ask it a question, or reopen it. See [docs/sessions.md](docs/sessions.md).
+
+```sh
+tailshare sessions find stripe webhook                 # search sessions on every machine
+tailshare sessions show prismo:3f2a91c0                # details (refs are host:id-prefix)
+tailshare sessions open prismo:3f2a91c0                # resume it in this terminal (over SSH if remote)
+tailshare sessions ask prismo:3f2a91c0 "why pg_dump?"  # a throwaway copy with no tools answers
+tailshare sessions launch prismo:3f2a91c0 --mode acceptEdits --prompt "run the tests"   # signed, see below
+```
+
+Agents get the same through MCP (`find_sessions`, `ask_session`). Only machines of the same tailnet user can
+search or ask. `launch` resumes a session in the background with real permissions, so it needs a request
+signed by a key that machine trusts (`tailshare sessions trust <key.pub>`, run on that machine by hand),
+ideally a FIDO key that needs a touch. It never runs as root and never bypasses permissions.
+
 Details:
 
 - The mailbox listens on `127.0.0.1:8789` for local agents and on the tailnet IP `:8789` for other

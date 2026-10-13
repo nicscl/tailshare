@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, agent, core, daemon
+from . import __version__, agent, core, daemon, sessions_cli
 
 
 def _base_url() -> str:
@@ -158,6 +158,7 @@ def main(argv: list[str] | None = None) -> None:
     u.add_argument("name")
     u.set_defaults(fn=cmd_url)
     agent.add_parser(sub)
+    sessions_cli.add_parser(sub)
     up = sub.add_parser("update", help="update tailshare from its git source now")
     up.add_argument("--all", action="store_true", help="also tell every other machine to update")
     up.set_defaults(fn=cmd_update)

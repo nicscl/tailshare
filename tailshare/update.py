@@ -29,7 +29,7 @@ REF = os.environ.get("TAILSHARE_UPDATE_REF", "main")
 STATE = Path(os.environ.get("TAILSHARE_STATE", "~/.tailshare")).expanduser() / "update.json"
 TRIGGER_GAP = 30  # seconds between accepted network triggers
 UV_CANDIDATES = ("~/.local/bin/uv", "/opt/homebrew/bin/uv", "/usr/local/bin/uv", "~/.cargo/bin/uv")
-CHECK_IMPORT = "import tailshare.server, tailshare.bus, tailshare.agent, tailshare.update, tailshare.cli"
+CHECK_IMPORT = "import tailshare.server, tailshare.bus, tailshare.agent, tailshare.update, tailshare.cli, tailshare.sessions"
 
 
 def log(msg: str) -> None:
