@@ -118,6 +118,7 @@ tailshare status                        # server, launchd, tailscale, serve rout
 |----------|---------|---------|
 | `TAILSHARE_DIR` | `~/Public/ts-share` | folder that is shared |
 | `TAILSHARE_PORT` | `8787` | localhost port of the share server |
+| `TAILSHARE_SERVE` | `1` | `0` leaves `tailscale serve` alone (agent mailbox only, no file links) |
 | `TAILSHARE_LINKS` | `ip` | `ip` for `http://100.x.y.z/`, `dns` for `https://<name>.ts.net/` |
 
 Set them before `tailshare install` so the launchd agent picks them up.
