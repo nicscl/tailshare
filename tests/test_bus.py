@@ -21,11 +21,13 @@ def free_port() -> int:
 
 
 class StaticNet(bus.Net):
-    """A fixed tailnet view; `ipmap` says which host a connecting IP belongs to."""
+    """A fixed tailnet view; `ipmap` says which host a connecting IP belongs to, `usermap` its owner."""
 
-    def __init__(self, host: str, peers: dict | None = None, ipmap: dict | None = None) -> None:
-        super().__init__(host=host, ip="", peers=peers or {}, updated=time.time())
+    def __init__(self, host: str, peers: dict | None = None, ipmap: dict | None = None,
+                 user: str = "nick@example.com", usermap: dict | None = None) -> None:
+        super().__init__(host=host, ip="", user=user, peers=peers or {}, updated=time.time())
         self.ipmap = ipmap or {}
+        self.usermap = usermap or {}
 
     def refresh(self) -> None:
         self.updated = time.time()
@@ -33,14 +35,17 @@ class StaticNet(bus.Net):
     def host_for_ip(self, ip: str) -> str | None:
         return self.ipmap.get(ip)
 
+    def user_for_ip(self, ip: str) -> str | None:
+        return self.usermap.get(ip)
+
 
 def make_bus(host: str, net: StaticNet | None = None, port: int | None = None) -> bus.Bus:
     tmp = Path(tempfile.mkdtemp())
     return bus.Bus(bus.Store(tmp / "bus.db"), net or StaticNet(host), port or free_port())
 
 
-def reg(b: bus.Bus, aid: str, folder: str, harness: str = "claude", session: str = "") -> dict:
-    return b.register({"id": aid, "harness": harness, "cwd": f"/x/{folder}", "session": session})
+def reg(b: bus.Bus, aid: str, folder: str, harness: str = "claude", session: str = "", **kw) -> dict:
+    return b.register({"id": aid, "harness": harness, "cwd": f"/x/{folder}", "session": session, **kw})
 
 
 class Addresses(unittest.TestCase):
@@ -56,6 +61,38 @@ class Addresses(unittest.TestCase):
         for t in ("air/claude/tail", "pro/claude/tailshare", "*/codex/*", "air/claude/tailshare/other"):
             self.assertFalse(bus.matches(a, t), t)
         self.assertTrue(bus.matches("air/claude/tailshare:6d2b", "air/claude/tailshare"))
+
+
+class Users(unittest.TestCase):
+    def setUp(self):
+        self.b = make_bus("srv", StaticNet("srv", user="owner@example.com",
+                                           usermap={"100.1.1.1": "nick@example.com", "100.2.2.2": "ana@other.org"}))
+
+    def test_user_sources(self):
+        self.assertEqual(reg(self.b, "L", "p")["user"], "owner")  # sitting at the machine
+        self.assertEqual(reg(self.b, "S", "q", ssh_ip="100.2.2.2")["user"], "ana")  # SSH'd in from Ana's device
+        self.assertEqual(reg(self.b, "P", "r", ssh_ip="203.0.113.9")["user"], "owner")  # not a tailnet IP
+        self.assertEqual(reg(self.b, "E", "s", ssh_ip="100.2.2.2", user="Nick")["user"], "nick")  # explicit wins
+
+    def test_at_user_targets(self):
+        reg(self.b, "N1", "api", ssh_ip="100.1.1.1")
+        reg(self.b, "N2", "web", harness="codex", ssh_ip="100.1.1.1")
+        reg(self.b, "A1", "api", ssh_ip="100.2.2.2", session="ana")
+        reg(self.b, "X", "x", harness="cli")
+        self.b.send("X", "@nick", "to all of nick")
+        self.b.send("X", "@ana/*/*/api", "to ana's api sessions")
+        self.b.send("X", "@nick/*/codex/*", "to nick's codex")
+        body = lambda aid: [m["body"] for m in self.b.inbox(aid)]
+        self.assertEqual(body("N1"), ["to all of nick"])
+        self.assertEqual(body("N2"), ["to all of nick", "to nick's codex"])
+        self.assertEqual(body("A1"), ["to ana's api sessions"])
+        self.assertTrue(bus.is_pattern("@nick"))
+
+    def test_sender_user_travels(self):
+        reg(self.b, "N1", "api", ssh_ip="100.1.1.1")
+        reg(self.b, "A1", "web", ssh_ip="100.2.2.2")
+        self.b.send("N1", "srv/claude/web", "hi")
+        self.assertEqual(self.b.inbox("A1")[0]["sender_user"], "nick")
 
 
 class LocalMailbox(unittest.TestCase):
@@ -172,6 +209,79 @@ class TwoMachines(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class UpdateTrigger(unittest.TestCase):
+    def test_only_same_tailnet_user(self):
+        from tailshare import update
+
+        b = make_bus("srv", StaticNet("srv", user="nick@example.com",
+                                      usermap={"100.1.1.1": "nick@example.com", "100.2.2.2": "ana@other.org"}))
+        b.updater = update.Updater(restart=lambda: None)
+        b.updater.trigger = lambda: {"result": "checking for updates"}
+        self.assertEqual(b.update_trigger("100.1.1.1")["result"], "checking for updates")
+        for ip in ("100.2.2.2", "8.8.8.8"):
+            with self.assertRaises(bus.BusError) as cm:
+                b.update_trigger(ip)
+            self.assertEqual(cm.exception.code, 403)
+
+
+class Updater(unittest.TestCase):
+    """The update decision logic, with installs and network faked out."""
+
+    def setUp(self):
+        from tailshare import update
+
+        self.u = update
+        self.saved = {k: getattr(update, k) for k in ("install_info", "latest_commit", "find_uv", "_uv_install", "supervised", "STATE")}
+        self.saved_run = update.subprocess.run
+        update.STATE = Path(tempfile.mkdtemp()) / "update.json"
+        update.find_uv = lambda: "/bin/uv"
+        update.supervised = lambda: True
+        self.installs = []
+        update._uv_install = lambda uv, url, c: (self.installs.append(c), type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})())[1]
+        self.info = {"url": "https://github.com/o/r", "git": True, "commit": "a" * 40, "editable": False}
+        update.install_info = lambda: dict(self.info)
+        self.restarts = []
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(self.u, k, v)
+        self.u.subprocess.run = self.saved_run
+
+    def updater(self, import_ok=True):
+        self.u.subprocess.run = lambda *a, **k: type("CP", (), {"returncode": 0 if import_ok else 1, "stderr": "boom"})()
+        return self.u.Updater(restart=lambda: self.restarts.append(1))
+
+    def test_up_to_date(self):
+        self.u.latest_commit = lambda url, ref="main": "a" * 40
+        self.assertIn("up to date", self.updater().check()["result"])
+        self.assertEqual(self.installs, [])
+
+    def test_updates_and_restarts(self):
+        self.u.latest_commit = lambda url, ref="main": "b" * 40
+        r = self.updater().check()
+        self.assertIn("restarting", r["result"])
+        self.assertEqual(self.installs, ["b" * 40])
+        time.sleep(1.3)
+        self.assertEqual(self.restarts, [1])
+
+    def test_rollback_and_remember_bad(self):
+        self.u.latest_commit = lambda url, ref="main": "c" * 40
+        up = self.updater(import_ok=False)
+        self.assertIn("rolled back", up.check()["result"])
+        self.assertEqual(self.installs, ["c" * 40, "a" * 40])
+        self.assertIn("failed to load before", up.check()["result"])  # not retried
+        self.assertEqual(len(self.installs), 2)
+
+    def test_editable_skipped(self):
+        self.info["editable"] = True
+        self.assertIn("editable", self.updater().check()["result"])
+
+    def test_trigger_rate_limited(self):
+        up = self.updater()
+        self.assertEqual(up.trigger()["result"], "checking for updates")
+        self.assertEqual(up.trigger()["result"], "check already requested")
 
 
 if __name__ == "__main__":

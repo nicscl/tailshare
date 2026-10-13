@@ -27,7 +27,8 @@ TOOLS = [
         "name": "send",
         "description": (
             "Send a message to another agent on the tailnet. `to` is an address (host/harness/folder[/session]), "
-            "a prefix such as host/harness/folder (every session in that folder), or a pattern like */*/myproject. "
+            "a prefix such as host/harness/folder (every session in that folder), a pattern like */*/myproject, "
+            "or @user / @user/<pattern> for the sessions of one person. "
             "If the machine is offline the message is queued and delivered when it comes back."
         ),
         "inputSchema": {
@@ -73,7 +74,7 @@ def _tool(name: str, args: dict) -> str:
     if name == "agents":
         rows = agent.call("/agents")["agents"]
         lines = [
-            f"{a['address']}  {'(you)' if a['address'] == me['address'] else 'online' if a.get('online') else 'offline, seen ' + agent.ago(a.get('last_seen', 0))}"
+            f"{a['address']}  user {a.get('user') or '-'}  {'(you)' if a['address'] == me['address'] else 'online' if a.get('online') else 'offline, seen ' + agent.ago(a.get('last_seen', 0))}"
             for a in rows
         ]
         return "\n".join(lines) or "no agents yet"
