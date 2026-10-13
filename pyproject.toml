@@ -1,6 +1,6 @@
 [project]
 name = "tailshare"
-version = "0.1.0"
+version = "0.2.0"
 description = "Drop files into your tailnet from the terminal."
 requires-python = ">=3.11"
 dependencies = ["textual>=8", "qrcode>=8"]
