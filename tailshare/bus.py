@@ -61,12 +61,12 @@ def log(msg: str) -> None:
     sys.stderr.write(f"{datetime.now():%H:%M:%S} bus: {msg}\n")
 
 
-def request(url: str, payload: dict | None = None, timeout: float = 5.0) -> dict:
+def request(url: str, payload: dict | None = None, timeout: float = 5.0, headers: dict | None = None) -> dict:
     """GET (payload None) or POST JSON to a bus endpoint. Raises BusError on HTTP errors."""
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="GET" if data is None else "POST",
-        headers={HEADER: "1", "Content-Type": "application/json"},
+        headers={HEADER: "1", "Content-Type": "application/json", **(headers or {})},
     )
     try:
         with _opener.open(req, timeout=timeout) as r:
@@ -788,7 +788,7 @@ class _Handler(BaseHTTPRequestHandler):
             if path.startswith("/keys/"):
                 if b.keys is None:
                     raise BusError("SSH keys are not available on this machine", 409)
-                return self._reply(200, b.keys.route(method, path, body, local, ip))
+                return self._reply(200, b.keys.route(method, path, body, local, ip, self.headers.get("X-Tailshare-Keys", "")))
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello(ip))

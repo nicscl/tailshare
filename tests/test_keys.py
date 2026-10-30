@@ -136,6 +136,8 @@ class Flow(unittest.TestCase):
         keys.gate_exe = lambda: "/u/bin/tailshare"
         self._notify = keys.Keys._notify
         keys.Keys._notify = lambda *a: None  # no desktop notifications from tests
+        self._sk = keys.REQUIRE_SK
+        keys.REQUIRE_SK = False  # ssh-keygen cannot make security keys without the hardware
         self.tmp = Path(tempfile.mkdtemp())
         self.pro_port = free_port()
         self.air = make_bus("air", StaticNet(
@@ -148,8 +150,8 @@ class Flow(unittest.TestCase):
         self.signing_key, sign_pub = keypair(self.tmp, "signer")
         self.signers.write_text(sessions.trust_line("nick", sign_pub))
         os.chmod(self.signers, 0o600)
-        self.air_keys = keys.Keys(self.air, self.signers, self.tmp / "air" / "authorized_keys")
-        self.pro_keys = keys.Keys(self.pro, self.signers, self.tmp / "pro" / "authorized_keys")
+        self.air_keys = keys.Keys(self.air, self.signers, self.tmp / "air" / "authorized_keys", self.tmp / "air.token")
+        self.pro_keys = keys.Keys(self.pro, self.signers, self.tmp / "pro" / "authorized_keys", self.tmp / "pro.token")
         self.air.keys, self.pro.keys = self.air_keys, self.pro_keys
         self.air.store.x("INSERT INTO peers(host, ip, version, last_ok) VALUES('pro','127.0.0.1','t',?)", time.time())
         _, self.phone_pub = keypair(self.tmp, "phone")
@@ -157,6 +159,7 @@ class Flow(unittest.TestCase):
 
     def tearDown(self):
         keys.install_problem, keys.gate_exe, keys.Keys._notify = self._problem, self._exe, self._notify
+        keys.REQUIRE_SK = self._sk
         self.srv.shutdown()
         self.srv.server_close()
 
@@ -187,7 +190,7 @@ class Flow(unittest.TestCase):
 
     def test_approve_here_only(self):
         r = self.enroll()
-        out = self.air_keys.approve({"id": r["request_id"], "mode": "pane"})
+        out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane"})
         self.assertEqual([i["host"] for i in out["installed"]], ["air"])
         text = (self.tmp / "air" / "authorized_keys").read_text()
         self.assertIn(f'restrict,pty,command="/u/bin/tailshare ssh-gate" {keys.parse_pubkey(self.phone_pub)} '
@@ -196,7 +199,7 @@ class Flow(unittest.TestCase):
         st = self.air_keys.status(PHONE, r["request_id"])
         self.assertEqual((st["status"], st["key_id"]), ("approved", out["key_id"]))
         with self.assertRaises(bus.BusError):
-            self.air_keys.approve({"id": r["request_id"]})  # not pending any more
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"]})  # not pending any more
 
     def signed(self, req, mode="pane", hosts=None):
         p = self.air_keys.pending()["pending"][0]
@@ -207,7 +210,7 @@ class Flow(unittest.TestCase):
     def test_signed_fan_out_replay_and_revoke(self):
         r = self.enroll()
         payload, sig = self.signed(r)
-        out = self.air_keys.approve({"id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
+        out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
         self.assertEqual(sorted(i["host"] for i in out["installed"]), ["air", "pro"], out)
         self.assertIn("tailshare:kaaaaaaaaaaaa", (self.tmp / "pro" / "authorized_keys").read_text())
         with self.assertRaises(bus.BusError) as cm:  # the same signed approval again
@@ -224,7 +227,7 @@ class Flow(unittest.TestCase):
     def test_device_revokes_its_own_key(self):
         r = self.enroll()
         payload, sig = self.signed(r)
-        self.air_keys.approve({"id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
+        self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
         with self.assertRaises(bus.BusError) as cm:  # not the device that enrolled it, nor the owner's machine
             self.air_keys.revoke("100.64.0.66", {"key_id": "kaaaaaaaaaaaa"})
         self.assertEqual(cm.exception.code, 403)
@@ -244,12 +247,80 @@ class Flow(unittest.TestCase):
             self.air.peer_list("100.64.0.66")
         self.assertEqual(cm.exception.code, 403)
 
+    def test_local_api_needs_the_token(self):
+        local = self.air.listen("127.0.0.1", local=True)
+        url = f"http://127.0.0.1:{local.server_address[1]}/bus/v1"
+        try:
+            r = self.enroll()
+            body = {"id": r["request_id"], "mode": "shell", "confirm": r["fingerprint"][-6:]}
+            for token in (None, "0" * 64):  # another user or process on this machine
+                with self.assertRaises(bus.BusError) as cm:
+                    bus.request(url + "/keys/approve", body, headers={keys.TOKEN_HEADER: token} if token else None)
+                self.assertEqual(cm.exception.code, 403)
+            self.assertEqual(self.air_keys.pending()["pending"][0]["id"], r["request_id"])  # nothing approved
+            token = (self.tmp / "air.token").read_text()
+            self.assertEqual(oct((self.tmp / "air.token").stat().st_mode & 0o777), "0o600")
+            out = bus.request(url + "/keys/approve", body, headers={keys.TOKEN_HEADER: token})
+            self.assertEqual(out["installed"][0]["mode"], "shell")
+        finally:
+            local.shutdown()
+            local.server_close()
+
+    def test_approve_checks_the_typed_characters(self):
+        r = self.enroll()
+        for confirm in (None, "", "abcdef", r["fingerprint"][-5:]):
+            with self.assertRaises(bus.BusError) as cm:
+                self.air_keys.approve({"id": r["request_id"], "confirm": confirm})
+            self.assertEqual(cm.exception.code, 403)
+        # a look-alike key pending at the same time blocks both
+        other = self.enroll(pub=keypair(self.tmp, "twin")[1], device="Nick's iPhone")
+        self.air_keys.store.x("UPDATE key_requests SET fingerprint=? WHERE id=?",
+                              "SHA256:x" + r["fingerprint"][-6:], other["request_id"])
+        with self.assertRaises(bus.BusError) as cm:
+            self.air_keys.approve({"id": r["request_id"], "confirm": r["fingerprint"][-6:]})
+        self.assertEqual(cm.exception.code, 409)
+
+    def test_revoked_request_can_enroll_again(self):
+        r = self.enroll()
+        out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"]})
+        self.air_keys.rm({"key_id": out["key_id"]})
+        self.assertEqual(self.air_keys.status(PHONE, r["request_id"])["status"], "revoked")
+        again = self.enroll()
+        self.assertNotEqual(again["request_id"], r["request_id"])
+        self.assertEqual(again["status"], "pending")
+
+    def test_rm_reaches_machines_it_was_installed_on(self):
+        r = self.enroll()
+        payload, sig = self.signed(r)
+        out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane",
+                                     "payload": payload, "signature": sig})
+        self.air.store.x("DELETE FROM peers WHERE host='pro'")  # pro no longer among the current targets
+        self.assertEqual(self.air_keys.targets(), ["air"])
+        self.assertEqual(self.air_keys.rm({"key_id": out["key_id"]})["elsewhere"], {"pro": "removed"})
+        self.assertNotIn("tailshare:", (self.tmp / "pro" / "authorized_keys").read_text())
+
+    def test_signed_approvals_need_a_security_key(self):
+        r = self.enroll()
+        payload, sig = self.signed(r)
+        self.assertEqual(keys.signature_key_type(sig), "ssh-ed25519")
+        keys.REQUIRE_SK = True
+        with self.assertRaises(bus.BusError) as cm:
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane",
+                                   "payload": payload, "signature": sig})
+        self.assertEqual(cm.exception.code, 403)
+        self.assertIn("security key", str(cm.exception))
+
+    def test_status_never_says_approving(self):
+        r = self.enroll()
+        self.air_keys.store.x("UPDATE key_requests SET status='approving' WHERE id=?", r["request_id"])
+        self.assertEqual(self.air_keys.status(PHONE, r["request_id"])["status"], "pending")
+
     def test_launch_signature_is_not_a_key_approval(self):
         r = self.enroll()
         payload, _ = self.signed(r)
         wrong_ns = sessions.sign(payload, self.signing_key)  # tailshare-launch namespace
         with self.assertRaises(bus.BusError) as cm:
-            self.air_keys.approve({"id": r["request_id"], "payload": payload, "signature": wrong_ns})
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "payload": payload, "signature": wrong_ns})
         self.assertEqual(cm.exception.code, 403)
         self.assertFalse((self.tmp / "air" / "authorized_keys").exists())
 
@@ -257,11 +328,11 @@ class Flow(unittest.TestCase):
         r = self.enroll()
         payload, sig = self.signed(r, mode="shell")
         with self.assertRaises(bus.BusError):
-            self.air_keys.approve({"id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
 
     def test_peer_routes_need_same_user(self):
         eve = make_bus("eve", StaticNet("eve", usermap={"127.0.0.1": "eve@example.com"}, user=OWNER))
-        eve.keys = keys.Keys(eve, self.signers, self.tmp / "eve" / "authorized_keys")
+        eve.keys = keys.Keys(eve, self.signers, self.tmp / "eve" / "authorized_keys", self.tmp / "eve.token")
         with self.assertRaises(bus.BusError) as cm:
             eve.keys.install_from_peer("127.0.0.1", {"payload": "{}", "signature": ""})
         self.assertEqual(cm.exception.code, 403)
@@ -275,9 +346,10 @@ class Flow(unittest.TestCase):
         r = bus.request(f"{url}/keys/enroll", {"pubkey": self.phone_pub, "device_name": "ipad"})
         self.assertEqual(r["status"], "pending")
         self.assertEqual(bus.request(f"{url}/keys/enroll/{r['request_id']}")["status"], "pending")
-        for path in ("/keys/pending", "/keys/ls", "/keys/panes"):  # local-only routes are not on the peer API
-            with self.assertRaises(bus.BusError) as cm:
-                bus.request(url + path)
+        for path, body in (("/keys/pending", None), ("/keys/ls", None), ("/keys/approve", {"id": r["request_id"]}),
+                           ("/keys/deny", {"id": r["request_id"]}), ("/keys/rm", {"key_id": "kaaaaaaaaaaaa"})):
+            with self.assertRaises(bus.BusError) as cm:  # local-only routes are not on the peer API
+                bus.request(url + path, body)
             self.assertEqual(cm.exception.code, 404, path)
         hello = bus.request(f"{url}/hello")
         self.assertEqual((hello["ssh"]["owner"], hello["ssh"]["port"], hello["ssh"]["enroll"]), (OWNER, 22, True))
@@ -296,7 +368,7 @@ class Flow(unittest.TestCase):
         r = self.enroll()
         self.air_keys.store.x("UPDATE key_requests SET status='approving' WHERE id=?", r["request_id"])  # another approve running
         with self.assertRaises(bus.BusError) as cm:
-            self.air_keys.approve({"id": r["request_id"]})
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"]})
         self.assertEqual(cm.exception.code, 404)
         self.assertEqual(self.air_keys.ls()["keys"], [])
 
@@ -304,14 +376,14 @@ class Flow(unittest.TestCase):
         r = self.enroll()
         payload, sig = self.signed(r)
         with self.assertRaises(bus.BusError):
-            self.air_keys.approve({"id": r["request_id"], "payload": payload.replace("Nick's iPhone", "Nick's iPhonf"), "signature": sig})
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "payload": payload.replace("Nick's iPhone", "Nick's iPhonf"), "signature": sig})
         self.assertEqual(self.air_keys.status(PHONE, r["request_id"])["status"], "pending")
 
     def test_only_owner_machines_get_approvals_and_revocations(self):
         self.air.net.peers["pro"]["user"] = "eve@example.com"  # the name now belongs to someone else's machine
         r = self.enroll()
         payload, sig = self.signed(r)
-        out = self.air_keys.approve({"id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
+        out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
         self.assertEqual([i["host"] for i in out["installed"]], ["air"])
         self.assertIn("pro", out["errors"])
         self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
@@ -348,6 +420,52 @@ class GateChecks(unittest.TestCase):
             self.assertFalse(keys.own_socket(str(tmp / "missing")))
         finally:
             s.close()
+
+
+@unittest.skipUnless(keys.tmux_binary(""), "needs tmux")
+class GateEndToEnd(unittest.TestCase):
+    """cmd_gate against a real tmux server and a bus database, stopping at the exec."""
+
+    def setUp(self):
+        self.tmux = keys.tmux_binary("")
+        self.state = Path(tempfile.mkdtemp())
+        self.sock = str(Path(tempfile.mkdtemp(dir="/tmp")) / "s")  # short: sun_path is ~104 bytes
+        subprocess.run([self.tmux, "-S", self.sock, "new-session", "-d", "sleep 60"], check=True)
+        self.pane = subprocess.run([self.tmux, "-S", self.sock, "display", "-p", "#{pane_id}"],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+        b = bus.Bus(bus.Store(self.state / "bus.db"), StaticNet("air"), free_port())
+        b.register({"id": "A", "harness": "claude", "cwd": "/x/api",
+                    "tmux": {"socket": self.sock, "pane": self.pane, "target": "", "bin": self.tmux}})
+        self.old = bus.STATE_DIR, os.execv, os.environ.get("SSH_ORIGINAL_COMMAND")
+        bus.STATE_DIR = self.state
+        self.execs = []
+        os.execv = lambda path, argv: self.execs.append(argv)
+
+    def tearDown(self):
+        bus.STATE_DIR, os.execv = self.old[0], self.old[1]
+        if self.old[2] is None:
+            os.environ.pop("SSH_ORIGINAL_COMMAND", None)
+        else:
+            os.environ["SSH_ORIGINAL_COMMAND"] = self.old[2]
+        subprocess.run([self.tmux, "-S", self.sock, "kill-server"], capture_output=True)
+
+    def gate(self, cmd):
+        os.environ["SSH_ORIGINAL_COMMAND"] = cmd
+        keys.cmd_gate(None)
+
+    def test_attaches_to_the_registered_pane(self):
+        self.gate(f"tmux -S {self.sock} attach -r -t {self.pane}")
+        self.assertEqual(self.execs, [[self.tmux, "-S", self.sock, "attach", "-r", "-t", self.pane]])
+
+    def test_refuses(self):
+        for cmd in ("", "id", f"tmux -S {self.sock} attach -t %999", f"tmux -S {self.sock} attach -t {self.pane} ; run-shell id",
+                    f"tmux -S /tmp/elsewhere attach -t {self.pane}"):
+            with self.assertRaises(SystemExit, msg=cmd):
+                self.gate(cmd)
+        subprocess.run([self.tmux, "-S", self.sock, "kill-server"], check=True)
+        with self.assertRaises(SystemExit):  # registered, but the pane is gone
+            self.gate(f"tmux -S {self.sock} attach -t {self.pane}")
+        self.assertEqual(self.execs, [])
 
 
 if __name__ == "__main__":

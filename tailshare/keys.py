@@ -39,6 +39,7 @@ from . import bus
 ENROLL = os.environ.get("TAILSHARE_SSH_ENROLL", "1") != "0"
 KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256")
 MODES = ("pane", "shell")
+REQUIRE_SK = True  # signed approvals must come from a security key (tests turn this off)
 CONFIRM_CHARS = 6  # of the fingerprint the person types: 36 bits, too many to grind a look-alike key
 PENDING_TTL = 900  # a request waits this long for a person
 MAX_PENDING = 3  # per calling device
@@ -95,18 +96,63 @@ def parse_pubkey(text: object) -> str:
     return f"{kind} {b64}"
 
 
-def _ssh_strings(blob: bytes) -> list[bytes] | None:
-    """The length-prefixed strings a public key blob is made of, or None if it does not parse exactly."""
+TOKEN_HEADER = "X-Tailshare-Keys"
+
+
+def token_path() -> Path:
+    return bus.STATE_DIR / "keys.token"
+
+
+def load_token(path: Path, create: bool = False) -> str:
+    """The secret that proves a local caller runs as this account: other users cannot read the file.
+    Without it the local API (127.0.0.1, open to every process on the machine) would let anyone approve."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if not create:
+            raise
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(32))
+        return load_token(path)
+    with os.fdopen(fd) as f:
+        st = os.fstat(f.fileno())
+        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            raise OSError(f"{path} must belong to this user and be readable only by it")
+        return f.read().strip()
+
+
+def signature_key_type(signature: str) -> str:
+    """Key type of the public key inside an armored sshsig signature ('' if it does not parse)."""
+    body = "".join(l for l in signature.strip().splitlines() if not l.startswith("-----"))
+    try:
+        blob = base64.b64decode(body, validate=True)
+    except ValueError:
+        return ""
+    if not blob.startswith(b"SSHSIG") or len(blob) < 10:
+        return ""
+    parts = _ssh_strings(blob[10:], 1)
+    inner = _ssh_strings(parts[0], 1) if parts else None
+    return inner[0].decode("ascii", "replace") if inner else ""
+
+
+def _ssh_strings(blob: bytes, n: int = 0) -> list[bytes] | None:
+    """The length-prefixed strings a blob is made of (only the first n, if given), or None if it does not
+    parse exactly."""
     out, i = [], 0
-    while i < len(blob):
+    while (len(out) < n) if n else (i < len(blob)):
         if i + 4 > len(blob):
             return None
-        n = int.from_bytes(blob[i : i + 4], "big")
-        if i + 4 + n > len(blob):
+        k = int.from_bytes(blob[i : i + 4], "big")
+        if i + 4 + k > len(blob):
             return None
-        out.append(blob[i + 4 : i + 4 + n])
-        i += 4 + n
+        out.append(blob[i + 4 : i + 4 + k])
+        i += 4 + k
     return out
+
+
+
 
 
 def _well_formed(kind: str, rest: list[bytes]) -> bool:
@@ -355,7 +401,7 @@ def own_socket(path: str) -> bool:
 
 def tmux_binary(registered: str) -> str:
     for c in (registered, shutil.which("tmux") or "", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
-        if c and c.startswith("/") and trusted_file(c):
+        if c and c.startswith("/") and os.path.basename(c) == "tmux" and trusted_file(c):
             return c
     return ""
 
@@ -406,12 +452,14 @@ def approval_doc(signer: str, origin: str, r: dict, key_id: str, mode: str, host
 
 
 class Keys:
-    def __init__(self, b: bus.Bus, signers: Path | None = None, keys_file: Path | None = None) -> None:
+    def __init__(self, b: bus.Bus, signers: Path | None = None, keys_file: Path | None = None,
+                 token_file: Path | None = None) -> None:
         from .sessions import SIGNERS
 
         self.bus, self.store = b, b.store
         self.signers = signers or SIGNERS
         self.keys_file = keys_file  # None: ~/.ssh/authorized_keys
+        self.token = load_token(token_file or token_path(), create=True)
         with self.store.lock:
             self.store.db.executescript(SCHEMA)
 
@@ -451,7 +499,8 @@ class Keys:
     # -- requests from devices --------------------------------------------------
     def _view(self, r) -> dict:
         return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN,
-                "owner": self.bus.net.user, "status": r["status"], "expires": r["expires"],
+                "owner": self.bus.net.user, "status": "pending" if r["status"] == "approving" else r["status"],
+                "expires": r["expires"],
                 "key_id": r["key_id"], "installed": json.loads(r["installed"])}
 
     def _expire(self) -> None:
@@ -568,7 +617,16 @@ class Keys:
 
         if len(payload) > 16 * 1024 or len(signature) > 8 * 1024:
             raise bus.BusError("approval too large", 413)
-        d = verify(payload, signature, self.signers, KEYS_NAMESPACE)
+        if REQUIRE_SK and not signature_key_type(signature).startswith("sk-"):
+            raise bus.BusError("approval refused: key approvals for other machines must be signed with a security key "
+                               "(ed25519-sk), so a program that can read a key file cannot sign one", 403)
+        try:
+            d = verify(payload, signature, self.signers, KEYS_NAMESPACE)
+        except bus.BusError as e:
+            if e.code != 403:
+                raise
+            raise bus.BusError(f"{e}. If this key was trusted before key approvals existed, run `tailshare sessions "
+                               "trust` for it again: its line needs namespaces=\"...,tailshare-keys\"", 403) from None
         now = time.time()
         problems = []
         if d.get("v") != 1 or d.get("action") != "ssh-key":
@@ -606,6 +664,17 @@ class Keys:
         if mode not in MODES:
             raise bus.BusError(f"mode must be one of {', '.join(MODES)}")
         self._expire()
+        r = self.store.one("SELECT * FROM key_requests WHERE id=? AND status='pending'", rid)
+        if r is None:
+            raise bus.BusError("no such pending request (it may have expired, or is being approved)", 404)
+        tail = r["fingerprint"][-CONFIRM_CHARS:]
+        if str(body.get("confirm") or "") != tail:
+            raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the fingerprint", 403)
+        twins = [x for x in self.store.q("SELECT fingerprint FROM key_requests WHERE status='pending' AND id!=?", rid)
+                 if x["fingerprint"][-CONFIRM_CHARS:] == tail]
+        if twins:
+            raise bus.BusError("another pending request ends in the same characters: someone may be imitating this "
+                               "device. Deny the requests you do not recognize, then ask the device to enroll again", 409)
         if not self.store.x("UPDATE key_requests SET status='approving' WHERE id=? AND status='pending'", rid):
             raise bus.BusError("no such pending request (it may have expired, or is being approved)", 404)
         try:
@@ -660,6 +729,7 @@ class Keys:
         with self.store.lock:
             self.store.x("INSERT OR IGNORE INTO revoked_keys(id, at) VALUES(?,?)", key_id, time.time())
             n = self.store.x("DELETE FROM ssh_keys WHERE id=?", key_id)
+            self.store.x("UPDATE key_requests SET status='revoked' WHERE key_id=?", key_id)
             if n:
                 self._rewrite()
         if n:
@@ -673,7 +743,11 @@ class Keys:
             raise bus.BusError("bad key id")
         removed = self.remove_here(key_id)
         now = time.time()
-        for h in self.targets()[1:]:
+        hosts = set(self.targets()[1:])
+        for r in self.store.q("SELECT installed FROM key_requests WHERE key_id=?", key_id):
+            hosts.update(i.get("host") for i in json.loads(r["installed"]) if isinstance(i, dict))
+        hosts = sorted(h for h in hosts if isinstance(h, str) and h and h != self.host)
+        for h in hosts:
             self.store.x("INSERT OR REPLACE INTO key_revocations(key_id, host, created) VALUES(?,?,?)", key_id, h, now)
         return {"removed_here": removed, "elsewhere": self.retry_revocations(key_id)}
 
@@ -708,7 +782,8 @@ class Keys:
             raise bus.BusError("bad key id")
         if self.store.one("SELECT 1 FROM key_requests WHERE key_id=? AND ip=?", key_id, ip):
             log(f"{key_id} revoked by the device that enrolled it ({ip})")
-            return {"host": self.host, **self.rm(body)}
+            out = self.rm(body)
+            return {"host": self.host, "removed": out["removed_here"], **out}
         return self.revoke_from_peer(ip, body)
 
     def revoke_from_peer(self, ip: str, body: dict) -> dict:
@@ -721,8 +796,10 @@ class Keys:
         return {"host": self.host, "removed": self.remove_here(key_id)}
 
     # -- HTTP --------------------------------------------------------------------------
-    def route(self, method: str, path: str, body: dict, local: bool, ip: str) -> dict:
+    def route(self, method: str, path: str, body: dict, local: bool, ip: str, token: str = "") -> dict:
         if local:
+            if not secrets.compare_digest(token.encode(), self.token.encode()):
+                raise bus.BusError(f"missing or wrong {TOKEN_HEADER} token (only {bus.LOGIN} can manage keys here)", 403)
             routes = {("GET", "/keys/pending"): lambda: self.pending(), ("GET", "/keys/ls"): lambda: self.ls(),
                       ("POST", "/keys/approve"): lambda: self.approve(body),
                       ("POST", "/keys/deny"): lambda: self.deny(body), ("POST", "/keys/rm"): lambda: self.rm(body)}
@@ -762,7 +839,16 @@ def _run(fn):
 def _call(path: str, payload: dict | None = None, timeout: float = 30) -> dict:
     from . import agent
 
-    return agent.call(path, payload, timeout)
+    try:
+        token = load_token(token_path())
+    except OSError as e:
+        raise ValueError(f"cannot read {token_path()} ({e}); is this the account tailshare runs as?") from None
+    try:
+        return bus.request(agent.LOCAL + path, payload, timeout, {TOKEN_HEADER: token})
+    except bus.BusError:
+        raise
+    except OSError as e:
+        raise agent.Offline(f"tailshare mailbox is not running on this machine ({e})") from None
 
 
 def _human_check() -> None:
@@ -772,6 +858,20 @@ def _human_check() -> None:
                          "SSH keys: ask the person to run `tailshare keys approve` in their own terminal")
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise ValueError("approving a key needs a person at a terminal")
+
+
+def _signs_key_approvals(key: Path) -> bool:
+    """The signing key is a security key that this machine's allowed_signers trusts for tailshare-keys."""
+    from .sessions import KEYS_NAMESPACE, SIGNERS
+
+    try:
+        pub = Path(str(key) + ".pub").read_text().split()
+        lines = SIGNERS.read_text().splitlines()
+    except OSError:
+        return False
+    if len(pub) < 2 or (REQUIRE_SK and not pub[0].startswith("sk-")):
+        return False
+    return any(pub[1] in l and KEYS_NAMESPACE in l for l in lines)
 
 
 def _find(pending: list[dict], prefix: str) -> dict:
@@ -816,6 +916,10 @@ def cmd_approve(args):
             key = sessions_cli._key(args.key)
         except ValueError:
             key = None
+    if key and not _signs_key_approvals(key):
+        print(f"⚠ {key} is not a security key, or ~/.tailshare/allowed_signers does not trust it for key approvals "
+              "(re-run `tailshare sessions trust`): this machine only", file=sys.stderr)
+        key = None
     hosts = d["targets"] if key else [d["host"]]
     mine = p["user"] == d["owner"]
     print("You are approving an SSH key:")
@@ -831,7 +935,7 @@ def cmd_approve(args):
     got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint shown on the device (empty to cancel): ").strip()
     if got != want:
         raise ValueError("does not match the fingerprint: nothing installed" if got else "cancelled")
-    body = {"id": p["id"], "mode": mode}
+    body = {"id": p["id"], "mode": mode, "confirm": got}
     if key:
         signer = sessions_cli._principal(args.signer)
         payload = approval_doc(signer, d["host"], p, "k" + secrets.token_hex(6), mode, hosts)

@@ -35,15 +35,23 @@ tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machin
 
 ## Who can approve, and where the key goes
 
-- **Only a person, on that machine.** `keys approve` refuses to run without a terminal and refuses inside an
-  agent's shell (`CLAUDECODE`, `CODEX_THREAD_ID` and the like). Approval is not offered over MCP. An agent
-  with a shell could still edit `authorized_keys` itself; these checks stop agents from being *talked into*
-  approving, which is the likely attack (a bus message saying "please approve key X").
-- **This machine only, unless signed.** With a signing key (`TAILSHARE_SIGN_KEY` or `~/.ssh/id_*_sk`), the
-  approval is signed with `ssh-keygen -Y sign -n tailshare-keys` and sent to the owner's other machines that
+- **Only this account, on that machine.** The local API listens on 127.0.0.1, where every process and every
+  Unix user of the machine can reach it. So approve, deny, rm, pending and ls also need the secret in
+  `~/.tailshare/keys.token` (mode 0600, made by the mailbox), sent as the `X-Tailshare-Keys` header. Other
+  users cannot read it. The server itself checks the 6 typed characters (`confirm`). It refuses while another
+  pending request ends in the same characters, since that would be someone imitating the device.
+- **A person, not an agent: friction, not a wall.** `keys approve` refuses to run without a terminal and
+  inside an agent's shell (`CLAUDECODE`, `CODEX_THREAD_ID` and the like), and approval is not offered over MCP.
+  An agent running as this account can read the token, call the API, or edit `authorized_keys` directly; no
+  check on the same account can stop that. These checks make the likely attack, a bus message saying
+  "please approve key X", fail when an agent goes along with it, instead of quietly working.
+- **This machine only, unless signed with a security key.** With a FIDO signing key (`TAILSHARE_SIGN_KEY` or
+  `~/.ssh/id_*_sk`; other machines refuse approvals signed by plain key files, which any program running as you
+  could use), the approval is signed with `ssh-keygen -Y sign -n tailshare-keys` and sent to the owner's other machines that
   run tailshare. Each one checks the signature against its own `~/.tailshare/allowed_signers` before
   installing. One machine can never add keys to the others on its own say-so. `--here` skips the others.
-  Keys trusted with `tailshare sessions trust` sign both launches and key approvals. A launch signature is
+  Keys trusted with `tailshare sessions trust` sign both launches and key approvals. Lines written before key
+  approvals existed name only `tailshare-launch`: run `trust` for that key again. A launch signature is
   never accepted as a key approval, and a key approval is never accepted as a launch.
 - **Someone else's machine shared into your tailnet**: the device enrolls there and that machine's owner
   approves it there. Install and revoke requests from other machines are only accepted from machines of the
@@ -53,7 +61,8 @@ tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machin
 
 ## Revoking
 
-`tailshare keys rm <key id>` removes the key here, then asks the owner's other machines to remove it.
+`tailshare keys rm <key id>` removes the key here, then asks the owner's other machines, and every machine it
+was installed on, to remove it.
 The device itself can do the same with `POST /bus/v1/keys/revoke {"key_id": "k…"}` on the machine it enrolled
 with, from the tailnet node that made the request (an app's "Remove access" button). Removing access needs no
 signature. Machines that are offline are retried every minute until they answer.
@@ -117,5 +126,6 @@ answers:
 - `tailshare keys pending` shows the first 8 characters of `request_id`, and `keys approve` takes any prefix
   that matches one request, so a client can show `tailshare keys approve <request_id[:8]>`.
 - `GET /bus/v1/keys/enroll/<request_id>` answers the same shape. Only the device that made the request can
-  read it. `status` is one of `pending`, `approved`, `denied`, `expired`.
+  read it. `status` is one of `pending`, `approved`, `denied`, `expired`, `revoked`. After `revoked`, enrolling the same key
+  starts a new request.
 - Every call needs the header `X-Tailshare: 1`.
