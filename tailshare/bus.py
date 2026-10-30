@@ -14,6 +14,7 @@ so it cannot be forged.
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from . import __version__, core
 BUS_PORT = int(os.environ.get("TAILSHARE_BUS_PORT", "8789"))
 STATE_DIR = Path(os.environ.get("TAILSHARE_STATE", "~/.tailshare")).expanduser()
 PROTOCOL = 1
+SHARE_PANES = os.environ.get("TAILSHARE_SHARE_PANES", "1") != "0"  # tmux panes in /hello, for attaching
 HEADER = "X-Tailshare"  # required on every request: a web page cannot add it cross-site
 TTL = 7 * 86400  # undelivered and unread messages expire after a week
 LIVE = 90  # an agent that polled this recently counts as online
@@ -90,6 +92,40 @@ def make_address(host: str, harness: str, folder: str, session: str = "") -> str
     if session:
         parts.append(slug(session))
     return "/".join(parts)
+
+
+def _login() -> str:
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):
+        return ""
+
+
+LOGIN = _login()  # the account this mailbox and its agents run as: what to SSH in as
+_LOGIN_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,63}")
+_PANE_RE = re.compile(r"%[0-9]{1,6}")
+_PATH_RE = re.compile(r"/[^\x00-\x1f\x7f]{0,255}")
+_TARGET_RE = re.compile(r"[^\x00-\x1f\x7f]{0,128}")
+
+
+def clean_login(v: object) -> str:
+    return v if isinstance(v, str) and _LOGIN_RE.fullmatch(v) else ""
+
+
+def clean_tmux(t: object) -> dict:
+    """A tmux pane {socket, pane, target, bin}, or {} if it is missing or malformed.
+    Peers send these too, and they end up in shell commands, so only well-formed values pass."""
+    if not isinstance(t, dict):
+        return {}
+    sock, pane = t.get("socket"), t.get("pane")
+    if not (isinstance(sock, str) and _PATH_RE.fullmatch(sock) and isinstance(pane, str) and _PANE_RE.fullmatch(pane)):
+        return {}
+    out = {"socket": sock, "pane": pane, "target": "", "bin": ""}
+    if isinstance(t.get("target"), str) and _TARGET_RE.fullmatch(t["target"]):
+        out["target"] = t["target"]
+    if isinstance(t.get("bin"), str) and _PATH_RE.fullmatch(t["bin"]):
+        out["bin"] = t["bin"]
+    return out
 
 
 def is_pattern(target: str) -> bool:
@@ -185,7 +221,7 @@ class Net:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents(
   id TEXT PRIMARY KEY, address TEXT NOT NULL, harness TEXT, cwd TEXT, session TEXT,
-  pid INTEGER, first_seen REAL, last_seen REAL, user TEXT NOT NULL DEFAULT '');
+  pid INTEGER, first_seen REAL, last_seen REAL, user TEXT NOT NULL DEFAULT '', tmux TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL,
   files TEXT NOT NULL DEFAULT '[]', created REAL NOT NULL, received REAL NOT NULL,
@@ -212,7 +248,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -276,6 +312,7 @@ class Bus:
         cwd = str(a.get("cwd") or "")
         session = str(a.get("session") or "").strip()
         user = self._user_for(a)
+        tmux = clean_tmux(a.get("tmux"))
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:
@@ -287,11 +324,12 @@ class Bus:
                 clash = any(r["address"].split(":")[0] == base for r in live)
                 address = f"{base}:{slug(aid)[:4]}" if clash else base
             self.store.x(
-                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user)"
-                " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
+                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
                 " harness=excluded.harness, cwd=excluded.cwd, session=excluded.session,"
-                " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user",
+                " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user, tmux=excluded.tmux",
                 aid, address, harness, cwd, session, int(a.get("pid") or 0), now, now, user,
+                json.dumps(tmux) if tmux else "",
             )
             self._claim(aid, address, user)
         return self.agent(aid)
@@ -333,6 +371,7 @@ class Bus:
             "id": r["id"], "address": r["address"], "user": r["user"], "harness": r["harness"], "session": r["session"],
             "cwd": r["cwd"], "pid": r["pid"], "last_seen": r["last_seen"],
             "online": r["last_seen"] > time.time() - LIVE, "host": self.net.host,
+            "tmux": json.loads(r["tmux"]) if r["tmux"] else {}, "login": LOGIN,
         }
 
     def by_pid(self, pid: int) -> dict | None:
@@ -352,7 +391,8 @@ class Bus:
         for p in self.store.q("SELECT * FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
             up = bool(self.net.peers.get(p["host"], {}).get("online"))
             for a in json.loads(p["agents"]):
-                a.update(host=p["host"], online=bool(a.get("online")) and up, host_online=up)
+                a.update(host=p["host"], online=bool(a.get("online")) and up, host_online=up,
+                         tmux=clean_tmux(a.get("tmux")), login=clean_login(a.get("login")))
                 out.append(a)
         return {"host": self.net.host, "agents": out}
 
@@ -454,10 +494,10 @@ class Bus:
 
     # -- peers ----------------------------------------------------------------
     def hello(self) -> dict:
-        agents = [
-            {k: a[k] for k in ("address", "user", "harness", "session", "online", "last_seen")}
-            for a in self.local_agents()
-        ]
+        """What any tailnet peer may know. With SHARE_PANES, also where each agent's tmux pane is,
+        so a person can attach to it; SSH to that machine is still the gate."""
+        keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login") if SHARE_PANES else ())
+        agents = [{k: a[k] for k in keys} for a in self.local_agents()]
         return {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents}
 
     def version(self) -> str:

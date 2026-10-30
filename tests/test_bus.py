@@ -211,6 +211,77 @@ class TwoMachines(unittest.TestCase):
             srv.server_close()
 
 
+PANE = {"socket": "/private/tmp/tmux-501/default", "pane": "%7", "target": "main:1.0", "bin": "/opt/homebrew/bin/tmux"}
+
+
+class TmuxPanes(unittest.TestCase):
+    """Agents in tmux advertise their pane in /hello, so a person can attach to it."""
+
+    def setUp(self):
+        self.pro_port = free_port()
+        self.air = make_bus("air", StaticNet(
+            "air", peers={"pro": {"ip": "127.0.0.1", "port": self.pro_port, "online": True}}))
+        self.pro = make_bus("pro", StaticNet("pro"), self.pro_port)
+
+    def test_clean_tmux(self):
+        self.assertEqual(bus.clean_tmux(PANE), PANE)
+        self.assertEqual(bus.clean_tmux({"socket": "/s", "pane": "%1"}), {"socket": "/s", "pane": "%1", "target": "", "bin": ""})
+        for bad in (None, "x", {}, {**PANE, "pane": "7"}, {**PANE, "pane": "%7; rm -rf ~"},
+                    {**PANE, "socket": "relative"}, {**PANE, "socket": "/a\nb"}):
+            self.assertEqual(bus.clean_tmux(bad), {}, bad)
+        self.assertEqual(bus.clean_tmux({**PANE, "target": "x\x1b[2J", "bin": "tmux"})["target"], "")
+        self.assertEqual(bus.clean_login("Glaciar"), "Glaciar")
+        self.assertEqual(bus.clean_login("a b"), "")
+        self.assertEqual(bus.clean_login("-oProxyCommand=x"), "")
+
+    def test_register_and_hello(self):
+        a = reg(self.pro, "P", "api", tmux={**PANE, "extra": "dropped"})
+        self.assertEqual(a["tmux"], PANE)
+        self.assertEqual(a["login"], bus.LOGIN)
+        hello = self.pro.hello()["agents"][0]
+        self.assertEqual((hello["tmux"], hello["login"]), (PANE, bus.LOGIN))
+        self.assertEqual(reg(self.pro, "P", "api")["tmux"], {})  # left tmux: cleared on the next registration
+
+    def test_opt_out(self):
+        reg(self.pro, "P", "api", tmux=PANE)
+        old = bus.SHARE_PANES
+        bus.SHARE_PANES = False
+        try:
+            self.assertNotIn("tmux", self.pro.hello()["agents"][0])
+        finally:
+            bus.SHARE_PANES = old
+
+    def test_peer_panes_reach_directory_cleaned(self):
+        reg(self.pro, "P", "api", tmux=PANE)
+        srv = self.pro.listen("127.0.0.1", local=False)
+        try:
+            self.air.discover(["pro"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        a = next(a for a in self.air.directory()["agents"] if a["host"] == "pro")
+        self.assertEqual(a["tmux"], PANE)
+        # a peer that sends junk gets it dropped
+        self.air.store.x("UPDATE peers SET agents=? WHERE host='pro'",
+                         '[{"address": "pro/x/y", "tmux": {"socket": "/s", "pane": "$(id)"}, "login": "a;b"}]')
+        a = next(a for a in self.air.directory()["agents"] if a["host"] == "pro")
+        self.assertEqual((a["tmux"], a["login"]), ({}, ""))
+
+    def test_attach_command(self):
+        from tailshare.agent import attach_command
+
+        a = {"host": "pro", "login": "Glaciar", "tmux": {**PANE, "socket": "/tmp/my sock"}}
+        cmd = attach_command(a, here="air")
+        self.assertTrue(cmd.startswith("ssh -t Glaciar@pro '"), cmd)
+        import shlex
+
+        remote = shlex.split(shlex.split(cmd)[3])
+        self.assertEqual(remote, ["/opt/homebrew/bin/tmux", "-S", "/tmp/my sock", "attach", "-t", "%7", ";",
+                                  "select-window", "-t", "%7", ";", "select-pane", "-t", "%7"])
+        self.assertFalse(attach_command(a, here="pro").startswith("ssh"))
+        self.assertEqual(attach_command({"host": "pro", "tmux": {}}), "")
+
+
 class UpdateTrigger(unittest.TestCase):
     def test_only_same_tailnet_user(self):
         from tailshare import update
