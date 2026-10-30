@@ -248,10 +248,18 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.air.hello(PHONE)["you"], {"user": OWNER, "node": "iphone"})
         self.assertEqual(self.air.hello("100.64.0.66")["you"], {"user": "eve@example.com", "node": "eve-laptop"})
         self.assertNotIn("you", self.air.hello())
+        self.air.net.nodes = [  # two nodes may share a name; a node may not run tailshare
+            {"id": "n2", "host": "pro", "ip": "127.0.0.1", "port": self.pro_port, "online": True, "user": OWNER},
+            {"id": "n3", "host": "pro", "ip": "100.64.0.77", "port": 8789, "online": False, "user": "eve@example.com"},
+            {"id": "n4", "host": "tv", "ip": "100.64.0.78", "port": 8789, "online": True, "user": OWNER}]
         peers = self.air.peer_list(PHONE)
-        self.assertEqual([(p["host"], p["owner"]) for p in peers], [("air", OWNER), ("pro", OWNER)])
-        self.assertEqual(peers[1]["port"], self.pro_port)
-        self.assertEqual([p["self"] for p in peers], [True, False])
+        self.assertEqual([(p["host"], p["ip"], p["owner"], p["tailshare"]) for p in peers],
+                         [("air", "", OWNER, True), ("pro", "100.64.0.77", "eve@example.com", False),
+                          ("pro", "127.0.0.1", OWNER, True), ("tv", "100.64.0.78", OWNER, False)])
+        self.assertEqual([p["port"] for p in peers[1:]], [None, self.pro_port, None])
+        self.air.net.nodes = []
+        peers = self.air.peer_list(PHONE)
+        self.assertEqual([(p["host"], p["port"], p["self"]) for p in peers], [("air", self.air.port, True), ("pro", self.pro_port, False)])
         with self.assertRaises(bus.BusError) as cm:  # names the owner's machines: not for others
             self.air.peer_list("100.64.0.66")
         self.assertEqual(cm.exception.code, 403)
