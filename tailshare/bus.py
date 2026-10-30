@@ -61,12 +61,12 @@ def log(msg: str) -> None:
     sys.stderr.write(f"{datetime.now():%H:%M:%S} bus: {msg}\n")
 
 
-def request(url: str, payload: dict | None = None, timeout: float = 5.0) -> dict:
+def request(url: str, payload: dict | None = None, timeout: float = 5.0, headers: dict | None = None) -> dict:
     """GET (payload None) or POST JSON to a bus endpoint. Raises BusError on HTTP errors."""
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="GET" if data is None else "POST",
-        headers={HEADER: "1", "Content-Type": "application/json"},
+        headers={HEADER: "1", "Content-Type": "application/json", **(headers or {})},
     )
     try:
         with _opener.open(req, timeout=timeout) as r:
@@ -166,6 +166,16 @@ def target_matches(address: str, user: str, target: str) -> bool:
 # --------------------------------------------------------------------------- tailnet view
 
 
+def clean_host_keys(keys: object) -> list[str]:
+    """`type base64` host key lines from tailscale status, dropping anything else."""
+    out = []
+    for k in keys if isinstance(keys, list) else []:
+        parts = k.split() if isinstance(k, str) else []
+        if len(parts) >= 2 and re.fullmatch(r"[a-z0-9@.-]{1,64}", parts[0]) and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", parts[1]):
+            out.append(f"{parts[0]} {parts[1]}")
+    return out
+
+
 @dataclass
 class Net:
     """This machine's tailnet name and IP, and the other machines, from `tailscale status`."""
@@ -175,6 +185,8 @@ class Net:
     user: str = ""  # tailnet login that owns this machine
     peers: dict[str, dict] = field(default_factory=dict)  # host -> {"ip", "port", "online", "user"}
     updated: float = 0.0
+    tailscale_ssh: bool = False  # Tailscale SSH answers port 22 here (it ignores authorized_keys)
+    ssh_host_keys: list[str] = field(default_factory=list)  # Tailscale SSH's host keys here, per tailscale status
 
     def host_for_ip(self, ip: str) -> str | None:
         if ip == self.ip:
@@ -207,12 +219,15 @@ class Net:
         self.host = name(me)
         self.ip = next(iter(me.get("TailscaleIPs") or []), "")
         self.user = logins.get(str(me.get("UserID")), "")
+        self.tailscale_ssh = bool(me.get("sshHostKeys"))
+        self.ssh_host_keys = clean_host_keys(me.get("sshHostKeys"))
         peers = {}
         for p in (d.get("Peer") or {}).values():
             ips = p.get("TailscaleIPs") or []
             if ips:
                 peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online")),
-                                  "user": logins.get(str(p.get("UserID")), "")}
+                                  "user": logins.get(str(p.get("UserID")), ""),
+                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys"))}
         self.peers = peers
 
 
@@ -296,12 +311,14 @@ def _check_message(m: object) -> dict:
 class Bus:
     def __init__(self, store: Store, net: Net, port: int = BUS_PORT) -> None:
         self.store, self.net, self.port = store, net, port
+        self._alive: dict[tuple[str, str], tuple[float, bool]] = {}
         self.kick = threading.Event()  # wakes the delivery loop
         self._peer_server: ThreadingHTTPServer | None = None
         self._peer_ip = ""
         self._pruned = 0.0
         self.updater = None  # set by start_bus when self-update is available
         self.sessions = None  # set by start_bus: sessions.Sessions (index, search, ask, launch)
+        self.keys = None  # set by start_bus: keys.Keys (SSH keys devices ask for)
 
     # -- agents ---------------------------------------------------------------
     def register(self, a: dict) -> dict:
@@ -493,12 +510,53 @@ class Bus:
         ]
 
     # -- peers ----------------------------------------------------------------
-    def hello(self) -> dict:
+    def hello(self, ip: str = "") -> dict:
         """What any tailnet peer may know. With SHARE_PANES, also where each agent's tmux pane is,
-        so a person can attach to it; SSH to that machine is still the gate."""
+        so a person can attach to it; SSH to that machine is still the gate. `you` is what the tailnet
+        says about the caller, so a client can tell its own machines from ones shared with it."""
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login") if SHARE_PANES else ())
         agents = [{k: a[k] for k in keys} for a in self.local_agents()]
-        return {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents}
+        for a in agents:
+            if a.get("tmux"):
+                a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
+        ssh = self.keys.ssh_info() if self.keys else {"enroll": False}
+        out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
+        if ip:
+            if self.net.host_for_ip(ip) is None and time.time() - self.net.updated > 30:
+                self.net.refresh()
+            out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
+        return out
+
+    def _pane_alive(self, t: dict) -> bool:
+        """Whether the registered pane still exists (the gate's check), cached a few seconds: /hello is open
+        to the tailnet and should not run tmux on every call."""
+        from . import keys
+
+        k = (t.get("socket", ""), t.get("pane", ""))
+        hit = self._alive.get(k)
+        if hit and hit[0] > time.time() - 5:
+            return hit[1]
+        binary = keys.tmux_binary(t.get("bin") or "")
+        alive = bool(binary) and keys.own_socket(k[0]) and keys.pane_alive(binary, *k)
+        self._alive[k] = (time.time(), alive)
+        return alive
+
+    def peer_list(self, ip: str) -> list[dict]:
+        """Machines running tailshare that this machine has heard from, for clients that cannot run
+        `tailscale status` (phones). Only the owner's devices may ask: it names their other machines.
+        ip, owner and ssh_host_keys come from tailscale status, never from what a peer says about itself."""
+        self.require_same_user(ip)
+        own = self.net.ssh_host_keys if self.net.tailscale_ssh else (self.keys.ssh_info()["host_keys"] if self.keys else [])
+        out = [{"host": self.net.host, "ip": self.net.ip, "port": self.port, "owner": self.net.user, "online": True,
+                "ssh_host_keys": own, "self": True}]
+        for p in self.store.q("SELECT host, ip FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
+            n = self.net.peers.get(p["host"])
+            if n is None:
+                continue
+            out.append({"host": p["host"], "ip": n["ip"], "port": n.get("port", BUS_PORT),
+                        "owner": n.get("user", ""), "online": bool(n.get("online")),
+                        "ssh_host_keys": n.get("ssh_host_keys", []), "self": False})
+        return out
 
     def version(self) -> str:
         from .update import describe
@@ -762,9 +820,15 @@ class _Handler(BaseHTTPRequestHandler):
             path = url.path.removeprefix("/bus/v1")
             if path.startswith("/sessions/") and method == "POST":
                 return self._reply(200, self._sessions(path, body, local, ip))
+            if path.startswith("/keys/"):
+                if b.keys is None:
+                    raise BusError("SSH keys are not available on this machine", 409)
+                return self._reply(200, b.keys.route(method, path, body, local, ip, self.headers.get("X-Tailshare-Keys", "")))
             if not local:
                 if (method, path) == ("GET", "/hello"):
-                    return self._reply(200, b.hello())
+                    return self._reply(200, b.hello(ip))
+                if (method, path) == ("GET", "/peers"):
+                    return self._reply(200, {"peers": b.peer_list(ip)})
                 if (method, path) == ("POST", "/deliver"):
                     return self._reply(200, b.accept(ip, body))
                 if (method, path) == ("POST", "/update"):
@@ -813,6 +877,12 @@ def start_bus() -> Bus | None:
         b.sessions = sessions.start(b)
     except Exception as e:  # noqa: BLE001
         log(f"sessions not started: {e!r}")
+    try:
+        from . import keys
+
+        b.keys = keys.start(b)
+    except Exception as e:  # noqa: BLE001
+        log(f"keys not started: {e!r}")
     try:
         from .update import ENABLED, Updater
 

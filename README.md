@@ -120,6 +120,7 @@ tailshare status                        # server, launchd, tailscale, serve rout
 | `TAILSHARE_PORT` | `8787` | localhost port of the share server |
 | `TAILSHARE_SERVE` | `1` | `0` leaves `tailscale serve` alone (agent mailbox only, no file links) |
 | `TAILSHARE_SHARE_PANES` | `1` | `0` keeps agents' tmux panes and login out of what other machines can read |
+| `TAILSHARE_SSH_ENROLL` | `1` | `0` refuses SSH key requests from devices |
 | `TAILSHARE_LINKS` | `ip` | `ip` for `http://100.x.y.z/`, `dns` for `https://<name>.ts.net/` |
 
 Set them before `tailshare install` so the launchd agent picks them up.
@@ -151,7 +152,16 @@ path) and the account it runs as. `agent ls --attach` prints `ssh -t <login>@<ho
 <pane> ...` for each one, and any device on the tailnet can read the same from a machine's `GET
 http://<tailnet ip>:8789/bus/v1/hello` (header `X-Tailshare: 1`), so an app can list agents and open their panes.
 This only says where a pane is; attaching still needs SSH access to that machine. `TAILSHARE_SHARE_PANES=0`
-leaves panes out of `/hello`.
+leaves panes out of `/hello`. `/hello` also answers `you: {user, node}`, what the tailnet says about the caller.
+Devices without `tailscale status` (phones) find the rest with `GET /bus/v1/peers`: the machines running tailshare
+that this one has heard from, as `{host, ip, port, owner, online, ssh_host_keys, self}`, all from `tailscale status`
+(never from what a peer says). Only the machine owner's own devices may ask. Each pane in `/hello` carries
+`alive`, from the same `tmux display` check the SSH gate makes.
+
+**SSH keys for devices.** A device without tailshare (a phone app) can ask a machine for an SSH key over
+`POST /bus/v1/keys/enroll`. Nothing is installed until a person runs `tailshare keys approve` on that
+machine and confirms the fingerprint. The key can then only attach to agents' tmux panes, which still means
+typing into a shell or an agent: treat it as shell access. See [docs/ssh-keys.md](docs/ssh-keys.md).
 
 How messages reach an agent:
 

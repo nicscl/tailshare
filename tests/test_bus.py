@@ -239,6 +239,7 @@ class TmuxPanes(unittest.TestCase):
         self.assertEqual(a["tmux"], PANE)
         self.assertEqual(a["login"], bus.LOGIN)
         hello = self.pro.hello()["agents"][0]
+        self.assertIsInstance(hello["tmux"].pop("alive"), bool)
         self.assertEqual((hello["tmux"], hello["login"]), (PANE, bus.LOGIN))
         self.assertEqual(reg(self.pro, "P", "api")["tmux"], {})  # left tmux: cleared on the next registration
 
