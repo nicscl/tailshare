@@ -581,7 +581,7 @@ class Keys:
         if r is None or r["ip"] != ip:
             raise bus.BusError("no such request", 404)
         if not self.store.x("UPDATE key_requests SET status='cancelled' WHERE id=? AND status='pending'", rid):
-            st = r["status"]
+            st = self.store.one("SELECT status FROM key_requests WHERE id=?", rid)["status"]  # as of now, not before
             raise bus.BusError("request is being approved right now" if st == "approving" else f"request is {st}, not pending", 409)
         log(f"request {rid[:8]} cancelled by the device")
         return self._view(self.store.one("SELECT * FROM key_requests WHERE id=?", rid))
