@@ -319,6 +319,23 @@ class Flow(unittest.TestCase):
         self.assertEqual(cm.exception.code, 403)
         self.assertIn("security key", str(cm.exception))
 
+    def test_device_cancels_its_pending_request(self):
+        r = self.enroll()
+        with self.assertRaises(bus.BusError) as cm:  # someone else's device
+            self.air_keys.cancel("100.64.0.66", r["request_id"])
+        self.assertEqual(cm.exception.code, 404)
+        self.assertEqual(self.air_keys.cancel(PHONE, r["request_id"])["status"], "cancelled")
+        self.assertEqual(self.air_keys.pending()["pending"], [])
+        with self.assertRaises(bus.BusError):  # nothing to approve any more
+            self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"]})
+        with self.assertRaises(bus.BusError) as cm:
+            self.air_keys.cancel(PHONE, r["request_id"])
+        self.assertEqual(cm.exception.code, 409)
+        self.assertEqual(self.enroll()["status"], "pending")  # can ask again
+        url = f"http://127.0.0.1:{self.pro_port}/bus/v1/keys/enroll"
+        r2 = bus.request(url, {"pubkey": self.phone_pub, "device_name": "ipad"})
+        self.assertEqual(bus.request(f"{url}/{r2['request_id']}/cancel", {})["status"], "cancelled")
+
     def test_status_never_says_approving(self):
         r = self.enroll()
         self.air_keys.store.x("UPDATE key_requests SET status='approving' WHERE id=?", r["request_id"])

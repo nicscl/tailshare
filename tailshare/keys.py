@@ -574,6 +574,17 @@ class Keys:
             raise bus.BusError("no such request", 404)
         return self._view(r)
 
+    def cancel(self, ip: str, rid: str) -> dict:
+        """The device withdraws its own pending request (an app's "Cancel request")."""
+        self._expire()
+        r = self.store.one("SELECT * FROM key_requests WHERE id=?", rid) if _ID_RE.fullmatch(rid) else None
+        if r is None or r["ip"] != ip:
+            raise bus.BusError("no such request", 404)
+        if not self.store.x("UPDATE key_requests SET status='cancelled' WHERE id=? AND status='pending'", rid):
+            raise bus.BusError(f"request is {self._view(r)['status']}, not pending", 409)
+        log(f"request {rid[:8]} cancelled by the device")
+        return self._view(self.store.one("SELECT * FROM key_requests WHERE id=?", rid))
+
     def _notify(self, device: str, node: str, user: str) -> None:
         if sys.platform != "darwin" or os.geteuid() == 0:
             return
@@ -831,6 +842,8 @@ class Keys:
         else:
             if method == "GET" and path.startswith("/keys/enroll/"):
                 return self.status(ip, path.removeprefix("/keys/enroll/"))
+            if method == "POST" and path.startswith("/keys/enroll/") and path.endswith("/cancel"):
+                return self.cancel(ip, path.removeprefix("/keys/enroll/").removesuffix("/cancel"))
             routes = {("POST", "/keys/enroll"): lambda: self.enroll(ip, body),
                       ("POST", "/keys/install"): lambda: self.install_from_peer(ip, body),
                       ("POST", "/keys/revoke"): lambda: self.revoke(ip, body)}

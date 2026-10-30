@@ -127,6 +127,8 @@ answers:
 - `tailshare keys pending` shows the first 8 characters of `request_id`, and `keys approve` takes any prefix
   that matches one request, so a client can show `tailshare keys approve <request_id[:8]>`.
 - `GET /bus/v1/keys/enroll/<request_id>` answers the same shape. Only the device that made the request can
-  read it. `status` is one of `pending`, `approved`, `denied`, `expired`, `revoked`. After `revoked`, enrolling the same key
+  read it. `status` is one of `pending`, `approved`, `denied`, `expired`, `cancelled`, `revoked`. After `revoked`, enrolling the same key
   starts a new request.
+- `POST /bus/v1/keys/enroll/<request_id>/cancel` withdraws a pending request, again only from the device that
+  made it. It becomes `cancelled`, and `keys approve` no longer offers it.
 - Every call needs the header `X-Tailshare: 1`.
