@@ -12,7 +12,8 @@ machines too. Keys are written into a managed block of ~/.ssh/authorized_keys an
 only run `tailshare ssh-gate`, which attaches to a tmux pane an agent on that machine registered.
 That still lets the client type into an agent or a shell, so approving a key is approving shell-level
 access as this account; the gate only keeps the key from doing anything else (no other commands,
-no port or agent forwarding).
+no port or agent forwarding). An attached client can still run tmux commands (`run-shell`, new windows,
+the command prompt, or anything over -CC), so a pane key is a shell key and is approved as one.
 """
 
 from __future__ import annotations
@@ -38,12 +39,12 @@ from . import bus
 ENROLL = os.environ.get("TAILSHARE_SSH_ENROLL", "1") != "0"
 KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256")
 MODES = ("pane", "shell")
+CONFIRM_CHARS = 6  # of the fingerprint the person types: 36 bits, too many to grind a look-alike key
 PENDING_TTL = 900  # a request waits this long for a person
 MAX_PENDING = 3  # per calling device
 MAX_PER_DAY = 20
 APPROVAL_TTL = 300
 APPROVAL_TTL_MAX = 900
-REVOKE_FOR = 7 * 86400  # keep retrying a revocation on a machine that is offline
 ATTACH_FLAGS = {"read-only", "ignore-size", "active-pane", "no-output"}
 AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SANDBOX", "TAILSHARE_AGENT_ID")
 BEGIN = "# >>> tailshare managed keys: change them with `tailshare keys`, not by hand >>>"
@@ -309,15 +310,63 @@ def pane_alive(binary: str, sock: str, pane: str) -> bool:
     return cp.returncode == 0 and cp.stdout.strip() == pane
 
 
+def registered_panes(db: Path) -> list[dict]:
+    """Every pane an agent on this machine registered (kept until the agent is pruned, 30 days after it
+    was last seen). Read straight from this user's database: the gate must not trust whatever answers
+    on the mailbox port, which another local user could take while the mailbox is down."""
+    import sqlite3
+
+    st = db.stat()
+    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise OSError(f"{db} must belong to this user and not be writable by others")
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = con.execute("SELECT address, tmux FROM agents WHERE tmux != '' ORDER BY last_seen DESC").fetchall()
+    finally:
+        con.close()
+    out = []
+    for address, raw in rows:
+        try:
+            t = bus.clean_tmux(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+        if t:
+            out.append({"address": address, "tmux": t})
+    return out
+
+
+def trusted_file(path: str) -> bool:
+    """A binary only this user or root can change."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid in (0, os.geteuid()) and not st.st_mode & 0o022 and os.access(path, os.X_OK)
+
+
+def own_socket(path: str) -> bool:
+    """A tmux socket that this user's own server made (not one another user put in its place)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == os.geteuid()
+
+
+def tmux_binary(registered: str) -> str:
+    for c in (registered, shutil.which("tmux") or "", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if c and c.startswith("/") and trusted_file(c):
+            return c
+    return ""
+
+
 def cmd_gate(_args) -> None:
     """Forced command of pane keys: attach to a registered agent pane, or refuse."""
-    from . import agent
-
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "")
     try:
-        panes = agent.call("/keys/panes")["panes"]
+        panes = registered_panes(bus.STATE_DIR / "bus.db")
     except Exception as e:  # noqa: BLE001
-        sys.exit(f"tailshare ssh-gate: the tailshare mailbox is not answering here ({e})")
+        sys.exit(f"tailshare ssh-gate: cannot read the registered panes ({e})")
     if not cmd:
         print("This key can only attach to the tmux pane of an agent on this machine:", file=sys.stderr)
         for p in panes:
@@ -331,8 +380,10 @@ def cmd_gate(_args) -> None:
               if p["tmux"]["socket"] == req["socket"] and p["tmux"]["pane"] == req["pane"]), None)
     if t is None:
         sys.exit(f"tailshare ssh-gate: no agent here registered pane {req['pane']} on {req['socket']}")
-    binary = t.get("bin") or shutil.which("tmux") or ""
-    if not binary or not pane_alive(binary, req["socket"], req["pane"]):
+    binary = tmux_binary(t.get("bin") or "")
+    if not binary:
+        sys.exit("tailshare ssh-gate: no tmux binary that only this user or root can change")
+    if not own_socket(req["socket"]) or not pane_alive(binary, req["socket"], req["pane"]):
         sys.exit(f"tailshare ssh-gate: pane {req['pane']} is gone")
     os.execv(binary, gate_argv(req, binary))
 
@@ -379,19 +430,23 @@ class Keys:
     def host(self) -> str:
         return self.bus.net.host
 
+    def _owner_problem(self) -> str:
+        """Fan-out and revocation trust "machines of the same tailnet user": only when there is one."""
+        u = self.bus.net.user
+        return "" if u and u != "tagged-devices" else "this machine has no single tailnet owner (it is tagged)"
+
+    def _own_peer(self, host: str) -> dict | None:
+        """The peer `host`, if it is online and belongs to this machine's owner."""
+        p = self.bus.net.peers.get(host)
+        if not p or not p.get("online") or self._owner_problem() or p.get("user") != self.bus.net.user:
+            return None
+        return p
+
     # -- what peers may know ----------------------------------------------------
     def ssh_info(self) -> dict:
         return {"login": bus.LOGIN, "owner": self.bus.net.user, "port": 22, "host_keys": host_keys(),
                 "tailscale_ssh": bool(getattr(self.bus.net, "tailscale_ssh", False)), "enroll": not install_problem()}
 
-    def panes(self) -> dict:
-        """Every pane an agent on this machine registered (kept until the agent is pruned)."""
-        out = []
-        for r in self.store.q("SELECT address, tmux FROM agents WHERE tmux != '' ORDER BY last_seen DESC"):
-            t = bus.clean_tmux(json.loads(r["tmux"]))
-            if t:
-                out.append({"address": r["address"], "tmux": t})
-        return {"panes": out}
 
     # -- requests from devices --------------------------------------------------
     def _view(self, r) -> dict:
@@ -417,7 +472,7 @@ class Keys:
         now = time.time()
         with self.store.lock:
             self._expire()
-            same = self.store.one("SELECT * FROM key_requests WHERE ip=? AND pubkey=? AND status IN ('pending','approved')"
+            same = self.store.one("SELECT * FROM key_requests WHERE ip=? AND pubkey=? AND status IN ('pending','approving','approved')"
                                   " ORDER BY created DESC", ip, pubkey)
             if same:
                 return self._view(same)
@@ -464,6 +519,8 @@ class Keys:
     def targets(self) -> list[str]:
         """This machine and the other machines of its owner that run tailshare."""
         net = self.bus.net
+        if self._owner_problem():
+            return [net.host]
         peers = [r["host"] for r in self.store.q("SELECT host FROM peers WHERE last_ok IS NOT NULL ORDER BY host")
                  if net.peers.get(r["host"], {}).get("user") == net.user and r["host"] != net.host]
         return [net.host, *peers]
@@ -478,7 +535,9 @@ class Keys:
 
     def ls(self) -> dict:
         rows = self.store.q("SELECT * FROM ssh_keys ORDER BY installed")
-        return {"host": self.host, "login": bus.LOGIN, "keys": [dict(r) for r in rows]}
+        unfinished = self.store.q("SELECT key_id, host, created, error FROM key_revocations WHERE done IS NULL")
+        return {"host": self.host, "login": bus.LOGIN, "keys": [dict(r) for r in rows],
+                "revoking": [dict(r) for r in unfinished]}
 
     # -- approving and installing ---------------------------------------------------
     def _rewrite(self) -> None:
@@ -490,9 +549,9 @@ class Keys:
         problem = install_problem()
         if problem:
             raise bus.BusError(problem, 409)
-        if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
-            raise bus.BusError(f"key {key_id} was revoked; enroll again", 409)
         with self.store.lock:
+            if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
+                raise bus.BusError(f"key {key_id} was revoked; enroll again", 409)
             self.store.x("INSERT OR REPLACE INTO ssh_keys(id, pubkey, fingerprint, device, node, user, mode, approved_by,"
                          " installed) VALUES(?,?,?,?,?,?,?,?,?)", key_id, r["pubkey"], r["fingerprint"], r["device"],
                          r["node"], r["user"], mode, by, time.time())
@@ -547,10 +606,16 @@ class Keys:
         if mode not in MODES:
             raise bus.BusError(f"mode must be one of {', '.join(MODES)}")
         self._expire()
-        r = self.store.one("SELECT * FROM key_requests WHERE id=?", rid)
-        if r is None or r["status"] != "pending":
-            raise bus.BusError("no such pending request (it may have expired)", 404)
-        r = dict(r)
+        if not self.store.x("UPDATE key_requests SET status='approving' WHERE id=? AND status='pending'", rid):
+            raise bus.BusError("no such pending request (it may have expired, or is being approved)", 404)
+        try:
+            return self._approve(rid, mode, body)
+        except BaseException:
+            self.store.x("UPDATE key_requests SET status='pending' WHERE id=? AND status='approving'", rid)
+            raise
+
+    def _approve(self, rid: str, mode: str, body: dict) -> dict:
+        r = dict(self.store.one("SELECT * FROM key_requests WHERE id=?", rid))
         payload, signature = str(body.get("payload") or ""), str(body.get("signature") or "")
         if payload:
             d = self.check_approval(payload, signature)
@@ -563,9 +628,9 @@ class Keys:
         for h in hosts:
             if h == self.host:
                 continue
-            p = self.bus.net.peers.get(h)
-            if not p or not p.get("online"):
-                errors[h] = "offline"
+            p = self._own_peer(h)
+            if not p:
+                errors[h] = "offline, or not a machine of this owner"
                 continue
             try:
                 installed.append(bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/install",
@@ -577,6 +642,8 @@ class Keys:
         return {"key_id": key_id, "installed": installed, "errors": errors}
 
     def install_from_peer(self, ip: str, body: dict) -> dict:
+        if self._owner_problem():
+            raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
         d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""))
         r = {k: d[k] for k in ("pubkey", "fingerprint", "device", "node", "user")}
@@ -613,17 +680,18 @@ class Keys:
     def retry_revocations(self, only: str = "") -> dict:
         now = time.time()
         out = {}
-        rows = self.store.q("SELECT * FROM key_revocations WHERE done IS NULL AND created>?", now - REVOKE_FOR)
-        for r in rows:
+        for r in self.store.q("SELECT * FROM key_revocations WHERE done IS NULL"):
             if only and r["key_id"] != only:
                 continue
-            p = self.bus.net.peers.get(r["host"])
-            if not p or not p.get("online"):
-                out[r["host"]] = "offline: will retry for 7 days"
+            p = self._own_peer(r["host"])
+            if not p:
+                out[r["host"]] = "offline: will keep retrying (see `tailshare keys ls`)"
                 continue
             try:
                 d = bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/revoke",
                                 {"v": bus.PROTOCOL, "key_id": r["key_id"]}, timeout=10)
+                if d.get("host") != r["host"]:
+                    raise bus.BusError(f"answered as {d.get('host')!r}")
                 self.store.x("UPDATE key_revocations SET done=? WHERE key_id=? AND host=?", now, r["key_id"], r["host"])
                 out[r["host"]] = "removed" if d.get("removed") else "was not installed"
             except Exception as e:  # noqa: BLE001
@@ -632,6 +700,8 @@ class Keys:
         return out
 
     def revoke_from_peer(self, ip: str, body: dict) -> dict:
+        if self._owner_problem():
+            raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
         key_id = str(body.get("key_id") or "")
         if not _KEY_ID_RE.fullmatch(key_id):
@@ -642,7 +712,7 @@ class Keys:
     def route(self, method: str, path: str, body: dict, local: bool, ip: str) -> dict:
         if local:
             routes = {("GET", "/keys/pending"): lambda: self.pending(), ("GET", "/keys/ls"): lambda: self.ls(),
-                      ("GET", "/keys/panes"): lambda: self.panes(), ("POST", "/keys/approve"): lambda: self.approve(body),
+                      ("POST", "/keys/approve"): lambda: self.approve(body),
                       ("POST", "/keys/deny"): lambda: self.deny(body), ("POST", "/keys/rm"): lambda: self.rm(body)}
         else:
             if method == "GET" and path.startswith("/keys/enroll/"):
@@ -745,8 +815,8 @@ def cmd_approve(args):
     else:
         print(f"  access       a full shell as {d['login']}")
     print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (no signing key found: this machine only)"))
-    want = p["fingerprint"][-4:]
-    got = input("Type the last 4 characters of the fingerprint shown on the device (empty to cancel): ").strip()
+    want = p["fingerprint"][-CONFIRM_CHARS:]
+    got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint shown on the device (empty to cancel): ").strip()
     if got != want:
         raise ValueError("does not match the fingerprint: nothing installed" if got else "cancelled")
     body = {"id": p["id"], "mode": mode}
@@ -777,10 +847,12 @@ def cmd_ls(args):
         return
     if not d["keys"]:
         print(f"no tailshare-managed SSH keys for {d['login']} on {d['host']}")
-        return
     for k in d["keys"]:
         when = time.strftime("%Y-%m-%d", time.localtime(k["installed"]))
         print(f"{k['id']}  {k['mode']:<5}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
+    for r in d.get("revoking", []):
+        print(f"⚠ {r['key_id']} is still installed on {r['host']}: removal pending since "
+              f"{time.strftime('%Y-%m-%d', time.localtime(r['created']))}" + (f" ({r['error']})" if r["error"] else ""))
 
 
 @_run

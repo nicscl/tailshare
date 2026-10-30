@@ -263,7 +263,68 @@ class Flow(unittest.TestCase):
         pane = {"socket": "/tmp/s", "pane": "%3", "target": "", "bin": ""}
         self.air.register({"id": "A", "harness": "claude", "cwd": "/x/api", "tmux": pane})
         self.air.store.x("UPDATE agents SET last_seen=?", time.time() - 5 * 86400)  # idle for days
-        self.assertEqual(self.air_keys.panes()["panes"], [{"address": "air/claude/api", "tmux": pane}])
+        db = Path(self.air.store.db.execute("PRAGMA database_list").fetchone()[2])
+        self.assertEqual(keys.registered_panes(db), [{"address": "air/claude/api", "tmux": pane}])
+        os.chmod(db, 0o666)
+        with self.assertRaises(OSError):  # a database others can write is not trusted
+            keys.registered_panes(db)
+
+    def test_double_approve(self):
+        r = self.enroll()
+        self.air_keys.store.x("UPDATE key_requests SET status='approving' WHERE id=?", r["request_id"])  # another approve running
+        with self.assertRaises(bus.BusError) as cm:
+            self.air_keys.approve({"id": r["request_id"]})
+        self.assertEqual(cm.exception.code, 404)
+        self.assertEqual(self.air_keys.ls()["keys"], [])
+
+    def test_failed_approve_leaves_request_pending(self):
+        r = self.enroll()
+        payload, sig = self.signed(r)
+        with self.assertRaises(bus.BusError):
+            self.air_keys.approve({"id": r["request_id"], "payload": payload.replace("Nick's iPhone", "Nick's iPhonf"), "signature": sig})
+        self.assertEqual(self.air_keys.status(PHONE, r["request_id"])["status"], "pending")
+
+    def test_only_owner_machines_get_approvals_and_revocations(self):
+        self.air.net.peers["pro"]["user"] = "eve@example.com"  # the name now belongs to someone else's machine
+        r = self.enroll()
+        payload, sig = self.signed(r)
+        out = self.air_keys.approve({"id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
+        self.assertEqual([i["host"] for i in out["installed"]], ["air"])
+        self.assertIn("pro", out["errors"])
+        self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
+        self.air_keys.store.x("INSERT INTO key_revocations(key_id, host, created) VALUES('kaaaaaaaaaaaa','pro',?)", time.time())
+        self.assertIn("offline", self.air_keys.retry_revocations()["pro"])
+        self.assertEqual(self.air_keys.ls()["revoking"][0]["host"], "pro")  # still shown as not done
+
+    def test_tagged_machine_takes_no_part(self):
+        self.pro.net.user = "tagged-devices"
+        with self.assertRaises(bus.BusError) as cm:
+            self.pro_keys.revoke_from_peer("127.0.0.1", {"key_id": "kaaaaaaaaaaaa"})
+        self.assertEqual(cm.exception.code, 403)
+        self.assertEqual(self.pro_keys.targets(), ["pro"])
+
+
+class GateChecks(unittest.TestCase):
+    def test_trusted_file_and_socket(self):
+        import socket as so
+
+        tmp = Path(tempfile.mkdtemp())
+        exe = tmp / "tmux"
+        exe.write_text("#!/bin/sh\n")
+        os.chmod(exe, 0o755)
+        self.assertTrue(keys.trusted_file(str(exe)))
+        os.chmod(exe, 0o777)
+        self.assertFalse(keys.trusted_file(str(exe)))
+        self.assertEqual(keys.tmux_binary(str(exe)), keys.tmux_binary(""))  # falls back to a trusted tmux
+        sock_path = Path(tempfile.mkdtemp(dir="/tmp")) / "s"
+        s = so.socket(so.AF_UNIX)
+        s.bind(str(sock_path))
+        try:
+            self.assertTrue(keys.own_socket(str(sock_path)))
+            self.assertFalse(keys.own_socket(str(exe)))
+            self.assertFalse(keys.own_socket(str(tmp / "missing")))
+        finally:
+            s.close()
 
 
 if __name__ == "__main__":

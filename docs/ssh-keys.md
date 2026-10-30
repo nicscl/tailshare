@@ -4,9 +4,14 @@ A device with no tailshare install, such as a phone app, can ask a machine for S
 A person on that machine approves it, and the key goes into a managed block of `~/.ssh/authorized_keys`.
 By default the key can do one thing: attach to the tmux pane of an agent running there.
 
-**Approving a key is approving shell-level access.** A pane key cannot run commands, forward ports or
-agents, or copy files. But a client attached to tmux can type into the pane, and the pane is a shell or an
-agent, often one running with permissions skipped. Approve only devices you would give a shell to.
+**Approving a key is approving shell access.** The gate keeps a pane key from opening a shell directly or
+forwarding ports or agents. Once attached, though, a tmux client can:
+- run any tmux command: `run-shell`, `new-window <cmd>`, the `:` prompt, or anything sent over `-CC`;
+- switch to any other session on that tmux server;
+- type into the pane, which is a shell or an agent, often one running with permissions skipped.
+
+So it can run commands and read files as that account. `-r` (read-only) is the client's own choice, not
+something the gate enforces. Approve only devices you would give a shell to.
 
 ## The flow
 
@@ -15,7 +20,7 @@ agent, often one running with permissions skipped. Approve only devices you woul
    which the device cannot fake, and shows a desktop notification on macOS.
 3. A person runs `tailshare keys pending`, then `tailshare keys approve <id>`. The command prints the device,
    its tailnet node and owner (flagged when it is not one of yours), the fingerprint and what access it
-   grants. To approve, the person types the last 4 characters of the fingerprint shown on the device.
+   grants. To approve, the person types the last 6 characters of the fingerprint shown on the device.
 4. The key is installed. The device polls `GET /bus/v1/keys/enroll/<request id>` until it sees `approved`,
    then connects with SSH.
 
@@ -42,13 +47,17 @@ tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machin
   never accepted as a key approval, and a key approval is never accepted as a launch.
 - **Someone else's machine shared into your tailnet**: the device enrolls there and that machine's owner
   approves it there. Install and revoke requests from other machines are only accepted from machines of the
-  same tailnet user.
+  same tailnet user. Approvals and removals are only sent to machines that user owns. A tagged machine has
+  no single owner, so it takes part in neither.
 - Each signed approval works once (nonce), within 15 minutes. A revoked key id can never be installed again.
 
 ## Revoking
 
 `tailshare keys rm <key id>` removes the key here, then asks the owner's other machines to remove it.
-Removing access needs no signature. Machines that are offline are retried every minute for 7 days.
+Removing access needs no signature. Machines that are offline are retried every minute until they answer.
+`tailshare keys ls` lists removals that have not reached every machine yet. Removing a key does not end SSH
+sessions that are already open, and anything a session changed while attached (another line in
+`authorized_keys`, for instance) stays. After a lost device, also check those.
 
 ## The gate
 
@@ -67,8 +76,11 @@ tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-win
 - `<flags>` may combine `read-only`, `ignore-size`, `active-pane` and `no-output`. `ignore-size` keeps a small
   phone screen from shrinking the window on the desktop.
 - The socket and pane must have been registered by an agent on this machine. A registration lasts as long
-  as the agent's row, 30 days after it was last seen. The pane must still exist (`tmux display` checks it).
-- The gate then execs the registered tmux binary directly, with no shell in between.
+  as the agent's row, 30 days after it was last seen. The gate reads them from this user's database file,
+  not over the mailbox port.
+- The socket must belong to this user, and the pane must still exist (`tmux display` checks it).
+- The gate then execs tmux directly, with no shell in between. It uses the registered tmux binary only if
+  just this user or root can change that file.
 - With no command, the gate lists the panes it would accept.
 
 ## For clients
