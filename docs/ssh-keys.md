@@ -109,7 +109,8 @@ tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-win
   - tailshare runs as root (never: that would give the device root);
   - `TAILSHARE_SSH_ENROLL=0`;
   - sshd reads keys from somewhere other than `~/.ssh/authorized_keys`.
-- `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine. It ignores `authorized_keys`;
+- `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine, and `host_keys` are then
+  tailscaled's keys from `tailscale status`, not `/etc/ssh`. It ignores `authorized_keys`;
   access there follows the tailnet's SSH policy instead.
 
 `POST /bus/v1/keys/enroll` takes `{"pubkey": "ssh-ed25519 AAAA...", "device_name": "Nick's iPhone"}` and

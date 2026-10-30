@@ -236,6 +236,14 @@ class Flow(unittest.TestCase):
         self.assertNotIn("tailshare:", (self.tmp / "air" / "authorized_keys").read_text())
         self.assertNotIn("tailshare:", (self.tmp / "pro" / "authorized_keys").read_text())
 
+    def test_tailscale_ssh_host_keys(self):
+        ed = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDv5"
+        self.assertEqual(bus.clean_host_keys([ed + " comment", "junk", 7, 'x"; y z']), [ed])
+        self.air.net.tailscale_ssh, self.air.net.ssh_host_keys = True, [ed]
+        self.air.net.peers["pro"]["ssh_host_keys"] = [ed]
+        self.assertEqual(self.air_keys.ssh_info()["host_keys"], [ed])  # tailscaled's keys, not /etc/ssh
+        self.assertEqual([p["ssh_host_keys"] for p in self.air.peer_list(PHONE)], [[ed], [ed]])
+
     def test_hello_says_who_is_asking_and_owner_gets_peers(self):
         self.assertEqual(self.air.hello(PHONE)["you"], {"user": OWNER, "node": "iphone"})
         self.assertEqual(self.air.hello("100.64.0.66")["you"], {"user": "eve@example.com", "node": "eve-laptop"})
@@ -452,6 +460,13 @@ class GateEndToEnd(unittest.TestCase):
     def gate(self, cmd):
         os.environ["SSH_ORIGINAL_COMMAND"] = cmd
         keys.cmd_gate(None)
+
+    def test_hello_says_whether_the_pane_is_alive(self):
+        b = bus.Bus(bus.Store(self.state / "bus.db"), StaticNet("air"), free_port())
+        self.assertTrue(b.hello()["agents"][0]["tmux"]["alive"])
+        subprocess.run([self.tmux, "-S", self.sock, "kill-server"], check=True)
+        b._alive.clear()
+        self.assertFalse(b.hello()["agents"][0]["tmux"]["alive"])
 
     def test_attaches_to_the_registered_pane(self):
         self.gate(f"tmux -S {self.sock} attach -r -t {self.pane}")

@@ -166,6 +166,16 @@ def target_matches(address: str, user: str, target: str) -> bool:
 # --------------------------------------------------------------------------- tailnet view
 
 
+def clean_host_keys(keys: object) -> list[str]:
+    """`type base64` host key lines from tailscale status, dropping anything else."""
+    out = []
+    for k in keys if isinstance(keys, list) else []:
+        parts = k.split() if isinstance(k, str) else []
+        if len(parts) >= 2 and re.fullmatch(r"[a-z0-9@.-]{1,64}", parts[0]) and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", parts[1]):
+            out.append(f"{parts[0]} {parts[1]}")
+    return out
+
+
 @dataclass
 class Net:
     """This machine's tailnet name and IP, and the other machines, from `tailscale status`."""
@@ -176,6 +186,7 @@ class Net:
     peers: dict[str, dict] = field(default_factory=dict)  # host -> {"ip", "port", "online", "user"}
     updated: float = 0.0
     tailscale_ssh: bool = False  # Tailscale SSH answers port 22 here (it ignores authorized_keys)
+    ssh_host_keys: list[str] = field(default_factory=list)  # Tailscale SSH's host keys here, per tailscale status
 
     def host_for_ip(self, ip: str) -> str | None:
         if ip == self.ip:
@@ -209,12 +220,14 @@ class Net:
         self.ip = next(iter(me.get("TailscaleIPs") or []), "")
         self.user = logins.get(str(me.get("UserID")), "")
         self.tailscale_ssh = bool(me.get("sshHostKeys"))
+        self.ssh_host_keys = clean_host_keys(me.get("sshHostKeys"))
         peers = {}
         for p in (d.get("Peer") or {}).values():
             ips = p.get("TailscaleIPs") or []
             if ips:
                 peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online")),
-                                  "user": logins.get(str(p.get("UserID")), "")}
+                                  "user": logins.get(str(p.get("UserID")), ""),
+                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys"))}
         self.peers = peers
 
 
@@ -298,6 +311,7 @@ def _check_message(m: object) -> dict:
 class Bus:
     def __init__(self, store: Store, net: Net, port: int = BUS_PORT) -> None:
         self.store, self.net, self.port = store, net, port
+        self._alive: dict[tuple[str, str], tuple[float, bool]] = {}
         self.kick = threading.Event()  # wakes the delivery loop
         self._peer_server: ThreadingHTTPServer | None = None
         self._peer_ip = ""
@@ -502,6 +516,9 @@ class Bus:
         says about the caller, so a client can tell its own machines from ones shared with it."""
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login") if SHARE_PANES else ())
         agents = [{k: a[k] for k in keys} for a in self.local_agents()]
+        for a in agents:
+            if a.get("tmux"):
+                a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
         ssh = self.keys.ssh_info() if self.keys else {"enroll": False}
         out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
         if ip:
@@ -510,17 +527,35 @@ class Bus:
             out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
         return out
 
+    def _pane_alive(self, t: dict) -> bool:
+        """Whether the registered pane still exists (the gate's check), cached a few seconds: /hello is open
+        to the tailnet and should not run tmux on every call."""
+        from . import keys
+
+        k = (t.get("socket", ""), t.get("pane", ""))
+        hit = self._alive.get(k)
+        if hit and hit[0] > time.time() - 5:
+            return hit[1]
+        binary = keys.tmux_binary(t.get("bin") or "")
+        alive = bool(binary) and keys.own_socket(k[0]) and keys.pane_alive(binary, *k)
+        self._alive[k] = (time.time(), alive)
+        return alive
+
     def peer_list(self, ip: str) -> list[dict]:
         """Machines running tailshare that this machine has heard from, for clients that cannot run
-        `tailscale status` (phones). Only the owner's devices may ask: it names their other machines."""
+        `tailscale status` (phones). Only the owner's devices may ask: it names their other machines.
+        ip, owner and ssh_host_keys come from tailscale status, never from what a peer says about itself."""
         self.require_same_user(ip)
-        out = [{"host": self.net.host, "ip": self.net.ip, "port": self.port, "owner": self.net.user, "online": True}]
+        own = self.net.ssh_host_keys if self.net.tailscale_ssh else (self.keys.ssh_info()["host_keys"] if self.keys else [])
+        out = [{"host": self.net.host, "ip": self.net.ip, "port": self.port, "owner": self.net.user, "online": True,
+                "ssh_host_keys": own}]
         for p in self.store.q("SELECT host, ip FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
             n = self.net.peers.get(p["host"])
             if n is None:
                 continue
             out.append({"host": p["host"], "ip": n["ip"], "port": n.get("port", BUS_PORT),
-                        "owner": n.get("user", ""), "online": bool(n.get("online"))})
+                        "owner": n.get("user", ""), "online": bool(n.get("online")),
+                        "ssh_host_keys": n.get("ssh_host_keys", [])})
         return out
 
     def version(self) -> str:

@@ -492,8 +492,12 @@ class Keys:
 
     # -- what peers may know ----------------------------------------------------
     def ssh_info(self) -> dict:
-        return {"login": bus.LOGIN, "owner": self.bus.net.user, "port": 22, "host_keys": host_keys(),
-                "tailscale_ssh": bool(getattr(self.bus.net, "tailscale_ssh", False)), "enroll": not install_problem()}
+        net = self.bus.net
+        ts = bool(getattr(net, "tailscale_ssh", False))
+        # Tailscale SSH answers port 22 with its own host keys, not the ones in /etc/ssh
+        keys = list(getattr(net, "ssh_host_keys", []) or []) if ts else host_keys()
+        return {"login": bus.LOGIN, "owner": net.user, "port": 22, "host_keys": keys,
+                "tailscale_ssh": ts, "enroll": not install_problem()}
 
 
     # -- requests from devices --------------------------------------------------
