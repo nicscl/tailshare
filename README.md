@@ -119,6 +119,7 @@ tailshare status                        # server, launchd, tailscale, serve rout
 | `TAILSHARE_DIR` | `~/Public/ts-share` | folder that is shared |
 | `TAILSHARE_PORT` | `8787` | localhost port of the share server |
 | `TAILSHARE_SERVE` | `1` | `0` leaves `tailscale serve` alone (agent mailbox only, no file links) |
+| `TAILSHARE_SHARE_PANES` | `1` | `0` keeps agents' tmux panes and login out of what other machines can read |
 | `TAILSHARE_LINKS` | `ip` | `ip` for `http://100.x.y.z/`, `dns` for `https://<name>.ts.net/` |
 
 Set them before `tailshare install` so the launchd agent picks them up.
@@ -142,7 +143,15 @@ tailshare agent send '*/*/api' "migration is ready" --file schema.sql
 tailshare agent inbox                   # read new messages
 tailshare agent watch [--once]          # print messages as they arrive (for Monitor / background Bash)
 tailshare agent outbox                  # what is waiting for an offline machine
+tailshare agent ls --attach             # agents running in tmux, with a command to attach to each pane
 ```
+
+**tmux panes.** An agent started inside tmux registers its pane (socket, pane id, `session:window.pane`, tmux
+path) and the account it runs as. `agent ls --attach` prints `ssh -t <login>@<host> tmux -S <socket> attach -t
+<pane> ...` for each one, and any device on the tailnet can read the same from a machine's `GET
+http://<tailnet ip>:8789/bus/v1/hello` (header `X-Tailshare: 1`), so an app can list agents and open their panes.
+This only says where a pane is; attaching still needs SSH access to that machine. `TAILSHARE_SHARE_PANES=0`
+leaves panes out of `/hello`.
 
 How messages reach an agent:
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import bus, core
@@ -41,6 +42,7 @@ class Identity:
     pid: int = 0
     user: str = ""  # explicit TAILSHARE_USER; otherwise the mailbox works it out
     ssh_ip: str = ""  # where an SSH login came from, to find the tailnet user behind it
+    tmux: dict = field(default_factory=dict)  # the tmux pane the session runs in, if any
 
 
 def _claude_transcript(session_id: str) -> Path | None:
@@ -100,7 +102,44 @@ def detect(hook: dict | None = None) -> Identity:
     ident.user = os.environ.get("TAILSHARE_USER", "")
     ssh = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT") or ""
     ident.ssh_ip = ssh.split()[0] if ssh.split() else ""
+    ident.tmux = _tmux_pane()
     return ident
+
+
+def _tmux_pane() -> dict:
+    """The tmux pane this process runs in: {socket, pane, target, bin}, or {} outside tmux.
+    Hooks inherit TMUX and TMUX_PANE from the pane the agent was started in."""
+    tmux, pane = os.environ.get("TMUX", ""), os.environ.get("TMUX_PANE", "")
+    if not tmux or not pane:
+        return {}
+    sock = tmux.split(",")[0]
+    exe_ = shutil.which("tmux") or ""
+    target = ""
+    if exe_:
+        try:
+            r = subprocess.run([exe_, "-S", sock, "display", "-p", "-t", pane,
+                                "#{session_name}:#{window_index}.#{pane_index}"],
+                               capture_output=True, text=True, timeout=2)
+            target = r.stdout.strip() if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return bus.clean_tmux({"socket": sock, "pane": pane, "target": target, "bin": exe_})
+
+
+def attach_command(a: dict, here: str = "") -> str:
+    """A shell command that attaches to an agent's tmux pane, over SSH unless it is on `here`."""
+    t = bus.clean_tmux(a.get("tmux"))
+    if not t:
+        return ""
+    p = t["pane"]
+    argv = [t["bin"] or "tmux", "-S", t["socket"], "attach", "-t", p, ";", "select-window", "-t", p, ";",
+            "select-pane", "-t", p]
+    remote = " ".join(shlex.quote(x) for x in argv)
+    if a.get("host") == here:
+        return remote
+    login = bus.clean_login(a.get("login"))
+    dest = f"{login}@{a['host']}" if login else a["host"]
+    return f"ssh -t {shlex.quote(dest)} {shlex.quote(remote)}"
 
 
 def _detect_session(hook: dict) -> Identity:
@@ -197,6 +236,14 @@ def cmd_ls(args):
         return
     if not rows:
         print("no agents yet")
+        return
+    if args.attach:
+        rows = [a for a in rows if bus.clean_tmux(a.get("tmux"))]
+        rows.sort(key=lambda a: a["address"])
+        for a in rows:
+            print(f"{a['address']}\n  {attach_command(a, d.get('host', ''))}")
+        if not rows:
+            print("no agents in tmux")
         return
     rows.sort(key=lambda a: (a.get("user") or "~", a["address"]))
     w = max(len(a["address"]) for a in rows)
@@ -401,6 +448,7 @@ def add_parser(sub) -> None:
     p.set_defaults(fn=cmd_whoami)
     p = s.add_parser("ls", help="agents on this machine and the tailnet")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--attach", action="store_true", help="agents in tmux, with a command to attach to each pane")
     p.set_defaults(fn=cmd_ls)
     p = s.add_parser("send", help="send a message (queued if the machine is offline)")
     p.add_argument("to", help="host/harness/folder[/session], a pattern like */*/tailshare, or @user[/pattern]")
