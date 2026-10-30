@@ -230,8 +230,8 @@ class Net:
             if ips:
                 peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online")),
                                   "user": logins.get(str(p.get("UserID")), ""),
-                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys"))}
-                nodes.append({"id": str(p.get("ID") or ""), "host": name(p), **peers[name(p)]})
+                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys")), "id": str(p.get("ID") or "")}
+                nodes.append({"host": name(p), **peers[name(p)]})
         self.peers, self.nodes = peers, nodes
 
 
@@ -267,7 +267,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -548,16 +548,19 @@ class Bus:
     def peer_list(self, ip: str) -> list[dict]:
         """Every node in this machine's `tailscale status`, for clients that cannot run it (phones), with
         `tailshare` saying which ones have answered this machine as tailshare peers. Only the owner's devices
-        may ask: it names their machines. Rows are about IPs and node ids; ip, owner, online and
-        ssh_host_keys come from tailscale status, never from what a node says about itself."""
+        may ask: it names their machines. Rows are about IPs and node ids. id, ip, owner and online are the
+        coordination server's view in tailscale status, never what a node tells tailshare. ssh_host_keys is the
+        node's own Hostinfo claim (tied to its node key, not checked by Tailscale), present only on nodes
+        running Tailscale SSH. `tailshare` needs the same IP and node id that answered /hello, so a node
+        that takes over a reused IP does not inherit it."""
         self.require_same_user(ip)
         own = self.net.ssh_host_keys if self.net.tailscale_ssh else (self.keys.ssh_info()["host_keys"] if self.keys else [])
         out = [{"id": self.net.node_id, "host": self.net.host, "ip": self.net.ip, "port": self.port,
                 "owner": self.net.user, "online": True, "ssh_host_keys": own, "tailshare": True, "self": True}]
-        answered = {r["ip"] for r in self.store.q("SELECT ip FROM peers WHERE last_ok IS NOT NULL")}
+        answered = {(r["ip"], r["node"]) for r in self.store.q("SELECT ip, node FROM peers WHERE last_ok IS NOT NULL")}
         nodes = self.net.nodes or [{"id": "", "host": h, **p} for h, p in self.net.peers.items()]
         for n in sorted(nodes, key=lambda n: (n["host"], n["ip"])):
-            ts = n["ip"] in answered
+            ts = (n["ip"], n.get("id", "")) in answered
             out.append({"id": n.get("id", ""), "host": n["host"], "ip": n["ip"],
                         "port": n.get("port", BUS_PORT) if ts else None, "owner": n.get("user", ""),
                         "online": bool(n.get("online")), "ssh_host_keys": n.get("ssh_host_keys", []),
@@ -672,10 +675,10 @@ class Bus:
             except Exception:  # noqa: BLE001
                 return
             self.store.x(
-                "INSERT INTO peers(host, ip, version, last_ok, agents) VALUES(?,?,?,?,?)"
+                "INSERT INTO peers(host, ip, version, last_ok, agents, node) VALUES(?,?,?,?,?,?)"
                 " ON CONFLICT(host) DO UPDATE SET ip=excluded.ip, version=excluded.version,"
-                " last_ok=excluded.last_ok, agents=excluded.agents",
-                h, p["ip"], str(d.get("version", "")), time.time(), json.dumps(d.get("agents", [])),
+                " last_ok=excluded.last_ok, agents=excluded.agents, node=excluded.node",
+                h, p["ip"], str(d.get("version", "")), time.time(), json.dumps(d.get("agents", [])), p.get("id", ""),
             )
 
         if hosts:

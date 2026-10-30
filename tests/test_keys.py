@@ -248,6 +248,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.air.hello(PHONE)["you"], {"user": OWNER, "node": "iphone"})
         self.assertEqual(self.air.hello("100.64.0.66")["you"], {"user": "eve@example.com", "node": "eve-laptop"})
         self.assertNotIn("you", self.air.hello())
+        self.air.store.x("UPDATE peers SET node='n2' WHERE host='pro'")
         self.air.net.nodes = [  # two nodes may share a name; a node may not run tailshare
             {"id": "n2", "host": "pro", "ip": "127.0.0.1", "port": self.pro_port, "online": True, "user": OWNER},
             {"id": "n3", "host": "pro", "ip": "100.64.0.77", "port": 8789, "online": False, "user": "eve@example.com"},
@@ -257,7 +258,10 @@ class Flow(unittest.TestCase):
                          [("air", "", OWNER, True), ("pro", "100.64.0.77", "eve@example.com", False),
                           ("pro", "127.0.0.1", OWNER, True), ("tv", "100.64.0.78", OWNER, False)])
         self.assertEqual([p["port"] for p in peers[1:]], [None, self.pro_port, None])
+        self.air.net.nodes[0]["id"] = "n9"  # another node took over pro's IP
+        self.assertFalse(self.air.peer_list(PHONE)[2]["tailshare"])
         self.air.net.nodes = []
+        self.air.store.x("UPDATE peers SET node='' WHERE host='pro'")
         peers = self.air.peer_list(PHONE)
         self.assertEqual([(p["host"], p["port"], p["self"]) for p in peers], [("air", self.air.port, True), ("pro", self.pro_port, False)])
         with self.assertRaises(bus.BusError) as cm:  # names the owner's machines: not for others
