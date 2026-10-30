@@ -175,6 +175,7 @@ class Net:
     user: str = ""  # tailnet login that owns this machine
     peers: dict[str, dict] = field(default_factory=dict)  # host -> {"ip", "port", "online", "user"}
     updated: float = 0.0
+    tailscale_ssh: bool = False  # Tailscale SSH answers port 22 here (it ignores authorized_keys)
 
     def host_for_ip(self, ip: str) -> str | None:
         if ip == self.ip:
@@ -207,6 +208,7 @@ class Net:
         self.host = name(me)
         self.ip = next(iter(me.get("TailscaleIPs") or []), "")
         self.user = logins.get(str(me.get("UserID")), "")
+        self.tailscale_ssh = bool(me.get("sshHostKeys"))
         peers = {}
         for p in (d.get("Peer") or {}).values():
             ips = p.get("TailscaleIPs") or []
@@ -302,6 +304,7 @@ class Bus:
         self._pruned = 0.0
         self.updater = None  # set by start_bus when self-update is available
         self.sessions = None  # set by start_bus: sessions.Sessions (index, search, ask, launch)
+        self.keys = None  # set by start_bus: keys.Keys (SSH keys devices ask for)
 
     # -- agents ---------------------------------------------------------------
     def register(self, a: dict) -> dict:
@@ -498,7 +501,8 @@ class Bus:
         so a person can attach to it; SSH to that machine is still the gate."""
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login") if SHARE_PANES else ())
         agents = [{k: a[k] for k in keys} for a in self.local_agents()]
-        return {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents}
+        ssh = self.keys.ssh_info() if self.keys else {"enroll": False}
+        return {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
 
     def version(self) -> str:
         from .update import describe
@@ -762,6 +766,10 @@ class _Handler(BaseHTTPRequestHandler):
             path = url.path.removeprefix("/bus/v1")
             if path.startswith("/sessions/") and method == "POST":
                 return self._reply(200, self._sessions(path, body, local, ip))
+            if path.startswith("/keys/"):
+                if b.keys is None:
+                    raise BusError("SSH keys are not available on this machine", 409)
+                return self._reply(200, b.keys.route(method, path, body, local, ip))
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello())
@@ -813,6 +821,12 @@ def start_bus() -> Bus | None:
         b.sessions = sessions.start(b)
     except Exception as e:  # noqa: BLE001
         log(f"sessions not started: {e!r}")
+    try:
+        from . import keys
+
+        b.keys = keys.start(b)
+    except Exception as e:  # noqa: BLE001
+        log(f"keys not started: {e!r}")
     try:
         from .update import ENABLED, Updater
 

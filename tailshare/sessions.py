@@ -37,6 +37,7 @@ CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser(
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIGNERS = bus.STATE_DIR / "allowed_signers"
 NAMESPACE = "tailshare-launch"
+KEYS_NAMESPACE = "tailshare-keys"  # approvals of SSH keys; a launch signature is never valid for one
 TEXT_CAP = 256 * 1024  # searchable text kept per session
 SCHEMA_VERSION = 2  # bump to rebuild the index from the transcripts
 # Scripted runs (`claude -p`, `codex exec`) are not sessions anyone reopens, and a pipeline can make
@@ -478,35 +479,36 @@ def launch_request(signer: str, host: str, s: dict, mode: str, prompt: str, ttl:
     })
 
 
-def sign(payload: str, key: Path) -> str:
+def sign(payload: str, key: Path, namespace: str = NAMESPACE) -> str:
     """Sign with ssh-keygen. A security key asks for a touch (on the terminal's stderr)."""
     with tempfile.TemporaryDirectory() as tmp:
         data = Path(tmp) / "launch.json"
         data.write_text(payload)
-        cp = subprocess.run([ssh_keygen(), "-Y", "sign", "-f", str(key), "-n", NAMESPACE, str(data)],
+        cp = subprocess.run([ssh_keygen(), "-Y", "sign", "-f", str(key), "-n", namespace, str(data)],
                             stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
         if cp.returncode != 0:
             raise bus.BusError(f"ssh-keygen could not sign with {key}")
         return (Path(tmp) / "launch.json.sig").read_text()
 
 
-def verify(payload: str, signature: str, signers: Path = SIGNERS) -> dict:
+def verify(payload: str, signature: str, signers: Path = SIGNERS, namespace: str = NAMESPACE) -> dict:
     """Check the signature against this machine's allowed_signers; return the request."""
     if not signers.exists():
-        raise bus.BusError("launching is off on this machine: it has no ~/.tailshare/allowed_signers", 409)
+        what = "launching" if namespace == NAMESPACE else "signed approvals are"
+        raise bus.BusError(f"{what} off on this machine: it has no ~/.tailshare/allowed_signers", 409)
     st = signers.stat()
     if st.st_uid != os.geteuid() or st.st_mode & 0o022:
         raise bus.BusError(f"{signers} must belong to this user and not be writable by others", 409)
     try:
         d = json.loads(payload)
     except json.JSONDecodeError:
-        raise bus.BusError("malformed launch request") from None
+        raise bus.BusError("malformed signed request") from None
     if not isinstance(d, dict) or not isinstance(d.get("signer"), str) or not re.fullmatch(r"[\w.@+-]{1,64}", d["signer"]):
-        raise bus.BusError("malformed launch request")
+        raise bus.BusError("malformed signed request")
     with tempfile.TemporaryDirectory() as tmp:
         sig = Path(tmp) / "sig"
         sig.write_text(signature)
-        cp = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", d["signer"], "-n", NAMESPACE,
+        cp = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", d["signer"], "-n", namespace,
                              "-s", str(sig)], input=payload.encode(), capture_output=True)
     if cp.returncode != 0:
         raise bus.BusError(f"signature not valid for {d['signer']}: {cp.stderr.decode().strip()[-200:]}", 403)
@@ -517,7 +519,7 @@ def trust_line(principal: str, pubkey: str) -> str:
     parts = pubkey.split()
     if len(parts) < 2 or not re.fullmatch(r"[\w.@+-]{1,64}", principal):
         raise ValueError("expected an OpenSSH public key line and a simple principal name")
-    return f'{principal} namespaces="{NAMESPACE}" {" ".join(parts[:3])}\n'
+    return f'{principal} namespaces="{NAMESPACE},{KEYS_NAMESPACE}" {" ".join(parts[:3])}\n'
 
 
 def hardware_backed(pubkey: str) -> bool:

@@ -1,0 +1,105 @@
+# SSH keys for devices: enroll, approve, attach
+
+A device with no tailshare install, such as a phone app, can ask a machine for SSH access over plain HTTP.
+A person on that machine approves it, and the key goes into a managed block of `~/.ssh/authorized_keys`.
+By default the key can do one thing: attach to the tmux pane of an agent running there.
+
+**Approving a key is approving shell-level access.** A pane key cannot run commands, forward ports or
+agents, or copy files. But a client attached to tmux can type into the pane, and the pane is a shell or an
+agent, often one running with permissions skipped. Approve only devices you would give a shell to.
+
+## The flow
+
+1. The device calls `POST http://<tailnet ip>:8789/bus/v1/keys/enroll` with its public key and a name.
+2. The machine records a pending request with what the tailnet says about the caller (its node and user),
+   which the device cannot fake, and shows a desktop notification on macOS.
+3. A person runs `tailshare keys pending`, then `tailshare keys approve <id>`. The command prints the device,
+   its tailnet node and owner (flagged when it is not one of yours), the fingerprint and what access it
+   grants. To approve, the person types the last 4 characters of the fingerprint shown on the device.
+4. The key is installed. The device polls `GET /bus/v1/keys/enroll/<request id>` until it sees `approved`,
+   then connects with SSH.
+
+```sh
+tailshare keys pending                 # requests waiting here
+tailshare keys approve 3f2a91c0        # pane access (default)
+tailshare keys approve 3f2a91c0 --shell   # a full shell instead
+tailshare keys deny 3f2a91c0
+tailshare keys ls                      # keys tailshare installed here
+tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machines
+```
+
+## Who can approve, and where the key goes
+
+- **Only a person, on that machine.** `keys approve` refuses to run without a terminal and refuses inside an
+  agent's shell (`CLAUDECODE`, `CODEX_THREAD_ID` and the like). Approval is not offered over MCP. An agent
+  with a shell could still edit `authorized_keys` itself; these checks stop agents from being *talked into*
+  approving, which is the likely attack (a bus message saying "please approve key X").
+- **This machine only, unless signed.** With a signing key (`TAILSHARE_SIGN_KEY` or `~/.ssh/id_*_sk`), the
+  approval is signed with `ssh-keygen -Y sign -n tailshare-keys` and sent to the owner's other machines that
+  run tailshare. Each one checks the signature against its own `~/.tailshare/allowed_signers` before
+  installing. One machine can never add keys to the others on its own say-so. `--here` skips the others.
+  Keys trusted with `tailshare sessions trust` sign both launches and key approvals. A launch signature is
+  never accepted as a key approval, and a key approval is never accepted as a launch.
+- **Someone else's machine shared into your tailnet**: the device enrolls there and that machine's owner
+  approves it there. Install and revoke requests from other machines are only accepted from machines of the
+  same tailnet user.
+- Each signed approval works once (nonce), within 15 minutes. A revoked key id can never be installed again.
+
+## Revoking
+
+`tailshare keys rm <key id>` removes the key here, then asks the owner's other machines to remove it.
+Removing access needs no signature. Machines that are offline are retried every minute for 7 days.
+
+## The gate
+
+Pane keys are installed as
+
+```
+restrict,pty,command="/path/to/tailshare ssh-gate" ssh-ed25519 AAAA... tailshare:<key id> <device>
+```
+
+`tailshare ssh-gate` reads `SSH_ORIGINAL_COMMAND` and accepts only
+
+```
+tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-window -t %N ; select-pane -t %N]
+```
+
+- `<flags>` may combine `read-only`, `ignore-size`, `active-pane` and `no-output`. `ignore-size` keeps a small
+  phone screen from shrinking the window on the desktop.
+- The socket and pane must have been registered by an agent on this machine. A registration lasts as long
+  as the agent's row, 30 days after it was last seen. The pane must still exist (`tmux display` checks it).
+- The gate then execs the registered tmux binary directly, with no shell in between.
+- With no command, the gate lists the panes it would accept.
+
+## For clients
+
+`GET /bus/v1/hello` carries what a client needs to connect:
+
+```json
+"ssh": {"login": "Glaciar", "owner": "nick@example.com", "port": 22,
+        "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true}
+```
+
+- `host_keys` go straight into `known_hosts`, so there is no trust-on-first-use.
+- `owner` says whose machine it is; enroll once per owner.
+- `enroll` is false where keys cannot be installed:
+  - tailshare runs as root (never: that would give the device root);
+  - `TAILSHARE_SSH_ENROLL=0`;
+  - sshd reads keys from somewhere other than `~/.ssh/authorized_keys`.
+- `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine. It ignores `authorized_keys`;
+  access there follows the tailnet's SSH policy instead.
+
+`POST /bus/v1/keys/enroll` takes `{"pubkey": "ssh-ed25519 AAAA...", "device_name": "Nick's iPhone"}` and
+answers:
+
+```json
+{"request_id": "…", "fingerprint": "SHA256:…", "host": "macbook-pro", "login": "Glaciar", "owner": "…",
+ "status": "pending", "expires": 1793390000.0, "key_id": "", "installed": []}
+```
+
+- Key types: `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`, `ecdsa-sha2-nistp256`.
+- Limits: 3 pending requests per device, 20 a day. A request expires after 15 minutes.
+- Enrolling the same key again returns the same request.
+- `GET /bus/v1/keys/enroll/<request_id>` answers the same shape. Only the device that made the request can
+  read it. `status` is one of `pending`, `approved`, `denied`, `expired`.
+- Every call needs the header `X-Tailshare: 1`.
