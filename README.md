@@ -154,7 +154,7 @@ http://<tailnet ip>:8789/bus/v1/hello` (header `X-Tailshare: 1`), so an app can 
 This only says where a pane is; attaching still needs SSH access to that machine. `TAILSHARE_SHARE_PANES=0`
 leaves panes out of `/hello`. `/hello` also answers `you: {user, node}`, what the tailnet says about the caller.
 Devices without `tailscale status` (phones) find the rest with `GET /bus/v1/peers`: the machines running tailshare
-that this one has heard from, as `{host, ip, port, owner, online, ssh_host_keys}`, all from `tailscale status`
+that this one has heard from, as `{host, ip, port, owner, online, ssh_host_keys, self}`, all from `tailscale status`
 (never from what a peer says). Only the machine owner's own devices may ask. Each pane in `/hello` carries
 `alive`, from the same `tmux display` check the SSH gate makes.
 

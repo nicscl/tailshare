@@ -105,22 +105,43 @@ def token_path() -> Path:
 
 def load_token(path: Path, create: bool = False) -> str:
     """The secret that proves a local caller runs as this account: other users cannot read the file.
-    Without it the local API (127.0.0.1, open to every process on the machine) would let anyone approve."""
+    Without it the local API (127.0.0.1, open to every process on the machine) would let anyone approve.
+    With `create` (the mailbox), a missing or unusable file is replaced by a new token."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
+        return _read_token(path)
+    except (FileNotFoundError, ValueError):
         if not create:
             raise
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".keys.token.")  # mode 0600
+    try:
         with os.fdopen(fd, "w") as f:
             f.write(secrets.token_hex(32))
-        return load_token(path)
+        try:
+            os.link(tmp, path)  # fails if another process made one meanwhile: use theirs
+        except FileExistsError:
+            try:
+                return _read_token(path)
+            except ValueError:  # still empty or short: a crash mid-write, or a `touch`
+                if path.is_symlink() or path.stat().st_uid != os.geteuid():
+                    raise
+                os.replace(tmp, path)
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+    return _read_token(path)
+
+
+def _read_token(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd) as f:
         st = os.fstat(f.fileno())
-        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
-            raise OSError(f"{path} must belong to this user and be readable only by it")
-        return f.read().strip()
+        if st.st_uid != os.geteuid() or st.st_mode & 0o077 or not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path} must be a file that belongs to this user and is readable only by it")
+        token = f.read(256).strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        raise ValueError(f"{path} does not hold a token")
+    return token
 
 
 def signature_key_type(signature: str) -> str:
@@ -802,7 +823,7 @@ class Keys:
     # -- HTTP --------------------------------------------------------------------------
     def route(self, method: str, path: str, body: dict, local: bool, ip: str, token: str = "") -> dict:
         if local:
-            if not secrets.compare_digest(token.encode(), self.token.encode()):
+            if len(self.token) < 64 or not secrets.compare_digest(token.encode(), self.token.encode()):
                 raise bus.BusError(f"missing or wrong {TOKEN_HEADER} token (only {bus.LOGIN} can manage keys here)", 403)
             routes = {("GET", "/keys/pending"): lambda: self.pending(), ("GET", "/keys/ls"): lambda: self.ls(),
                       ("POST", "/keys/approve"): lambda: self.approve(body),
@@ -845,7 +866,7 @@ def _call(path: str, payload: dict | None = None, timeout: float = 30) -> dict:
 
     try:
         token = load_token(token_path())
-    except OSError as e:
+    except (OSError, ValueError) as e:
         raise ValueError(f"cannot read {token_path()} ({e}); is this the account tailshare runs as?") from None
     try:
         return bus.request(agent.LOCAL + path, payload, timeout, {TOKEN_HEADER: token})

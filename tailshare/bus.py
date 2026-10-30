@@ -548,14 +548,14 @@ class Bus:
         self.require_same_user(ip)
         own = self.net.ssh_host_keys if self.net.tailscale_ssh else (self.keys.ssh_info()["host_keys"] if self.keys else [])
         out = [{"host": self.net.host, "ip": self.net.ip, "port": self.port, "owner": self.net.user, "online": True,
-                "ssh_host_keys": own}]
+                "ssh_host_keys": own, "self": True}]
         for p in self.store.q("SELECT host, ip FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
             n = self.net.peers.get(p["host"])
             if n is None:
                 continue
             out.append({"host": p["host"], "ip": n["ip"], "port": n.get("port", BUS_PORT),
                         "owner": n.get("user", ""), "online": bool(n.get("online")),
-                        "ssh_host_keys": n.get("ssh_host_keys", [])})
+                        "ssh_host_keys": n.get("ssh_host_keys", []), "self": False})
         return out
 
     def version(self) -> str:

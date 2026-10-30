@@ -251,6 +251,7 @@ class Flow(unittest.TestCase):
         peers = self.air.peer_list(PHONE)
         self.assertEqual([(p["host"], p["owner"]) for p in peers], [("air", OWNER), ("pro", OWNER)])
         self.assertEqual(peers[1]["port"], self.pro_port)
+        self.assertEqual([p["self"] for p in peers], [True, False])
         with self.assertRaises(bus.BusError) as cm:  # names the owner's machines: not for others
             self.air.peer_list("100.64.0.66")
         self.assertEqual(cm.exception.code, 403)
@@ -405,6 +406,43 @@ class Flow(unittest.TestCase):
             self.pro_keys.revoke_from_peer("127.0.0.1", {"key_id": "kaaaaaaaaaaaa"})
         self.assertEqual(cm.exception.code, 403)
         self.assertEqual(self.pro_keys.targets(), ["pro"])
+
+
+class Token(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "keys.token"
+
+    def test_made_once_and_kept(self):
+        t = keys.load_token(self.path, create=True)
+        self.assertRegex(t, r"^[0-9a-f]{64}$")
+        self.assertEqual(oct(self.path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(keys.load_token(self.path, create=True), t)
+        self.assertEqual(keys.load_token(self.path), t)
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], ["keys.token"])  # no temp files left
+
+    def test_empty_or_short_file_never_opens_the_api(self):
+        for junk in ("", "abc\n", "x" * 64):
+            self.path.write_text(junk)
+            os.chmod(self.path, 0o600)
+            with self.assertRaises(ValueError):  # the CLI refuses
+                keys.load_token(self.path)
+            t = keys.load_token(self.path, create=True)  # the mailbox replaces it
+            self.assertRegex(t, r"^[0-9a-f]{64}$")
+            self.path.unlink()
+
+    def test_empty_token_refuses_requests_without_header(self):
+        b = make_bus("air")
+        k = keys.Keys(b, Path("/nonexistent"), Path(tempfile.mkdtemp()) / "ak", self.path)
+        k.token = ""  # as if the file had been empty
+        with self.assertRaises(bus.BusError) as cm:
+            k.route("POST", "/keys/approve", {"id": "x", "mode": "shell"}, True, "127.0.0.1", "")
+        self.assertEqual(cm.exception.code, 403)
+
+    def test_group_readable_file_is_refused(self):
+        keys.load_token(self.path, create=True)
+        os.chmod(self.path, 0o640)
+        with self.assertRaises(OSError):
+            keys.load_token(self.path)
 
 
 class GateChecks(unittest.TestCase):
