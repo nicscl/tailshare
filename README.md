@@ -152,7 +152,9 @@ path) and the account it runs as. `agent ls --attach` prints `ssh -t <login>@<ho
 <pane> ...` for each one, and any device on the tailnet can read the same from a machine's `GET
 http://<tailnet ip>:8789/bus/v1/hello` (header `X-Tailshare: 1`), so an app can list agents and open their panes.
 This only says where a pane is; attaching still needs SSH access to that machine. `TAILSHARE_SHARE_PANES=0`
-leaves panes out of `/hello`.
+leaves panes out of `/hello`. `/hello` also answers `you: {user, node}`, what the tailnet says about the caller.
+Devices without `tailscale status` (phones) find the rest with `GET /bus/v1/peers`: the machines running tailshare
+that this one has heard from, as `{host, ip, port, owner, online}`. Only the machine owner's own devices may ask.
 
 **SSH keys for devices.** A device without tailshare (a phone app) can ask a machine for an SSH key over
 `POST /bus/v1/keys/enroll`. Nothing is installed until a person runs `tailshare keys approve` on that

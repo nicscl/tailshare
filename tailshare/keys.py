@@ -699,6 +699,18 @@ class Keys:
                 out[r["host"]] = f"failed, will retry: {str(e)[:100]}"
         return out
 
+    def revoke(self, ip: str, body: dict) -> dict:
+        """POST /keys/revoke. From the device that enrolled the key here: remove it here and on the
+        owner's other machines (removing access needs no signature, so a lost phone's app can do it).
+        From another machine: that machine's `keys rm` fanning out, handled by revoke_from_peer."""
+        key_id = str(body.get("key_id") or "")
+        if not _KEY_ID_RE.fullmatch(key_id):
+            raise bus.BusError("bad key id")
+        if self.store.one("SELECT 1 FROM key_requests WHERE key_id=? AND ip=?", key_id, ip):
+            log(f"{key_id} revoked by the device that enrolled it ({ip})")
+            return {"host": self.host, **self.rm(body)}
+        return self.revoke_from_peer(ip, body)
+
     def revoke_from_peer(self, ip: str, body: dict) -> dict:
         if self._owner_problem():
             raise bus.BusError(self._owner_problem(), 403)
@@ -719,7 +731,7 @@ class Keys:
                 return self.status(ip, path.removeprefix("/keys/enroll/"))
             routes = {("POST", "/keys/enroll"): lambda: self.enroll(ip, body),
                       ("POST", "/keys/install"): lambda: self.install_from_peer(ip, body),
-                      ("POST", "/keys/revoke"): lambda: self.revoke_from_peer(ip, body)}
+                      ("POST", "/keys/revoke"): lambda: self.revoke(ip, body)}
         fn = routes.get((method, path))
         if fn is None:
             raise bus.BusError("not found", 404)

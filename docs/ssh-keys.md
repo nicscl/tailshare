@@ -54,7 +54,9 @@ tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machin
 ## Revoking
 
 `tailshare keys rm <key id>` removes the key here, then asks the owner's other machines to remove it.
-Removing access needs no signature. Machines that are offline are retried every minute until they answer.
+The device itself can do the same with `POST /bus/v1/keys/revoke {"key_id": "k…"}` on the machine it enrolled
+with, from the tailnet node that made the request (an app's "Remove access" button). Removing access needs no
+signature. Machines that are offline are retried every minute until they answer.
 `tailshare keys ls` lists removals that have not reached every machine yet. Removing a key does not end SSH
 sessions that are already open, and anything a session changed while attached (another line in
 `authorized_keys`, for instance) stays. After a lost device, also check those.
@@ -112,6 +114,8 @@ answers:
 - Key types: `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`, `ecdsa-sha2-nistp256`.
 - Limits: 3 pending requests per device, 20 a day. A request expires after 15 minutes.
 - Enrolling the same key again returns the same request.
+- `tailshare keys pending` shows the first 8 characters of `request_id`, and `keys approve` takes any prefix
+  that matches one request, so a client can show `tailshare keys approve <request_id[:8]>`.
 - `GET /bus/v1/keys/enroll/<request_id>` answers the same shape. Only the device that made the request can
   read it. `status` is one of `pending`, `approved`, `denied`, `expired`.
 - Every call needs the header `X-Tailshare: 1`.

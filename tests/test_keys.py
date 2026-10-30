@@ -221,6 +221,29 @@ class Flow(unittest.TestCase):
             self.pro_keys.install_here("kaaaaaaaaaaaa", {"pubkey": "x", "fingerprint": "y", "device": "d",
                                                          "node": "n", "user": "u"}, "pane", "test")
 
+    def test_device_revokes_its_own_key(self):
+        r = self.enroll()
+        payload, sig = self.signed(r)
+        self.air_keys.approve({"id": r["request_id"], "mode": "pane", "payload": payload, "signature": sig})
+        with self.assertRaises(bus.BusError) as cm:  # not the device that enrolled it, nor the owner's machine
+            self.air_keys.revoke("100.64.0.66", {"key_id": "kaaaaaaaaaaaa"})
+        self.assertEqual(cm.exception.code, 403)
+        out = self.air_keys.revoke(PHONE, {"key_id": "kaaaaaaaaaaaa"})
+        self.assertEqual((out["removed_here"], out["elsewhere"]), (True, {"pro": "removed"}))
+        self.assertNotIn("tailshare:", (self.tmp / "air" / "authorized_keys").read_text())
+        self.assertNotIn("tailshare:", (self.tmp / "pro" / "authorized_keys").read_text())
+
+    def test_hello_says_who_is_asking_and_owner_gets_peers(self):
+        self.assertEqual(self.air.hello(PHONE)["you"], {"user": OWNER, "node": "iphone"})
+        self.assertEqual(self.air.hello("100.64.0.66")["you"], {"user": "eve@example.com", "node": "eve-laptop"})
+        self.assertNotIn("you", self.air.hello())
+        peers = self.air.peer_list(PHONE)
+        self.assertEqual([(p["host"], p["owner"]) for p in peers], [("air", OWNER), ("pro", OWNER)])
+        self.assertEqual(peers[1]["port"], self.pro_port)
+        with self.assertRaises(bus.BusError) as cm:  # names the owner's machines: not for others
+            self.air.peer_list("100.64.0.66")
+        self.assertEqual(cm.exception.code, 403)
+
     def test_launch_signature_is_not_a_key_approval(self):
         r = self.enroll()
         payload, _ = self.signed(r)

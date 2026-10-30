@@ -496,13 +496,32 @@ class Bus:
         ]
 
     # -- peers ----------------------------------------------------------------
-    def hello(self) -> dict:
+    def hello(self, ip: str = "") -> dict:
         """What any tailnet peer may know. With SHARE_PANES, also where each agent's tmux pane is,
-        so a person can attach to it; SSH to that machine is still the gate."""
+        so a person can attach to it; SSH to that machine is still the gate. `you` is what the tailnet
+        says about the caller, so a client can tell its own machines from ones shared with it."""
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login") if SHARE_PANES else ())
         agents = [{k: a[k] for k in keys} for a in self.local_agents()]
         ssh = self.keys.ssh_info() if self.keys else {"enroll": False}
-        return {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
+        out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
+        if ip:
+            if self.net.host_for_ip(ip) is None and time.time() - self.net.updated > 30:
+                self.net.refresh()
+            out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
+        return out
+
+    def peer_list(self, ip: str) -> list[dict]:
+        """Machines running tailshare that this machine has heard from, for clients that cannot run
+        `tailscale status` (phones). Only the owner's devices may ask: it names their other machines."""
+        self.require_same_user(ip)
+        out = [{"host": self.net.host, "ip": self.net.ip, "port": self.port, "owner": self.net.user, "online": True}]
+        for p in self.store.q("SELECT host, ip FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
+            n = self.net.peers.get(p["host"])
+            if n is None:
+                continue
+            out.append({"host": p["host"], "ip": n["ip"], "port": n.get("port", BUS_PORT),
+                        "owner": n.get("user", ""), "online": bool(n.get("online"))})
+        return out
 
     def version(self) -> str:
         from .update import describe
@@ -772,7 +791,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._reply(200, b.keys.route(method, path, body, local, ip))
             if not local:
                 if (method, path) == ("GET", "/hello"):
-                    return self._reply(200, b.hello())
+                    return self._reply(200, b.hello(ip))
+                if (method, path) == ("GET", "/peers"):
+                    return self._reply(200, {"peers": b.peer_list(ip)})
                 if (method, path) == ("POST", "/deliver"):
                     return self._reply(200, b.accept(ip, body))
                 if (method, path) == ("POST", "/update"):
