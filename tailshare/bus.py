@@ -547,57 +547,66 @@ class Bus:
         return alive
 
     # -- Hive app pairing -----------------------------------------------------
-    def add_pair_token(self, t: str, exp: float) -> dict:
-        """From `tailshare hive pair` (local API). The token is single-use and grants nothing by itself: it
-        ties a phone's pairing to the code on this screen, so the terminal can say which phone it was."""
+    PAIR_TTL = 600  # the longest a `tailshare hive pair` code may live
+
+    def add_pair_token(self, t: str, code: str, exp: float) -> dict:
+        """From `tailshare hive pair` (local API). The token grants nothing: it lets the app tell a fresh code
+        from a used one, and lets the waiting terminal say which device used it."""
         now = time.time()
-        if not re.fullmatch(r"[A-Za-z0-9_-]{22,64}", t):
-            raise BusError("bad token")
-        if not now < exp <= now + 3600:
-            raise BusError("bad expiry")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{22,64}", t) or not re.fullmatch(r"[A-Z0-9]{6}", code):
+            raise BusError("bad token or code")
+        if not now < exp <= now + self.PAIR_TTL + 5:
+            raise BusError(f"expiry must be within {self.PAIR_TTL} seconds")
         with self.store.lock:
             for k in [k for k, v in self._pair_tokens.items() if v["exp"] <= now - 3600]:
                 del self._pair_tokens[k]
             if sum(v["exp"] > now for v in self._pair_tokens.values()) >= 20:
                 raise BusError("too many pairing codes open", 429)
-            self._pair_tokens[t] = {"exp": exp, "paired": None}
+            self._pair_tokens[t] = {"exp": exp, "code": code, "used_by": None}
         return {"ok": True}
 
     def pair_status(self, t: str) -> dict:
-        """For the waiting `tailshare hive pair`: waiting, paired (with whom) or expired."""
+        """For the waiting `tailshare hive pair`: waiting, used (by whom, per the tailnet) or expired."""
         with self.store.lock:
             v = self._pair_tokens.get(t)
+            used = dict(v["used_by"]) if v and v["used_by"] else None
         if v is None:
             raise BusError("no such pairing code", 404)
-        if v["paired"]:
-            return {"state": "paired", **v["paired"]}
+        if used and not used.pop("busy", False):
+            return {"state": "used", **used}
+        if used:
+            return {"state": "waiting"}  # being used right now: enrolling its key
         return {"state": "expired" if v["exp"] < time.time() else "waiting"}
 
     def use_pair_token(self, ip: str, body: dict) -> dict:
-        """POST /hive/pair from the phone: {t, device_name, pubkey?}."""
-        t = str(body.get("t") or "")
-        now = time.time()
+        """POST /hive/pair {t, device_name, pubkey?} from the phone: 200 once, then 410; 404 if unknown.
+        With a pubkey it also enrolls it: `enroll` is the normal enroll response, or {error, code}."""
+        from .keys import clean_device
+
+        t, now = str(body.get("t") or ""), time.time()
         with self.store.lock:
             v = self._pair_tokens.get(t)
             if v is None:
                 raise BusError("no pairing is running with that code", 404)
-            if v["paired"] or v["exp"] < now:
+            if v["used_by"] or v["exp"] < now:
                 raise BusError("pairing code already used or expired", 410)
             if self.net.host_for_ip(ip) is None and now - self.net.updated > 30:
                 self.net.refresh()
             you = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
-            from .keys import clean_device
-
-            v["paired"] = {"device": clean_device(body.get("device_name")), "ip": ip, **you}
-        out = {"paired": True, "you": you, "owner": self.net.user}
-        if body.get("pubkey"):
-            try:
-                if self.keys is None:
-                    raise BusError("SSH keys are not available on this machine", 409)
-                out["enroll"] = self.keys.enroll(ip, {"pubkey": body["pubkey"], "device_name": body.get("device_name")})
-            except BusError as e:
-                out["enroll"] = {"error": str(e), "code": e.code}
-            v["paired"]["request_id"] = (out["enroll"] or {}).get("request_id", "")
+            v["used_by"] = {"ip": ip, **you, "device": clean_device(body.get("device_name")), "busy": True}
+        out = {"paired": True, "you": you, "owner": self.net.user, "host": self.net.host, "code": v["code"]}
+        try:
+            if body.get("pubkey"):
+                try:
+                    if self.keys is None:
+                        raise BusError("SSH keys are not available on this machine", 409)
+                    out["enroll"] = self.keys.enroll(ip, {"pubkey": body["pubkey"], "device_name": body.get("device_name")})
+                    v["used_by"]["request_id"] = out["enroll"].get("request_id", "")
+                except BusError as e:
+                    out["enroll"] = {"error": str(e), "code": e.code}
+        finally:
+            with self.store.lock:
+                v["used_by"].pop("busy", None)
         return out
 
     def peer_list(self, ip: str) -> list[dict]:
@@ -916,7 +925,8 @@ class _Handler(BaseHTTPRequestHandler):
             elif (method, path) == ("GET", "/outbox"):
                 return self._reply(200, {"outbox": b.outbox()})
             elif (method, path) == ("POST", "/hive/token"):
-                return self._reply(200, b.add_pair_token(str(body.get("t") or ""), float(body.get("exp") or 0)))
+                return self._reply(200, b.add_pair_token(str(body.get("token") or ""), str(body.get("code") or ""),
+                                                         float(body.get("exp") or 0)))
             elif (method, path) == ("GET", "/hive/status"):
                 return self._reply(200, b.pair_status(qs.get("t", "")))
             elif (method, path) == ("GET", "/machines"):
