@@ -128,8 +128,8 @@ detach, close stdin.
 Other panes' output and the names of other windows and sessions never leave the machine.
 
 When %N exits, or is left dead by `remain-on-exit`, the gate sends `%tailshare-gone %N` as its last line
-and exits 0. The control client keeps tmux's default 80x24 size, since `refresh-client` is not allowed.
-Send `-f ignore-size` so that size never touches the pane.
+and exits 0. `refresh-client` is not allowed, so the control client never sets a size, and tmux leaves the
+window's size alone. `-f ignore-size` is accepted but not needed.
 
 This narrows what the client can do. It does not make a pane key safer: the same key can still run
 plain `attach`, which is a full tmux client.
