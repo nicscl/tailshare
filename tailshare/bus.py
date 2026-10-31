@@ -187,6 +187,8 @@ class Net:
     updated: float = 0.0
     tailscale_ssh: bool = False  # Tailscale SSH answers port 22 here (it ignores authorized_keys)
     ssh_host_keys: list[str] = field(default_factory=list)  # Tailscale SSH's host keys here, per tailscale status
+    node_id: str = ""
+    nodes: list[dict] = field(default_factory=list)  # every peer node, even ones sharing a name: {"id", "host", ...}
 
     def host_for_ip(self, ip: str) -> str | None:
         if ip == self.ip:
@@ -221,14 +223,16 @@ class Net:
         self.user = logins.get(str(me.get("UserID")), "")
         self.tailscale_ssh = bool(me.get("sshHostKeys"))
         self.ssh_host_keys = clean_host_keys(me.get("sshHostKeys"))
-        peers = {}
+        self.node_id = str(me.get("ID") or "")
+        peers, nodes = {}, []
         for p in (d.get("Peer") or {}).values():
             ips = p.get("TailscaleIPs") or []
             if ips:
                 peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online")),
                                   "user": logins.get(str(p.get("UserID")), ""),
-                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys"))}
-        self.peers = peers
+                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys")), "id": str(p.get("ID") or "")}
+                nodes.append({"host": name(p), **peers[name(p)]})
+        self.peers, self.nodes = peers, nodes
 
 
 # --------------------------------------------------------------------------- storage
@@ -263,7 +267,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -542,20 +546,25 @@ class Bus:
         return alive
 
     def peer_list(self, ip: str) -> list[dict]:
-        """Machines running tailshare that this machine has heard from, for clients that cannot run
-        `tailscale status` (phones). Only the owner's devices may ask: it names their other machines.
-        ip, owner and ssh_host_keys come from tailscale status, never from what a peer says about itself."""
+        """Every node in this machine's `tailscale status`, for clients that cannot run it (phones), with
+        `tailshare` saying which ones have answered this machine as tailshare peers. Only the owner's devices
+        may ask: it names their machines. Rows are about IPs and node ids. id, ip, owner and online are the
+        coordination server's view in tailscale status, never what a node tells tailshare. ssh_host_keys is the
+        node's own Hostinfo claim (tied to its node key, not checked by Tailscale), present only on nodes
+        running Tailscale SSH. `tailshare` needs the same IP and node id that answered /hello, so a node
+        that takes over a reused IP does not inherit it."""
         self.require_same_user(ip)
         own = self.net.ssh_host_keys if self.net.tailscale_ssh else (self.keys.ssh_info()["host_keys"] if self.keys else [])
-        out = [{"host": self.net.host, "ip": self.net.ip, "port": self.port, "owner": self.net.user, "online": True,
-                "ssh_host_keys": own, "self": True}]
-        for p in self.store.q("SELECT host, ip FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
-            n = self.net.peers.get(p["host"])
-            if n is None:
-                continue
-            out.append({"host": p["host"], "ip": n["ip"], "port": n.get("port", BUS_PORT),
-                        "owner": n.get("user", ""), "online": bool(n.get("online")),
-                        "ssh_host_keys": n.get("ssh_host_keys", []), "self": False})
+        out = [{"id": self.net.node_id, "host": self.net.host, "ip": self.net.ip, "port": self.port,
+                "owner": self.net.user, "online": True, "ssh_host_keys": own, "tailshare": True, "self": True}]
+        answered = {(r["ip"], r["node"]) for r in self.store.q("SELECT ip, node FROM peers WHERE last_ok IS NOT NULL")}
+        nodes = self.net.nodes or [{"id": "", "host": h, **p} for h, p in self.net.peers.items()]
+        for n in sorted(nodes, key=lambda n: (n["host"], n["ip"])):
+            ts = (n["ip"], n.get("id", "")) in answered
+            out.append({"id": n.get("id", ""), "host": n["host"], "ip": n["ip"],
+                        "port": n.get("port", BUS_PORT) if ts else None, "owner": n.get("user", ""),
+                        "online": bool(n.get("online")), "ssh_host_keys": n.get("ssh_host_keys", []),
+                        "tailshare": ts, "self": False})
         return out
 
     def version(self) -> str:
@@ -666,10 +675,10 @@ class Bus:
             except Exception:  # noqa: BLE001
                 return
             self.store.x(
-                "INSERT INTO peers(host, ip, version, last_ok, agents) VALUES(?,?,?,?,?)"
+                "INSERT INTO peers(host, ip, version, last_ok, agents, node) VALUES(?,?,?,?,?,?)"
                 " ON CONFLICT(host) DO UPDATE SET ip=excluded.ip, version=excluded.version,"
-                " last_ok=excluded.last_ok, agents=excluded.agents",
-                h, p["ip"], str(d.get("version", "")), time.time(), json.dumps(d.get("agents", [])),
+                " last_ok=excluded.last_ok, agents=excluded.agents, node=excluded.node",
+                h, p["ip"], str(d.get("version", "")), time.time(), json.dumps(d.get("agents", [])), p.get("id", ""),
             )
 
         if hosts:
