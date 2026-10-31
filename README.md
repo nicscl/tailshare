@@ -161,10 +161,16 @@ and node id) that answered this machine as a tailshare peer (`port` is null for 
 `alive`, from the same `tmux display` check the SSH gate makes.
 
 **Pairing the Hive app.** `tailshare hive pair` prints a QR code (and `--link` just the link) that makes this
-machine the Tailshare Hive app's first trusted machine: `tailsharehive://pair?v=1&host=…&ip=…&port=…&owner=…&k=…&ver=…&exp=…`.
-`k` lists the SHA256 fingerprints of the SSH host keys answering port 22 (unpadded base64url; the app checks
-the full keys from `/hello` against them), and `exp` is a Unix time 10 minutes out (`--ttl`). Nothing in it
-is secret and it is not signed: it is trusted because you scan your own screen.
+machine the Tailshare Hive app's first trusted machine:
+`tailsharehive://pair?v=1&ip=…&port=…&host=…&owner=…&hk=SHA256:…[&hk=…]&exp=…&code=…&ver=…&token=…`.
+- `hk` is one per SSH host key answering port 22, as `ssh-keygen -l` prints it. The app checks the full keys
+  from `/hello` against them.
+- `owner` is the tailnet login, the same string as `/hello`'s `ssh.owner` and `/peers`' `owner`.
+- `exp` is at most 10 minutes out (`--ttl`).
+- `code` is printed next to the QR, and the app shows it before pairing.
+- `token` works once: `POST /bus/v1/hive/pair {"token"}` answers 200 with `{host, code}` the first time, 410 once
+  used or expired, 404 if unknown. Tokens live in the mailbox's memory and grant nothing.
+- The link is not signed. You are trusting your own screen.
 
 **SSH keys for devices.** A device without tailshare (a phone app) can ask a machine for an SSH key over
 `POST /bus/v1/keys/enroll`. Nothing is installed until a person runs `tailshare keys approve` on that

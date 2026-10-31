@@ -4,13 +4,15 @@ iOS apps cannot run `tailscale status`, so the app starts from one machine the p
 scanning its screen. From there it reads /hello (full host keys, checked against the fingerprints here)
 and /peers (the rest of the tailnet).
 
-The link carries no secret and is not signed: the person scans their own terminal, which is what makes it
-trustworthy. It expires, so an old screenshot cannot be replayed later.
+The link is not signed: the person scans their own terminal, which is what makes it trustworthy, and checks
+that the code the app shows matches the one printed here. It expires within 10 minutes, and its one-time
+token (POST /bus/v1/hive/pair) lets the app refuse a code that was already used.
 """
 
 from __future__ import annotations
 
 import io
+import secrets
 import sys
 import time
 from urllib.parse import urlencode
@@ -27,13 +29,21 @@ def host_keys(net: bus.Net) -> list[str]:
     return list(net.ssh_host_keys) if net.tailscale_ssh else keys.host_keys()
 
 
-def pair_link(net: bus.Net, version: str, now: float | None = None, ttl: int = TTL) -> str:
-    # SHA256 fingerprints as unpadded base64url: `+` would read as a space in a query string
-    fps = [keys.fingerprint(" ".join(k.split()[:2])).removeprefix("SHA256:").replace("+", "-").replace("/", "_")
-           for k in host_keys(net)]
-    q = {"v": FORMAT, "host": net.host, "ip": net.ip, "port": bus.BUS_PORT, "owner": net.user,
-         "k": ",".join(fps), "ver": version, "exp": int((now or time.time()) + ttl)}
-    return f"{SCHEME}?{urlencode(q, safe='@:,')}"
+ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
+
+
+def new_code() -> str:
+    return "".join(secrets.choice(ALPHABET) for _ in range(6))
+
+
+def pair_link(net: bus.Net, version: str, code: str, token: str = "", now: float | None = None,
+              ttl: int = TTL) -> str:
+    hks = [keys.fingerprint(" ".join(k.split()[:2])) for k in host_keys(net)]  # `ssh-keygen -l` form
+    q = [("v", FORMAT), ("ip", net.ip), ("port", bus.BUS_PORT), ("host", net.host), ("owner", net.user),
+         *[("hk", h) for h in hks], ("exp", int((now or time.time()) + ttl)), ("code", code), ("ver", version)]
+    if token:
+        q.append(("token", token))
+    return f"{SCHEME}?{urlencode(q, safe='@:')}"
 
 
 def qr_text(data: str) -> str:
@@ -54,17 +64,21 @@ def cmd_pair(args) -> None:
     net.refresh()
     if not net.ip:
         sys.exit("✗ tailscale is not running here, or this machine is not on a tailnet")
+    if not 60 <= args.ttl <= TTL:
+        sys.exit(f"✗ --ttl must be between 60 and {TTL} seconds")
+    code, token = new_code(), secrets.token_urlsafe(16)
     try:
-        agent.call("/machines", timeout=3)
-    except (agent.Offline, bus.BusError, OSError):
-        print("⚠ the tailshare mailbox is not running here, so the app will not be able to reach this machine. "
-              "Start it with `tailshare install`.", file=sys.stderr)
-    link = pair_link(net, describe(), ttl=args.ttl)
+        agent.call("/hive/token", {"token": token, "code": code, "exp": time.time() + args.ttl}, timeout=3)
+    except (agent.Offline, bus.BusError, OSError) as e:
+        sys.exit(f"✗ the tailshare mailbox is not answering here ({e}), so the app could not reach this machine. "
+                 "Start it with `tailshare install`.")
+    link = pair_link(net, describe(), code, token, ttl=args.ttl)
     if args.link:
         print(link)
         return
     print(qr_text(link))
     print(f"\nScan with Tailshare Hive to add {net.host} ({net.ip}, {net.user}).")
+    print(f"The app will show the code {code}: it must match.")
     print(f"Valid for {args.ttl // 60} minutes. Only scan codes from your own screen.")
     print(f"\n{link}")
 
@@ -73,6 +87,6 @@ def add_parser(sub) -> None:
     hp = sub.add_parser("hive", help="the Tailshare Hive iOS app")
     s = hp.add_subparsers(dest="hive_cmd", required=True)
     p = s.add_parser("pair", help="show a QR code that adds this machine to the app")
-    p.add_argument("--ttl", type=int, default=TTL, help=f"seconds the code stays valid (default {TTL})")
+    p.add_argument("--ttl", type=int, default=TTL, help=f"seconds the code stays valid (60 to {TTL})")
     p.add_argument("--link", action="store_true", help="print only the link")
     p.set_defaults(fn=cmd_pair)
