@@ -160,6 +160,12 @@ claim in its Hostinfo, present only on nodes running Tailscale SSH. `tailshare` 
 and node id) that answered this machine as a tailshare peer (`port` is null for the others). Host names can repeat; `ip` and `id` do not. Only the machine owner's own devices may ask. Each pane in `/hello` carries
 `alive`, from the same `tmux display` check the SSH gate makes.
 
+**Pairing the Hive app.** `tailshare hive pair` prints a QR code (and `--link` just the link) that makes this
+machine the Tailshare Hive app's first trusted machine: `tailsharehive://pair?v=1&host=…&ip=…&port=…&owner=…&k=…&ver=…&exp=…`.
+`k` lists the SHA256 fingerprints of the SSH host keys answering port 22 (unpadded base64url; the app checks
+the full keys from `/hello` against them), and `exp` is a Unix time 10 minutes out (`--ttl`). Nothing in it
+is secret and it is not signed: it is trusted because you scan your own screen.
+
 **SSH keys for devices.** A device without tailshare (a phone app) can ask a machine for an SSH key over
 `POST /bus/v1/keys/enroll`. Nothing is installed until a person runs `tailshare keys approve` on that
 machine and confirms the fingerprint. The key can then only attach to agents' tmux panes, which still means
