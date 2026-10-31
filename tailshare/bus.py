@@ -547,31 +547,58 @@ class Bus:
         return alive
 
     # -- Hive app pairing -----------------------------------------------------
-    def add_pair_token(self, token: str, code: str, exp: float) -> dict:
-        """From `tailshare hive pair` (local API). A token grants nothing: it only lets the app tell a fresh
-        code from one already used, so a photographed QR cannot pair a second phone."""
+    def add_pair_token(self, t: str, exp: float) -> dict:
+        """From `tailshare hive pair` (local API). The token is single-use and grants nothing by itself: it
+        ties a phone's pairing to the code on this screen, so the terminal can say which phone it was."""
         now = time.time()
-        if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token) or not re.fullmatch(r"[A-Z0-9]{6}", code):
-            raise BusError("bad token or code")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{22,64}", t):
+            raise BusError("bad token")
         if not now < exp <= now + 3600:
             raise BusError("bad expiry")
         with self.store.lock:
-            for t in [t for t, v in self._pair_tokens.items() if v["exp"] <= now]:
-                del self._pair_tokens[t]
-            if len(self._pair_tokens) >= 20:
+            for k in [k for k, v in self._pair_tokens.items() if v["exp"] <= now - 3600]:
+                del self._pair_tokens[k]
+            if sum(v["exp"] > now for v in self._pair_tokens.values()) >= 20:
                 raise BusError("too many pairing codes open", 429)
-            self._pair_tokens[token] = {"exp": exp, "code": code, "used": False}
+            self._pair_tokens[t] = {"exp": exp, "paired": None}
         return {"ok": True}
 
-    def use_pair_token(self, token: str) -> dict:
+    def pair_status(self, t: str) -> dict:
+        """For the waiting `tailshare hive pair`: waiting, paired (with whom) or expired."""
         with self.store.lock:
-            t = self._pair_tokens.get(token)
-            if t is None:
-                raise BusError("unknown pairing code", 404)
-            if t["used"] or t["exp"] < time.time():
+            v = self._pair_tokens.get(t)
+        if v is None:
+            raise BusError("no such pairing code", 404)
+        if v["paired"]:
+            return {"state": "paired", **v["paired"]}
+        return {"state": "expired" if v["exp"] < time.time() else "waiting"}
+
+    def use_pair_token(self, ip: str, body: dict) -> dict:
+        """POST /hive/pair from the phone: {t, device_name, pubkey?}."""
+        t = str(body.get("t") or "")
+        now = time.time()
+        with self.store.lock:
+            v = self._pair_tokens.get(t)
+            if v is None:
+                raise BusError("no pairing is running with that code", 404)
+            if v["paired"] or v["exp"] < now:
                 raise BusError("pairing code already used or expired", 410)
-            t["used"] = True
-        return {"host": self.net.host, "code": t["code"]}
+            if self.net.host_for_ip(ip) is None and now - self.net.updated > 30:
+                self.net.refresh()
+            you = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
+            from .keys import clean_device
+
+            v["paired"] = {"device": clean_device(body.get("device_name")), "ip": ip, **you}
+        out = {"paired": True, "you": you, "owner": self.net.user}
+        if body.get("pubkey"):
+            try:
+                if self.keys is None:
+                    raise BusError("SSH keys are not available on this machine", 409)
+                out["enroll"] = self.keys.enroll(ip, {"pubkey": body["pubkey"], "device_name": body.get("device_name")})
+            except BusError as e:
+                out["enroll"] = {"error": str(e), "code": e.code}
+            v["paired"]["request_id"] = (out["enroll"] or {}).get("request_id", "")
+        return out
 
     def peer_list(self, ip: str) -> list[dict]:
         """Every node in this machine's `tailscale status`, for clients that cannot run it (phones), with
@@ -867,7 +894,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if (method, path) == ("GET", "/peers"):
                     return self._reply(200, {"peers": b.peer_list(ip)})
                 if (method, path) == ("POST", "/hive/pair"):
-                    return self._reply(200, b.use_pair_token(str(body.get("token") or "")))
+                    return self._reply(200, b.use_pair_token(ip, body))
                 if (method, path) == ("POST", "/deliver"):
                     return self._reply(200, b.accept(ip, body))
                 if (method, path) == ("POST", "/update"):
@@ -889,8 +916,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif (method, path) == ("GET", "/outbox"):
                 return self._reply(200, {"outbox": b.outbox()})
             elif (method, path) == ("POST", "/hive/token"):
-                return self._reply(200, b.add_pair_token(str(body.get("token") or ""), str(body.get("code") or ""),
-                                                         float(body.get("exp") or 0)))
+                return self._reply(200, b.add_pair_token(str(body.get("t") or ""), float(body.get("exp") or 0)))
+            elif (method, path) == ("GET", "/hive/status"):
+                return self._reply(200, b.pair_status(qs.get("t", "")))
             elif (method, path) == ("GET", "/machines"):
                 return self._reply(200, {"machines": b.machines()})
             elif (method, path) == ("POST", "/update"):
