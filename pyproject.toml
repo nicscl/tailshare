@@ -5,6 +5,9 @@ description = "Drop files into your tailnet from the terminal."
 requires-python = ">=3.11"
 dependencies = ["textual>=8", "qrcode>=8"]
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [project.scripts]
 tailshare = "tailshare.cli:main"
 
