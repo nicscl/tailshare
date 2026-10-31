@@ -81,7 +81,8 @@ restrict,pty,command="/path/to/tailshare ssh-gate" ssh-ed25519 AAAA... tailshare
 `tailshare ssh-gate` reads `SSH_ORIGINAL_COMMAND` and accepts only
 
 ```
-tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-window -t %N ; select-pane -t %N]
+tmux -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-window -t %N ; select-pane -t %N]
+tmux -S <socket> -C attach [-r] [-f <flags>] -t %N
 ```
 
 - `<flags>` may combine `read-only`, `ignore-size`, `active-pane` and `no-output`. `ignore-size` keeps a small
@@ -93,6 +94,45 @@ tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-win
 - The gate then execs tmux directly, with no shell in between. It uses the registered tmux binary only if
   just this user or root can change that file.
 - With no command, the gate lists the panes it would accept.
+- `-CC` is refused. `-C` goes through the control-mode filter below instead of an exec.
+
+### Control mode: one pane, filtered
+
+A client that sees `"control": 1` in `/hello` can use tmux control mode over `ssh -T` (no pty):
+
+```
+tmux -S <socket> -C attach [-r] [-f ignore-size] -t %N
+```
+
+The gate checks the socket, binary and pane as above. It then runs tmux as a child process and passes
+lines through in both directions, filtering each one.
+
+**From the client to tmux**, only these lines, exactly as written:
+
+- `send-keys -H -t %N 68 69 0d`: one or more hex bytes. Dropped when the command has `-r`.
+- `capture-pane -p -e -t %N`, optionally ending in `-S -<n>` with n ≤ 10000.
+- `display -p -t %N '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{pane_dead}'`.
+  This exact format and no other, since formats can run `#()`.
+
+Anything else is logged and dropped, including empty lines (tmux would detach) and lines over 64 KiB. To
+detach, close stdin.
+
+**From tmux to the client**, only these:
+
+- command replies (`%begin` … `%end`/`%error`);
+- `%output` and `%extended-output` for %N;
+- `%layout-change` for %N's window;
+- `%pane-mode-changed`, `%pause` and `%continue` for %N;
+- `%exit`.
+
+Other panes' output and the names of other windows and sessions never leave the machine.
+
+When %N exits, or is left dead by `remain-on-exit`, the gate sends `%tailshare-gone %N` as its last line
+and exits 0. The control client keeps tmux's default 80x24 size, since `refresh-client` is not allowed.
+Send `-f ignore-size` so that size never touches the pane.
+
+This narrows what the client can do. It does not make a pane key safer: the same key can still run
+plain `attach`, which is a full tmux client.
 
 ## For clients
 
@@ -100,7 +140,7 @@ tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-win
 
 ```json
 "ssh": {"login": "Glaciar", "owner": "nick@example.com", "port": 22,
-        "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true}
+        "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true, "control": 1}
 ```
 
 - `host_keys` go straight into `known_hosts`, so there is no trust-on-first-use.
@@ -109,6 +149,7 @@ tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-win
   - tailshare runs as root (never: that would give the device root);
   - `TAILSHARE_SSH_ENROLL=0`;
   - sshd reads keys from somewhere other than `~/.ssh/authorized_keys`.
+- `control: 1` means the gate takes `-C attach` (see "Control mode" above). Older versions leave it out.
 - `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine, and `host_keys` are then
   tailscaled's keys from `tailscale status`, not `/etc/ssh`. It ignores `authorized_keys`;
   access there follows the tailnet's SSH policy instead.

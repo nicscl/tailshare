@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from tailshare import bus, keys, sessions
@@ -390,7 +391,7 @@ class Flow(unittest.TestCase):
                 bus.request(url + path, body)
             self.assertEqual(cm.exception.code, 404, path)
         hello = bus.request(f"{url}/hello")
-        self.assertEqual((hello["ssh"]["owner"], hello["ssh"]["port"], hello["ssh"]["enroll"]), (OWNER, 22, True))
+        self.assertEqual((hello["ssh"]["owner"], hello["ssh"]["port"], hello["ssh"]["enroll"], hello["ssh"]["control"]), (OWNER, 22, True, 1))
 
     def test_panes_survive_idle(self):
         pane = {"socket": "/tmp/s", "pane": "%3", "target": "", "bin": ""}
@@ -538,6 +539,21 @@ class GateEndToEnd(unittest.TestCase):
     def test_attaches_to_the_registered_pane(self):
         self.gate(f"tmux -S {self.sock} attach -r -t {self.pane}")
         self.assertEqual(self.execs, [[self.tmux, "-S", self.sock, "attach", "-r", "-t", self.pane]])
+
+    def test_control_mode_goes_through_the_filter(self):
+        with mock.patch("tailshare.gate_control.run", return_value=0) as run, \
+                mock.patch("os._exit", side_effect=SystemExit) as exit_:
+            with self.assertRaises(SystemExit):
+                self.gate(f"{self.tmux} -S {self.sock} -C attach -r -f ignore-size -t {self.pane}")
+        exit_.assert_called_once_with(0)
+        req = run.call_args.args[0]
+        self.assertEqual((req["cc"], req["readonly"], req["pane"]), ("-C", True, self.pane))
+        for cmd in (f"tmux -CC -S {self.sock} attach -t {self.pane}",  # the same protocol, unfiltered
+                    f"tmux -C -S {self.sock} attach -t {self.pane} ; select-pane -t {self.pane}"):
+            with self.assertRaises(SystemExit, msg=cmd) as cm:
+                self.gate(cmd)
+            self.assertIsInstance(cm.exception.code, str)
+        self.assertEqual(self.execs, [])
 
     def test_refuses(self):
         for cmd in ("", "id", f"tmux -S {self.sock} attach -t %999", f"tmux -S {self.sock} attach -t {self.pane} ; run-shell id",

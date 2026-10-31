@@ -319,7 +319,7 @@ def write_authorized_keys(lines: list[str], path: Path | None = None) -> bool:
 
 def parse_attach(cmd: str) -> dict | None:
     """The one command a pane key may run:
-    tmux [-CC|-C] -S <socket> attach[-session] [-r] [-f <flags>] -t %N [; select-window -t %N ; select-pane -t %N]
+    tmux [-CC|-C] -S <socket> [-C] attach[-session] [-r] [-f <flags>] -t %N [; select-window -t %N ; select-pane -t %N]
     """
     try:
         a = shlex.split(cmd)
@@ -333,6 +333,8 @@ def parse_attach(cmd: str) -> dict | None:
     if a[i : i + 1] != ["-S"] or i + 2 >= len(a):
         return None
     sock, i = a[i + 1], i + 2
+    if not cc and a[i] == "-C" and i + 1 < len(a):  # the Hive app's spelling: tmux -S <socket> -C attach
+        cc, i = "-C", i + 1
     if a[i] not in ("attach", "attach-session"):
         return None
     i += 1
@@ -452,6 +454,16 @@ def cmd_gate(_args) -> None:
         sys.exit("tailshare ssh-gate: no tmux binary that only this user or root can change")
     if not own_socket(req["socket"]) or not pane_alive(binary, req["socket"], req["pane"]):
         sys.exit(f"tailshare ssh-gate: pane {req['pane']} is gone")
+    if req["cc"] == "-CC":  # the same control protocol as -C, which only goes through the filter below
+        sys.exit("tailshare ssh-gate: -CC is not accepted; use -C")
+    if req["cc"]:
+        if req["tail"]:
+            sys.exit("tailshare ssh-gate: -C attach takes no other commands")
+        from . import gate_control
+
+        rc = gate_control.run(req, binary, log=log)
+        sys.stdout.flush()
+        os._exit(rc)  # the thread reading the app's stdin may still be blocked in it
     os.execv(binary, gate_argv(req, binary))
 
 
@@ -518,7 +530,8 @@ class Keys:
         # Tailscale SSH answers port 22 with its own host keys, not the ones in /etc/ssh
         keys = list(getattr(net, "ssh_host_keys", []) or []) if ts else host_keys()
         return {"login": bus.LOGIN, "owner": net.user, "port": 22, "host_keys": keys,
-                "tailscale_ssh": ts, "enroll": not install_problem()}
+                "tailscale_ssh": ts, "enroll": not install_problem(),
+                "control": 1}  # ssh-gate takes `-C attach` (tailshare/gate_control.py)
 
 
     # -- requests from devices --------------------------------------------------
