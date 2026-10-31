@@ -160,6 +160,25 @@ claim in its Hostinfo, present only on nodes running Tailscale SSH. `tailshare` 
 and node id) that answered this machine as a tailshare peer (`port` is null for the others). Host names can repeat; `ip` and `id` do not. Only the machine owner's own devices may ask. Each pane in `/hello` carries
 `alive`, from the same `tmux display` check the SSH gate makes.
 
+**Pairing the Hive app.** `tailshare hive pair` prints a QR code that makes this machine the Tailshare Hive
+app's first trusted machine, then waits until a phone uses it. The link is `tailsharehive://pair/<base64url JSON>`
+with `{v, ip, port, host, owner, hk, t, c, exp}`:
+- `hk` lists the SSH host keys answering port 22, as `ssh-keygen -l` prints them.
+- `owner` is the tailnet login, the same as `/hello`'s `ssh.owner`.
+- `t` is a single-use token.
+- `c` is a 6-character code, also printed next to the QR. The app makes you check it, or type it if you
+  opened the link. A machine shared into your tailnet can forge a link that names this machine, but it cannot
+  forge the code on your own screen.
+- `exp` is at most 10 minutes out (`--ttl`).
+
+The phone calls `POST /bus/v1/hive/pair {t, device_name, pubkey?}`. It gets back 200 `{paired, you, owner, host,
+code, enroll?}` once, 410 after that or after `exp`, and 404 for a code this mailbox does not know. The terminal then
+prints which phone paired, from the tailnet's whois. If the phone sent a key, the usual approve prompt follows.
+
+The link is printed alone when the terminal is too narrow, when output is not a terminal, or with `--link`.
+`--copy` also copies it. Exit codes: 0 paired, 1 expired, 130 Ctrl-C. The link is not signed: you are trusting
+your own screen and its code.
+
 **SSH keys for devices.** A device without tailshare (a phone app) can ask a machine for an SSH key over
 `POST /bus/v1/keys/enroll`. Nothing is installed until a person runs `tailshare keys approve` on that
 machine and confirms the fingerprint. The key can then only attach to agents' tmux panes, which still means
