@@ -572,15 +572,13 @@ class Bus:
             used = dict(v["used_by"]) if v and v["used_by"] else None
         if v is None:
             raise BusError("no such pairing code", 404)
-        if used and not used.pop("busy", False):
-            return {"state": "used", **used}
         if used:
-            return {"state": "waiting"}  # being used right now: enrolling its key
+            return {"state": "used", **used}
         return {"state": "expired" if v["exp"] < time.time() else "waiting"}
 
     def use_pair_token(self, ip: str, body: dict) -> dict:
-        """POST /hive/pair {t, device_name, pubkey?} from the phone: 200 once, then 410; 404 if unknown.
-        With a pubkey it also enrolls it: `enroll` is the normal enroll response, or {error, code}."""
+        """POST /hive/pair {t, device_name} from the phone: 200 once, then 410; 404 if unknown. A key for the
+        phone is a separate, normal POST /keys/enroll."""
         from .keys import clean_device
 
         t, now = str(body.get("t") or ""), time.time()
@@ -593,21 +591,8 @@ class Bus:
             if self.net.host_for_ip(ip) is None and now - self.net.updated > 30:
                 self.net.refresh()
             you = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
-            v["used_by"] = {"ip": ip, **you, "device": clean_device(body.get("device_name")), "busy": True}
-        out = {"paired": True, "you": you, "owner": self.net.user, "host": self.net.host, "code": v["code"]}
-        try:
-            if body.get("pubkey"):
-                try:
-                    if self.keys is None:
-                        raise BusError("SSH keys are not available on this machine", 409)
-                    out["enroll"] = self.keys.enroll(ip, {"pubkey": body["pubkey"], "device_name": body.get("device_name")})
-                    v["used_by"]["request_id"] = out["enroll"].get("request_id", "")
-                except BusError as e:
-                    out["enroll"] = {"error": str(e), "code": e.code}
-        finally:
-            with self.store.lock:
-                v["used_by"].pop("busy", None)
-        return out
+            v["used_by"] = {"ip": ip, **you, "device": clean_device(body.get("device_name"))}
+        return {"paired": True, "you": you, "owner": self.net.user, "host": self.net.host, "code": v["code"]}
 
     def peer_list(self, ip: str) -> list[dict]:
         """Every node in this machine's `tailscale status`, for clients that cannot run it (phones), with

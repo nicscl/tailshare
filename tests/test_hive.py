@@ -72,18 +72,12 @@ class Token(unittest.TestCase):
             self.b.use_pair_token(PHONE, {"t": "v" * 22})
         self.assertEqual(cm.exception.code, 410)
 
-    def test_pubkey_enrolls(self):
+    def test_pubkey_is_ignored(self):  # keys go through POST /keys/enroll
         self.b.keys = mock.Mock()
-        self.b.keys.enroll.return_value = {"request_id": "r" * 32, "status": "pending"}
         self.b.add_pair_token("t" * 22, "ABC234", time.time() + 60)
         r = self.b.use_pair_token(PHONE, {"t": "t" * 22, "device_name": "p", "pubkey": ED})
-        self.b.keys.enroll.assert_called_once_with(PHONE, {"pubkey": ED, "device_name": "p"})
-        self.assertEqual(r["enroll"]["status"], "pending")
-        self.assertEqual(self.b.pair_status("t" * 22)["request_id"], "r" * 32)
-        self.b.add_pair_token("w" * 22, "ABC234", time.time() + 60)
-        self.b.keys.enroll.side_effect = bus.BusError("tailshare runs as root here", 409)
-        r = self.b.use_pair_token(PHONE, {"t": "w" * 22, "pubkey": ED})  # pairing still works
-        self.assertEqual((r["paired"], r["enroll"]["code"]), (True, 409))
+        self.b.keys.enroll.assert_not_called()
+        self.assertNotIn("enroll", r)
 
     def test_bad_input(self):
         for t, code, exp in (("short", "ABC234", 60), ("t" * 22, "ABC234", 700), ("t" * 22, "ABC234", -1),

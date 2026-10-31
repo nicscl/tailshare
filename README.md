@@ -171,9 +171,10 @@ with `{v, ip, port, host, owner, hk, t, c, exp}`:
   forge the code on your own screen.
 - `exp` is at most 10 minutes out (`--ttl`).
 
-The phone calls `POST /bus/v1/hive/pair {t, device_name, pubkey?}`. It gets back 200 `{paired, you, owner, host,
-code, enroll?}` once, 410 after that or after `exp`, and 404 for a code this mailbox does not know. The terminal then
-prints which phone paired, from the tailnet's whois. If the phone sent a key, the usual approve prompt follows.
+The phone calls `POST /bus/v1/hive/pair {t, device_name}`. It gets back 200 `{paired, you, owner, host, code}`
+once, 410 after that or after `exp`, and 404 for a code this mailbox does not know. The terminal then prints
+which phone paired, from the tailnet's whois. For a minute after that, it waits for that phone's normal
+`POST /keys/enroll` and offers the usual approve prompt (the last 6 characters, 3 tries, Enter skips).
 
 The link is printed alone when the terminal is too narrow, when output is not a terminal, or with `--link`.
 `--copy` also copies it. Exit codes: 0 paired, 1 expired, 130 Ctrl-C. The link is not signed: you are trusting

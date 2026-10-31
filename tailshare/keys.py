@@ -616,7 +616,7 @@ class Keys:
         rows = self.store.q("SELECT * FROM key_requests WHERE status='pending' ORDER BY created")
         return {"host": self.host, "owner": self.bus.net.user, "login": bus.LOGIN, "problem": install_problem(),
                 "targets": self.targets(), "pending": [
-                    {k: r[k] for k in ("id", "node", "user", "device", "pubkey", "fingerprint", "created", "expires")}
+                    {k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires")}
                     for r in rows]}
 
     def ls(self) -> dict:

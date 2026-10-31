@@ -29,6 +29,7 @@ SCHEME = "tailsharehive://pair/"
 TTL = bus.Bus.PAIR_TTL  # seconds a printed code stays valid
 ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
 BORDER = 2  # QR quiet zone, in modules
+KEY_WAIT = 60  # seconds to wait after pairing for the app's SSH key request
 
 
 def host_keys(net: bus.Net) -> list[str]:
@@ -122,13 +123,31 @@ def cmd_pair(args) -> None:
     if st["user"] != net.user:
         print(f"⚠ that phone belongs to {st['user'] or 'someone not on this tailnet'}, not {net.user}: "
               "it treats this machine as shared with it")
-    if st.get("request_id"):
-        try:
-            keys.approve_interactive(st["request_id"][:8], tries=3, skip_ok=True)
-        except (ValueError, bus.BusError) as e:
-            print(f"✗ {e}", file=sys.stderr)
-        except KeyboardInterrupt:
-            print("\nskipped: nothing installed", file=sys.stderr)
+    _offer_key(st)
+
+
+def _offer_key(st: dict) -> None:
+    """The app usually asks for an SSH key right after pairing (POST /keys/enroll). For a person at this
+    terminal, wait a little for that request from the device that used the code (same tailnet IP) and offer
+    the usual approve prompt, with the same typed check."""
+    try:
+        keys._human_check()
+    except ValueError:
+        return  # not a person at a terminal: `tailshare keys approve` later
+    print(f"Waiting up to {KEY_WAIT} s for the app to ask for an SSH key (Ctrl-C skips)…")
+    try:
+        end = time.time() + KEY_WAIT
+        while time.time() < end:
+            mine = [p for p in keys._call("/keys/pending")["pending"] if p["ip"] == st["ip"]]
+            if mine:
+                keys.approve_interactive(mine[-1]["id"][:8], tries=3, skip_ok=True)
+                return
+            time.sleep(1)
+        print("no key request came; approve one later with `tailshare keys pending`")
+    except (ValueError, bus.BusError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\nskipped: nothing installed", file=sys.stderr)
 
 
 def add_parser(sub) -> None:
