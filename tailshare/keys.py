@@ -616,7 +616,7 @@ class Keys:
         rows = self.store.q("SELECT * FROM key_requests WHERE status='pending' ORDER BY created")
         return {"host": self.host, "owner": self.bus.net.user, "login": bus.LOGIN, "problem": install_problem(),
                 "targets": self.targets(), "pending": [
-                    {k: r[k] for k in ("id", "node", "user", "device", "pubkey", "fingerprint", "created", "expires")}
+                    {k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires")}
                     for r in rows]}
 
     def ls(self) -> dict:
@@ -941,18 +941,25 @@ def cmd_pending(args):
 
 @_run
 def cmd_approve(args):
+    approve_interactive(args.id, args.shell, args.here, args.key, args.signer)
+
+
+def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_arg: str = "", signer_arg: str = "",
+                        tries: int = 1, skip_ok: bool = False) -> bool:
+    """Show a pending request and install it if the person types the fingerprint's end. Returns whether a key
+    was installed (False only when skip_ok and the person pressed Enter)."""
     from . import sessions, sessions_cli
 
     _human_check()
     d = _call("/keys/pending")
     if d.get("problem"):
         raise ValueError(d["problem"])
-    p = _find(d["pending"], args.id)
-    mode = "shell" if args.shell else "pane"
+    p = _find(d["pending"], rid)
+    mode = "shell" if shell else "pane"
     key = None
-    if not args.here:
+    if not here:
         try:
-            key = sessions_cli._key(args.key)
+            key = sessions_cli._key(key_arg)
         except ValueError:
             key = None
     if key and not _signs_key_approvals(key):
@@ -971,12 +978,23 @@ def cmd_approve(args):
         print(f"  access       a full shell as {d['login']}")
     print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (no signing key found: this machine only)"))
     want = p["fingerprint"][-CONFIRM_CHARS:]
-    got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint shown on the device (empty to cancel): ").strip()
-    if got != want:
-        raise ValueError("does not match the fingerprint: nothing installed" if got else "cancelled")
+    skip = "skip" if skip_ok else "cancel"
+    for attempt in range(tries):
+        got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint shown on the device (Enter to {skip}): ").strip()
+        if not got:
+            if skip_ok:
+                print("skipped: nothing installed. Approve later with `tailshare keys approve " + p["id"][:8] + "`")
+                return False
+            raise ValueError("cancelled")
+        if got == want:
+            break
+        if attempt + 1 < tries:
+            print("✗ does not match; try again")
+    else:
+        raise ValueError("does not match the fingerprint: nothing installed")
     body = {"id": p["id"], "mode": mode, "confirm": got}
     if key:
-        signer = sessions_cli._principal(args.signer)
+        signer = sessions_cli._principal(signer_arg)
         payload = approval_doc(signer, d["host"], p, "k" + secrets.token_hex(6), mode, hosts)
         body.update(payload=payload, signature=sessions.sign(payload, key, sessions.KEYS_NAMESPACE))
     r = _call("/keys/approve", body, timeout=90)
@@ -985,6 +1003,7 @@ def cmd_approve(args):
     for h, e in r["errors"].items():
         print(f"✗ {h}: {e}")
     print(f"key id {r['key_id']}; remove it with `tailshare keys rm {r['key_id']}`")
+    return True
 
 
 @_run
