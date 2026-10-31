@@ -582,14 +582,14 @@ class Bus:
         from .keys import clean_device
 
         t, now = str(body.get("t") or ""), time.time()
+        if t in self._pair_tokens and self.net.host_for_ip(ip) is None and now - self.net.updated > 30:
+            self.net.refresh()  # outside the lock: it runs `tailscale status`
         with self.store.lock:
             v = self._pair_tokens.get(t)
             if v is None:
                 raise BusError("no pairing is running with that code", 404)
             if v["used_by"] or v["exp"] < now:
                 raise BusError("pairing code already used or expired", 410)
-            if self.net.host_for_ip(ip) is None and now - self.net.updated > 30:
-                self.net.refresh()
             you = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
             v["used_by"] = {"ip": ip, **you, "device": clean_device(body.get("device_name"))}
         return {"paired": True, "you": you, "owner": self.net.user, "host": self.net.host, "code": v["code"]}

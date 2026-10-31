@@ -119,6 +119,9 @@ def cmd_pair(args) -> None:
     except KeyboardInterrupt:
         print("\ncancelled", file=sys.stderr)
         sys.exit(130)
+    except (agent.Offline, bus.BusError, OSError) as e:
+        print(f"✗ lost the mailbox while waiting ({e}): run `tailshare hive pair` again", file=sys.stderr)
+        sys.exit(1)
     print(f"✓ Code used by {st['device']} ({st['user'] or 'unknown user'} · {st['ip']})")
     if st["user"] != net.user:
         print(f"⚠ that phone belongs to {st['user'] or 'someone not on this tailnet'}, not {net.user}: "
