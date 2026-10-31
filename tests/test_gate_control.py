@@ -24,7 +24,8 @@ class Filters(unittest.TestCase):
         ok = ["send-keys -H -t %3 68 69 0d", "capture-pane -p -e -t %3", "capture-pane -p -e -t %3 -S -10000",
               f"display -p -t %3 {FMT}"]
         bad = ["send-keys -H -t %4 68", "send-keys -t %3 hi", "send-keys -H -t %3 68 ; run-shell id",
-               "send-keys -H -t %3 6G", "send-keys -H -t %3", "send-keys -H -t %3 68 ;", "send-keys -H -t %3 6", "capture-pane -p -e -t %3 -S -10001",
+               "send-keys -H -t %3 6G", "send-keys -H -t %3", "send-keys -H -t %3 68 ;", "send-keys -H -t %3 6",
+               "send-keys -H -t %3 6;", "send-keys -H -t %3 68 6; run-shell id", "capture-pane -p -e -t %3 -S -10001",
                "capture-pane -p -e -t %3 -S 0", "display -p -t %3 '#(id)'", f"display -p -t %3 {FMT} ; kill-server",
                "run-shell id", "", "refresh-client -C 80x24", "send-keys -H -t %3 68\r"]
         for line in ok:
