@@ -28,7 +28,8 @@ zooms once attached, so the app gets the %layout-change (flags with Z, a visible
 window option @tailshare-zoom ("%N %prev", prev the pane that was active) says gates zoomed it: the last gate
 on %N to leave unzooms it if it is still zoomed on %N, and gives prev back. A window zoomed by someone
 else, or on another pane (a second phone on another pane of the same window), is left as it is: that phone
-gets the split pane, scaled to fit.
+gets the split pane, scaled to fit. Once a gate sees the window unzoomed, it drops the mark, so a zoom the
+Mac makes after that is never undone by a gate.
 
 This narrows what the app can do; it is not what makes a pane key safe. Plain attach still gives a full
 tmux client (see docs/ssh-keys.md: approving a key is approving shell access).
@@ -223,6 +224,12 @@ def zoom(binary: str, sock: str, pane: str, window: str, log: Callable[[str], No
         log(f"control {pane}: could not zoom {window}")
 
 
+def forget_zoom(binary: str, sock: str, pane: str, window: str) -> None:
+    """Drop the gates' mark on %N's window, so no gate unzooms it later."""
+    if _display(binary, sock, window, "#{@tailshare-zoom}").split()[:1] == [pane]:
+        _tmux(binary, sock, "set-option", "-w", "-u", "-t", window, "@tailshare-zoom")
+
+
 def unzoom(binary: str, sock: str, pane: str, window: str, session: str) -> None:
     """Undo zoom() once no other gate holds the window: only if gates zoomed it, and it is still on %N."""
     mark = _display(binary, sock, window, "#{@tailshare-zoom}").split()
@@ -328,6 +335,7 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     for t in threads:
         t.start()
     replies = 0 if session else 2  # attach's goes to the app; the set-option's is the gate's own
+    zoomed = False  # seen %N's window zoomed since attaching
     try:
         for line in lines(child.stdout):
             if gone.is_set():
@@ -345,6 +353,11 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
                         continue
                 elif replies == 1 and w0 == b"%begin":
                     continue
+            if session and line and line.startswith(b"%layout-change ") and line.split(b" ")[1:2] == [window.encode()]:
+                z = b"Z" in (line.split(b" ")[4:5] or [b""])[0]
+                if zoomed and not z:  # unzoomed by someone: a zoom after this is theirs, not the gates'
+                    forget_zoom(binary, sock, pane, window)
+                zoomed = z
             if line is not None and out.allowed(line):
                 send(line)
         child.wait()

@@ -181,6 +181,7 @@ gates drop them always.
   - A window that is already zoomed (by the Mac, or by a phone on another of its panes) is left as it is.
     That client gets the split pane and scales it to fit. If the Mac unzooms, or selects another pane,
     tmux unzooms and sends a `%layout-change` without Z; the gate doesn't zoom it again.
+    The gate then drops the mark, so if the Mac zooms %N again by hand, that zoom is the Mac's and stays.
   - A gate killed with SIGKILL leaves the window zoomed, with the mark; the next gate on %N unzooms it
     when it leaves.
 

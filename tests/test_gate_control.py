@@ -453,6 +453,18 @@ class Proxy(unittest.TestCase):
         self.assertEqual(self.zoomed(), "0 1")  # not toggled back on
         self.assertEqual(self.zoomed(c), "0 0")
 
+    def test_keeps_a_zoom_the_mac_made_again(self):
+        self.split()
+        self.start(flags=())
+        self.assertTrue(self.wait_for(b"%layout-change"))
+        self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"))
+        self.t("resize-pane", "-Z", "-t", self.a)  # the Mac unzooms ...
+        self.assertTrue(self.wait_until(
+            lambda: self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}") == ""))
+        self.t("resize-pane", "-Z", "-t", self.a)  # ... and zooms %A again, its own now
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(), "1 1")
+
     def test_the_last_gate_unzooms(self):
         self.split()
         first, second = self.gate(), self.gate()
