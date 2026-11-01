@@ -461,9 +461,7 @@ def cmd_gate(_args) -> None:
             sys.exit("tailshare ssh-gate: -C attach takes no other commands")
         from . import gate_control
 
-        rc = gate_control.run(req, binary, log=log)
-        sys.stdout.flush()
-        os._exit(rc)  # the thread reading the app's stdin may still be blocked in it
+        sys.exit(gate_control.run(req, binary, log=log))
     os.execv(binary, gate_argv(req, binary))
 
 
@@ -531,7 +529,8 @@ class Keys:
         keys = list(getattr(net, "ssh_host_keys", []) or []) if ts else host_keys()
         return {"login": bus.LOGIN, "owner": net.user, "port": 22, "host_keys": keys,
                 "tailscale_ssh": ts, "enroll": not install_problem(),
-                "control": 1}  # ssh-gate takes `-C attach` (tailshare/gate_control.py)
+                "control": 1,  # ssh-gate takes `-C attach` (tailshare/gate_control.py)
+                "control_size": 1}  # ... and refresh-client -C / select-window there, with the lease
 
 
     # -- requests from devices --------------------------------------------------
