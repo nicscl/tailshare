@@ -489,6 +489,18 @@ class Proxy(unittest.TestCase):
             self.assertTrue(self.wait_until(lambda: self.zoomed(c) == "0 1"), (sig, self.zoomed(c)))
             self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
 
+    def test_a_second_signal_does_not_cut_the_cleanup_short(self):
+        import signal
+        c = self.split()
+        for _ in range(4):
+            p = self.gate()
+            self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"))
+            p.send_signal(signal.SIGHUP)
+            p.send_signal(signal.SIGTERM)  # at once, as a logout may do
+            self.assertEqual(p.wait(5), 128 + signal.SIGHUP)
+            self.assertTrue(self.wait_until(lambda: self.zoomed(c) == "0 1"), self.zoomed(c))
+            self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
+
     def test_the_last_gate_unzooms(self):
         self.split()
         first, second = self.gate(), self.gate()
