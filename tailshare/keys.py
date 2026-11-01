@@ -530,7 +530,8 @@ class Keys:
         return {"login": bus.LOGIN, "owner": net.user, "port": 22, "host_keys": keys,
                 "tailscale_ssh": ts, "enroll": not install_problem(),
                 "control": 1,  # ssh-gate takes `-C attach` (tailshare/gate_control.py)
-                "control_size": 1}  # ... and refresh-client -C / select-window there, with the lease
+                "control_size": 1,  # ... and refresh-client -C / select-window there, with the lease
+                "control_zoom": 1}  # ... and zooms a split window on the pane while it sizes
 
 
     # -- requests from devices --------------------------------------------------

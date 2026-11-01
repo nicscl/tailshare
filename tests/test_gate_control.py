@@ -308,7 +308,8 @@ class Proxy(unittest.TestCase):
         script = ("import sys; from tailshare import gate_control as g; "
                   f"req = {{'socket': {self.sock!r}, 'pane': {self.a!r}, 'readonly': False, 'flags': [], "
                   "'cc': '-C', 'tail': []}; sys.exit(g.run(req, sys.argv[1]))")
-        p = subprocess.Popen([sys.executable, "-c", script, self.tmux], stdin=subprocess.PIPE,
+        # "ssh-gate" in its argv, as a real gate has, so other gates see it as live (gate_running)
+        p = subprocess.Popen([sys.executable, "-c", script, self.tmux, "ssh-gate"], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env)
         self.addCleanup(lambda: (p.stdin.close(), p.stdout.close(), p.kill(), p.wait()))
         return p
@@ -391,6 +392,130 @@ class Proxy(unittest.TestCase):
                 return True
             time.sleep(0.05)
         return False
+
+    def split(self) -> str:
+        """%A's window split, with the new pane %C active (the Mac's choice)."""
+        c = self.t("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", self.a, "cat")
+        self.t("select-pane", "-t", c)
+        return c
+
+    def zoomed(self, pane=None) -> str:
+        return self.t("display", "-p", "-t", pane or self.a, "#{window_zoomed_flag} #{pane_active}")
+
+    def test_zooms_a_split_window_on_its_pane(self):
+        c = self.split()
+        self.start(flags=())
+        self.assertTrue(self.wait_for(b"%layout-change"), self.out)
+        change = [ln for ln in self.out.split(b"\n") if ln.startswith(b"%layout-change")][-1].split()
+        self.assertIn(b"Z", change[4])  # %layout-change @W layout visible flags
+        self.assertTrue(change[3].endswith(f",{self.a[1:]}".encode()) and b"[" not in change[3]
+                        and b"{" not in change[3], change)
+        self.assertEqual(self.zoomed(), "1 1")
+        self.say("refresh-client -C 60x20")
+        self.assertTrue(self.wait_until(lambda: self.t("display", "-p", "-t", self.a,
+                                                       "#{pane_width}x#{pane_height}") == "60x20"))
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(c), "0 1")  # unzoomed, and the Mac's pane active again
+        self.assertEqual(self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}"), "")
+
+    def test_a_window_with_one_pane_is_not_zoomed(self):
+        self.start(flags=())
+        self.assertEqual(self.zoomed(), "0 1")
+        self.assertEqual(self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}"), "")
+        self.assertEqual(self.stop(), 0)
+
+    def test_never_zooms_without_sizing(self):
+        self.split()
+        for kw in ({"flags": ("ignore-size",)}, {"readonly": True, "flags": ()}):
+            self.start(**kw)
+            self.assertEqual(self.zoomed()[0], "0", kw)  # (attaching to %A makes it active, as before)
+            self.assertEqual(self.stop(), 0)
+
+    def test_leaves_the_macs_own_zoom(self):
+        c = self.split()
+        self.t("resize-pane", "-Z", "-t", c)  # the Mac zoomed another pane
+        self.start(flags=())
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(c), "1 1")
+        self.t("resize-pane", "-Z", "-t", c)
+        self.t("select-pane", "-t", self.a)
+        self.t("resize-pane", "-Z", "-t", self.a)  # ... or this one
+        self.start(flags=())
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(), "1 1")
+
+    def test_leaves_it_unzoomed_if_the_mac_unzoomed(self):
+        c = self.split()
+        self.start(flags=())
+        self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"))
+        self.t("resize-pane", "-Z", "-t", self.a)  # the Mac unzoomed while the phone was on
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(), "0 1")  # not toggled back on
+        self.assertEqual(self.zoomed(c), "0 0")
+
+    def test_keeps_a_zoom_the_mac_made_again(self):
+        self.split()
+        self.start(flags=())
+        self.assertTrue(self.wait_for(b"%layout-change"))
+        self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"))
+        self.t("resize-pane", "-Z", "-t", self.a)  # the Mac unzooms ...
+        self.assertTrue(self.wait_until(
+            lambda: self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}") == ""))
+        self.t("resize-pane", "-Z", "-t", self.a)  # ... and zooms %A again, its own now
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(), "1 1")
+
+    def test_a_stale_mark_never_undoes_the_macs_zoom(self):
+        c = self.split()
+        self.t("select-pane", "-t", self.a)
+        self.t("resize-pane", "-Z", "-t", self.a)  # what a killed gate leaves: zoomed, and its mark
+        self.t("set-option", "-w", "-t", self.a, "@tailshare-zoom", f"{self.a} {c}")
+        self.start(flags=())
+        self.t("resize-pane", "-Z", "-t", self.a)  # the Mac unzooms ...
+        self.assertTrue(self.wait_until(
+            lambda: self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}") == ""))
+        self.t("resize-pane", "-Z", "-t", self.a)  # ... and zooms again: its own
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(), "1 1")
+
+    def test_a_signal_still_unzooms(self):
+        import signal
+        c = self.split()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            p = self.gate()
+            self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"), sig)
+            p.send_signal(sig)
+            self.assertEqual(p.wait(5), 128 + sig)
+            self.assertTrue(self.wait_until(lambda: self.zoomed(c) == "0 1"), (sig, self.zoomed(c)))
+            self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
+
+    def test_the_last_gate_unzooms(self):
+        self.split()
+        first, second = self.gate(), self.gate()
+        self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"), (self.zoomed(), self.sessions()))
+        self.assertTrue(self.wait_until(lambda: len(self.sessions()) == 3), self.sessions())
+        first.stdin.close()
+        self.assertEqual(first.wait(5), 0)
+        self.assertEqual(self.zoomed(), "1 1")  # the other phone is still on it
+        second.stdin.close()
+        self.assertEqual(second.wait(5), 0)
+        self.assertTrue(self.wait_until(lambda: self.zoomed() == "0 0"), self.zoomed())
+
+    def test_a_phone_on_another_pane_does_not_keep_the_zoom(self):
+        c = self.split()
+        first = self.gate()  # on %A: zooms
+        self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"))
+        old, self.a = self.a, c
+        second = self.gate()  # on %C: the window is zoomed on %A, so it is left
+        self.a = old
+        self.assertTrue(self.wait_until(lambda: len(self.sessions()) == 3), self.sessions())
+        first.stdin.close()
+        self.assertEqual(first.wait(5), 0)
+        self.assertTrue(self.wait_until(lambda: self.zoomed()[0] == "0"), self.zoomed())
+        second.stdin.close()
+        self.assertEqual(second.wait(5), 0)
+        self.assertEqual(self.zoomed()[0], "0")
+        self.assertEqual(self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}"), "")
 
     def test_says_when_the_pane_is_gone(self):
         self.start()
