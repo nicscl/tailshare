@@ -392,7 +392,7 @@ class Flow(unittest.TestCase):
             self.assertEqual(cm.exception.code, 404, path)
         hello = bus.request(f"{url}/hello")
         self.assertEqual((hello["ssh"]["owner"], hello["ssh"]["port"], hello["ssh"]["enroll"], hello["ssh"]["control"],
-                          hello["ssh"]["control_size"]), (OWNER, 22, True, 1, 1))
+                          hello["ssh"]["control_size"], hello["ssh"]["control_zoom"]), (OWNER, 22, True, 1, 1, 1))
 
     def test_panes_survive_idle(self):
         pane = {"socket": "/tmp/s", "pane": "%3", "target": "", "bin": ""}

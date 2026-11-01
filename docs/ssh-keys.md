@@ -168,6 +168,21 @@ gates drop them always.
   counts, and the fixed `display` line will do. Otherwise the gate sends `%tailshare-idle %N` as its last
   line and exits 0, so a phone that dropped off the network without closing the connection doesn't hold the size.
 - `resize-window` is never accepted. It sets the window to manual size for good.
+- **Zoom.** A gate that sends `"control_zoom": 1` zooms %N's window on %N (`resize-pane -Z`) when the
+  window has more than one pane, so the client's size goes to the pane itself rather than to a layout
+  around it. The gate runs it, never the client, right after the attach, so the client gets tmux's
+  `%layout-change @W <layout> <visible layout of %N alone> <flags with Z>`.
+  - Zoom belongs to the window, not to a client. While the phone is attached, the Mac shows that window
+    zoomed on %N too, and the pane that was active on the Mac becomes %N.
+  - It marks the window `@tailshare-zoom` (`%N <pane that was active>`). When the last gate on %N leaves,
+    it unzooms only if the window is still zoomed with %N active, then makes the old pane active again.
+    The check and the toggle run in the tmux server at once (`if-shell -F`), so two gates never toggle
+    each other.
+  - A window that is already zoomed (by the Mac, or by a phone on another of its panes) is left as it is.
+    That client gets the split pane and scales it to fit. If the Mac unzooms, or selects another pane,
+    tmux unzooms and sends a `%layout-change` without Z; the gate doesn't zoom it again.
+  - A gate killed with SIGKILL leaves the window zoomed, with the mark; the next gate on %N unzooms it
+    when it leaves.
 
 This narrows what the client can do. It does not make a pane key safer: the same key can still run
 plain `attach`, which is a full tmux client.
@@ -179,7 +194,7 @@ plain `attach`, which is a full tmux client.
 ```json
 "ssh": {"login": "Glaciar", "owner": "nick@example.com", "port": 22,
         "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true, "control": 1,
-        "control_size": 1}
+        "control_size": 1, "control_zoom": 1}
 ```
 
 - `host_keys` go straight into `known_hosts`, so there is no trust-on-first-use.
@@ -190,6 +205,7 @@ plain `attach`, which is a full tmux client.
   - sshd reads keys from somewhere other than `~/.ssh/authorized_keys`.
 - `control: 1` means the gate takes `-C attach` (see "Control mode" above). Older versions leave it out.
 - `control_size: 1` means it also takes the sizing commands and the lease (see "Sizing" above).
+- `control_zoom: 1` means a sizing attach to a pane in a split window zooms it (see "Zoom" above).
 - `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine, and `host_keys` are then
   tailscaled's keys from `tailscale status`, not `/etc/ssh`. It ignores `authorized_keys`;
   access there follows the tailnet's SSH policy instead.

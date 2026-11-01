@@ -22,6 +22,14 @@ before that leaves a session the next gate removes (sweep). If the session canno
 writes `%tailshare-nosize %N` and exits, and the app attaches again with -f ignore-size. If %N leaves that
 window, the gate writes `%tailshare-moved %N` and exits.
 
+A sizing client on a pane in a split window zooms the window on %N (resize-pane -Z, run by the gate), so the
+phone's size goes to the pane and not to a layout around it; the Mac shows the pane zoomed meanwhile. It
+zooms once attached, so the app gets the %layout-change (flags with Z, a visible layout of %N alone). The
+window option @tailshare-zoom ("%N %prev", prev the pane that was active) says gates zoomed it: the last gate
+on %N to leave unzooms it if it is still zoomed on %N, and gives prev back. A window zoomed by someone
+else, or on another pane (a second phone on another pane of the same window), is left as it is: that phone
+gets the split pane, scaled to fit.
+
 This narrows what the app can do; it is not what makes a pane key safe. Plain attach still gives a full
 tmux client (see docs/ssh-keys.md: approving a key is approving shell access).
 """
@@ -192,6 +200,43 @@ def own_session(binary: str, sock: str, pane: str, window: str) -> str:
     return name
 
 
+def other_gates(binary: str, sock: str, pane: str, window: str, session: str) -> bool:
+    """Whether another live gate on `pane` still holds `window` in a session of its own."""
+    listed = _tmux(binary, sock, "list-windows", "-a", "-F", "#{session_name} #{window_id}") or ""
+    for row in listed.splitlines():
+        m = re.fullmatch(rf"(tailshare-{pane[1:]}-([0-9]{{1,10}})) (@[0-9]+)", row)
+        if m and m.group(1) != session and m.group(3) == window and gate_running(int(m.group(2))):
+            return True
+    return False
+
+
+def zoom(binary: str, sock: str, pane: str, window: str, log: Callable[[str], None] = lambda m: None) -> None:
+    """Zoom %N's window on %N if it is split and not zoomed yet (see the docstring at the top)."""
+    st = _display(binary, sock, window, "#{window_panes} #{window_zoomed_flag} #{pane_id}").split()
+    if len(st) != 3 or st[0] == "1" or st[1] != "0":
+        if len(st) == 3 and st[1] == "1" and _display(binary, sock, pane, "#{pane_active}") != "1":
+            log(f"control {pane}: its window is zoomed on {st[2]}, left as it is")
+        return
+    # checked and done in the server at once: two gates zooming together must not toggle it back off
+    if _tmux(binary, sock, "if-shell", "-F", "-t", pane, "#{||:#{window_zoomed_flag},#{==:#{window_panes},1}}", "",
+             f"set-option -w -t {window} @tailshare-zoom '{pane} {st[2]}' ; resize-pane -Z -t {pane}") is None:
+        log(f"control {pane}: could not zoom {window}")
+
+
+def unzoom(binary: str, sock: str, pane: str, window: str, session: str) -> None:
+    """Undo zoom() once no other gate holds the window: only if gates zoomed it, and it is still on %N."""
+    mark = _display(binary, sock, window, "#{@tailshare-zoom}").split()
+    if len(mark) != 2 or mark[0] != pane or not re.fullmatch(r"%[0-9]+", mark[1]) \
+            or other_gates(binary, sock, pane, window, session):
+        return
+    back = f" ; select-pane -t {mark[1]}" if mark[1] != pane and _display(binary, sock, mark[1], "#{window_id}") == window else ""
+    _tmux(binary, sock, "set-option", "-w", "-u", "-t", window, "@tailshare-zoom")
+    # unzoomed meanwhile, or zoomed on another pane, by someone else: leave it. Checked in the server, so
+    # two gates leaving together don't zoom it again
+    _tmux(binary, sock, "if-shell", "-F", "-t", pane, "#{&&:#{window_zoomed_flag},#{pane_active}}",
+          f"resize-pane -Z -t {pane}{back}")
+
+
 def child_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
@@ -295,6 +340,8 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
                         if w0 == b"%error":
                             log(f"control {pane}: could not set destroy-unattached on {session}")
                             end("nosize")
+                        else:  # attached: the app sees the zoom as %layout-change with Z
+                            zoom(binary, sock, pane, window, log)
                         continue
                 elif replies == 1 and w0 == b"%begin":
                     continue
@@ -314,4 +361,6 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         # session): then leave it to destroy-unattached instead of throwing the Mac out
         if session and _tmux(binary, sock, "display", "-p", "-t", f"={session}:", "#{session_attached}") == "0":
             _tmux(binary, sock, "kill-session", "-t", f"={session}")
+        if session:
+            unzoom(binary, sock, pane, window, session)
     return 0 if gone.is_set() else child.returncode
