@@ -46,6 +46,7 @@ TTL = 7 * 86400  # undelivered and unread messages expire after a week
 LIVE = 90  # an agent that polled this recently counts as online
 KNOWN = 86400  # agents seen within a day still receive pattern sends
 MAX_BODY = 64 * 1024
+STATE_BODY = 16 * 1024 * 1024
 RETRY_MAX = 300
 
 # Never send tailnet traffic through an HTTP proxy from the environment (Codex sets one).
@@ -125,14 +126,17 @@ def hook_state(d: dict) -> tuple[str, str, str]:
     strings if the event says nothing about the state."""
     if d.get("type") == "agent-turn-complete":  # Codex notify: the only event it has
         return str(d.get("thread-id") or ""), "idle", ""
-    aid, event = str(d.get("session_id") or ""), d.get("hook_event_name")
+    aid, event = d.get("session_id"), d.get("hook_event_name")
+    tool, note = (v if isinstance(v, str) else "" for v in (d.get("tool_name"), d.get("notification_type")))
+    if not (isinstance(aid, str) and isinstance(event, str)):
+        return "", "", ""
     state, reason = "", ""
-    if event == "PreToolUse" and d.get("tool_name") in _ASKS:
-        state, reason = "waiting_input", _ASKS[d["tool_name"]]
+    if event == "PreToolUse" and tool in _ASKS:
+        state, reason = "waiting_input", _ASKS[tool]
     elif event in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
         state = "working"
     elif event == "Notification":
-        state, reason = _NOTIFIED.get(d.get("notification_type"), ("", ""))
+        state, reason = _NOTIFIED.get(note, ("", ""))
     elif event == "Stop":
         state = "idle"
     elif event == "SessionStart" and d.get("source") != "compact":  # after a compaction it carries on working
@@ -588,7 +592,7 @@ class Bus:
         so a person can attach to it; SSH to that machine is still the gate. `you` is what the tailnet
         says about the caller, so a client can tell its own machines from ones shared with it."""
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login", "state") if SHARE_PANES else ())
-        agents = [{k: a[k] for k in keys if a.get(k) is not None} for a in self.local_agents()]
+        agents = [{k: a[k] for k in keys if k != "state" or a[k]} for a in self.local_agents()]
         for a in agents:
             if a.get("tmux"):
                 a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
@@ -907,9 +911,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _body(self) -> dict:
+    def _body(self, limit: int = 4 * MAX_BODY) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 4 * MAX_BODY:
+        if n > limit:
             raise BusError("request too large", 413)
         d = json.loads(self.rfile.read(n) or b"{}")
         if not isinstance(d, dict):
@@ -948,7 +952,8 @@ class _Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         qs = {k: v[-1] for k, v in parse_qs(url.query).items()}
         try:
-            body = self._body() if method == "POST" else {}
+            # a hook's input carries the tool's input: a large Write must still say the agent is working
+            body = self._body(STATE_BODY if local and url.path == "/bus/v1/state" else 4 * MAX_BODY) if method == "POST" else {}
             b = self.bus
             path = url.path.removeprefix("/bus/v1")
             if path.startswith("/sessions/") and method == "POST":

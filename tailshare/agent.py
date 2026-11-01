@@ -431,10 +431,13 @@ def _add_hooks(settings: dict) -> bool:
 
 
 def _write_settings(path: Path, settings: dict, backup: str) -> None:
+    path = path.resolve()  # a settings.json linked into dotfiles stays a link; the real file changes
     if path.exists():
         shutil.copy2(path, path.with_suffix(backup))
     tmp = path.with_suffix(".json.tailshare-tmp")
-    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    tmp.unlink(missing_ok=True)
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+        f.write(json.dumps(settings, indent=2) + "\n")
     if path.exists():
         shutil.copymode(path, tmp)
     os.replace(tmp, path)  # Claude Code never reads a half-written file

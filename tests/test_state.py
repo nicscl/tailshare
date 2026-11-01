@@ -41,6 +41,12 @@ class Mapping(unittest.TestCase):
         for d, want in cases:
             self.assertEqual(bus.hook_state(d), want, d)
 
+    def test_malformed_fields_say_nothing(self):
+        self.assertEqual(bus.hook_state(hook("PreToolUse", tool_name=["AskUserQuestion"])), ("S", "working", ""))
+        for d in (hook("Notification", notification_type={"a": 1}), {**hook("Stop"), "session_id": ["S"]},
+                  {**hook("Stop"), "hook_event_name": ["Stop"]}):
+            self.assertEqual(bus.hook_state(d), ("", "", ""), d)
+
     def test_says_nothing(self):
         for d in (hook("SessionStart", source="compact"), hook("Notification", notification_type="auth_success"),
                   hook("Notification"), hook("SubagentStop"), hook("PreCompact"), hook("Stop", sid=""), {},
@@ -56,7 +62,7 @@ class Mapping(unittest.TestCase):
                          {"v": "waiting_input", "since": now - 5, "at": now})
         for bad in (None, "working", {}, {**good, "v": "sleeping"}, {**good, "at": float("nan")},
                     {**good, "at": now + 3600}, {**good, "since": now + 1}, {**good, "at": "1"},
-                    {**good, "at": True}, {**good, "since": 0}):
+                    {**good, "at": True}, {**good, "since": True}, {**good, "since": 0}):
             self.assertIsNone(bus.clean_state(bad), bad)
 
 
@@ -173,6 +179,16 @@ class CurlHook(unittest.TestCase):
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
         self.assertEqual(self.b.agent("S")["state"]["v"], "working")
 
+    def test_large_and_malformed_bodies(self):
+        big = hook("PreToolUse", tool_name="Write", tool_input={"content": "x" * (2 * 1024 * 1024)})
+        self.assertEqual(self.run_hook(big).returncode, 0)
+        self.assertEqual(self.b.agent("S")["state"]["v"], "working")  # a large Write still counts
+        url = f"http://127.0.0.1:{self.port}/bus/v1/state"
+        self.assertEqual(bus.request(url, hook("Notification", notification_type=[1])), {"ok": False})
+        with self.assertRaises((bus.BusError, OSError)):  # other routes keep the usual limit (413, often a broken pipe)
+            bus.request(f"http://127.0.0.1:{self.port}/bus/v1/register", {"id": "Z", "pad": "x" * (2 * 1024 * 1024)})
+        self.assertIsNone(self.b.store.one("SELECT * FROM agents WHERE id='Z'"))
+
     def test_bus_down_or_disabled_never_blocks(self):
         cp = self.run_hook(hook("Stop"), port=free_port())  # nothing listening
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
@@ -242,6 +258,20 @@ class Install(unittest.TestCase):
         self.assertEqual(self.commands("Stop")[0], "say done")
         self.assertEqual(len(self.commands("SessionStart")), 2)
         self.assertFalse(agent.upgrade_claude_hooks())  # nothing left to add
+
+    def test_keeps_a_symlink_and_the_mode(self):
+        dotfiles = Path(tempfile.mkdtemp())
+        real = dotfiles / "claude-settings.json"
+        real.write_text(json.dumps({"hooks": {"Stop": [{"matcher": "", "hooks": [self.mine]}]}}))
+        real.chmod(0o640)
+        self.path.symlink_to(real)
+        self.install()
+        self.assertTrue(self.path.is_symlink())
+        self.assertEqual(self.path.resolve(), real.resolve())
+        self.assertEqual(real.stat().st_mode & 0o777, 0o640)
+        self.assertTrue(any(agent.STATE_MARK in c for c in self.commands("Stop")))
+        self.assertTrue((dotfiles / "claude-settings.json.bak-tailshare").exists())  # next to the real file
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["settings.json"])  # no tmp left behind
 
     def test_upgrade_leaves_settings_that_never_joined(self):
         self.assertFalse(agent.upgrade_claude_hooks())
