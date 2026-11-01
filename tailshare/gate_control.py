@@ -381,6 +381,9 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         for t in threads:  # both stop within POLL of done
             t.join(POLL + 5)
     finally:
+        if threading.current_thread() is threading.main_thread():  # a second signal must not cut this short
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, signal.SIG_IGN)
         if child.poll() is None:
             child.terminate()
         # %N's window stays where it was. A Mac's bare `tmux attach` may have landed here (the newest
