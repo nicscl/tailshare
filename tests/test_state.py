@@ -219,6 +219,9 @@ class Install(unittest.TestCase):
         w.start()
         self.addCleanup(w.stop)
         self.path = self.home / "settings.json"
+        d = mock.patch.object(bus, "STATE_DIR", self.home / "tailshare-state")
+        d.start()
+        self.addCleanup(d.stop)
         self.mine = {"type": "command", "command": "say done"}
 
     def settings(self) -> dict:
@@ -258,6 +261,14 @@ class Install(unittest.TestCase):
         self.assertEqual(self.commands("Stop")[0], "say done")
         self.assertEqual(len(self.commands("SessionStart")), 2)
         self.assertFalse(agent.upgrade_claude_hooks())  # nothing left to add
+        s = self.settings()  # the user takes the PreToolUse state hook out again
+        s["hooks"]["PreToolUse"] = [g for g in s["hooks"]["PreToolUse"]
+                                    if not any(agent.STATE_MARK in h["command"] for h in g["hooks"])]
+        self.path.write_text(json.dumps(s))
+        self.assertFalse(agent.upgrade_claude_hooks())  # the next start respects that
+        self.assertEqual(self.commands("PreToolUse"), [])
+        self.install()  # asking for them explicitly brings it back
+        self.assertEqual(len(self.commands("PreToolUse")), 1)
 
     def test_keeps_a_symlink_and_the_mode(self):
         dotfiles = Path(tempfile.mkdtemp())
@@ -271,7 +282,7 @@ class Install(unittest.TestCase):
         self.assertEqual(real.stat().st_mode & 0o777, 0o640)
         self.assertTrue(any(agent.STATE_MARK in c for c in self.commands("Stop")))
         self.assertTrue((dotfiles / "claude-settings.json.bak-tailshare").exists())  # next to the real file
-        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["settings.json"])  # no tmp left behind
+        self.assertFalse(list(self.home.glob("*tmp*")) + list(dotfiles.glob("*tmp*")))  # no tmp left behind
 
     def test_upgrade_leaves_settings_that_never_joined(self):
         self.assertFalse(agent.upgrade_claude_hooks())

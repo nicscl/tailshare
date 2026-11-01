@@ -182,8 +182,9 @@ and node id) that answered this machine as a tailshare peer (`port` is null for 
 it out too). The state hooks run `curl` to the local mailbox and always exit 0, so they never block a tool or
 add Python's start-up time to it. `install-claude` adds them; when the service starts after an update it adds
 any that are missing to a settings file that already has tailshare hooks, keeping your own hooks and a backup
-in `settings.json.bak-tailshare-upgrade` (a symlinked settings.json stays a link). Because that runs at every
-start, a tailshare hook you delete by hand comes back; `tailshare agent uninstall-claude` removes them all. Codex only says when a turn ends: add
+in `settings.json.bak-tailshare-upgrade` (a symlinked settings.json stays a link). Each hook is added this way
+only once (recorded in `~/.tailshare/claude-hooks.json`), so one you delete by hand stays deleted;
+`install-claude` puts it back and `uninstall-claude` removes them all. Codex only says when a turn ends: add
 `notify = ["tailshare", "agent", "codex-notify"]` to `~/.codex/config.toml` (if `notify` is not already set)
 and its agents show `idle` after each turn.
 

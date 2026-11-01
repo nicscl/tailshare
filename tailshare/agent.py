@@ -417,11 +417,14 @@ def _ours(h: dict) -> bool:
     return "agent hook" in c or STATE_MARK in c
 
 
-def _add_hooks(settings: dict) -> bool:
-    """Add the tailshare hooks that are missing. Never changes or removes anyone else's."""
+def _add_hooks(settings: dict, skip: set[str] = frozenset()) -> bool:
+    """Add the tailshare hooks that are missing, except `event|marker`s in skip. Never changes or
+    removes anyone else's."""
     hooks = settings.setdefault("hooks", {})
     changed = False
     for event, mark, hook in _wanted():
+        if f"{event}|{mark}" in skip:
+            continue
         groups = hooks.setdefault(event, [])
         if any(mark in h.get("command", "") for g in groups for h in g.get("hooks", [])):
             continue
@@ -443,19 +446,30 @@ def _write_settings(path: Path, settings: dict, backup: str) -> None:
     os.replace(tmp, path)  # Claude Code never reads a half-written file
 
 
+def _offered() -> Path:
+    return bus.STATE_DIR / "claude-hooks.json"  # the hooks an upgrade added once: never again
+
+
 def upgrade_claude_hooks() -> bool:
     """Add the hooks a newer tailshare uses where install-claude already ran. The service calls this
-    when it starts, so an update brings them; settings without tailshare hooks are left alone."""
+    when it starts, so an update brings them; settings without tailshare hooks are left alone. Each hook
+    is added once: one the user removed afterwards stays removed (install-claude puts it back)."""
     path = _settings_path()
     if not path.exists():
         return False
     settings = json.loads(path.read_text())
-    if not any(_ours(h) for gs in settings.get("hooks", {}).values() for g in gs for h in g.get("hooks", [])):
+    groups = settings.get("hooks", {})
+    if not any(_ours(h) for gs in groups.values() for g in gs for h in g.get("hooks", [])):
         return False
-    if not _add_hooks(settings):
-        return False
-    _write_settings(path, settings, ".json.bak-tailshare-upgrade")
-    return True
+    offered = set(json.loads(_offered().read_text())) if _offered().exists() else set()
+    present = {f"{e}|{m}" for e, m, _ in _wanted()
+               if any(m in h.get("command", "") for g in groups.get(e, []) for h in g.get("hooks", []))}
+    changed = _add_hooks(settings, skip=offered - present)
+    if changed:
+        _write_settings(path, settings, ".json.bak-tailshare-upgrade")
+    _offered().parent.mkdir(parents=True, exist_ok=True)
+    _offered().write_text(json.dumps(sorted(offered | {f"{e}|{m}" for e, m, _ in _wanted()})) + "\n")
+    return changed
 
 
 def _settings_path() -> Path:
