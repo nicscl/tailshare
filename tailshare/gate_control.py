@@ -29,7 +29,8 @@ window option @tailshare-zoom ("%N %prev", prev the pane that was active) says g
 on %N to leave unzooms it if it is still zoomed on %N, and gives prev back. A window zoomed by someone
 else, or on another pane (a second phone on another pane of the same window), is left as it is: that phone
 gets the split pane, scaled to fit. Once a gate sees the window unzoomed, it drops the mark, so a zoom the
-Mac makes after that is never undone by a gate.
+Mac makes after that is never undone by a gate. A window already zoomed on %N at attach (by the Mac, or a mark
+a killed gate left) counts as seen zoomed. SIGTERM and SIGHUP end the gate through its cleanup too.
 
 This narrows what the app can do; it is not what makes a pane key safe. Plain attach still gives a full
 tmux client (see docs/ssh-keys.md: approving a key is approving shell access).
@@ -40,6 +41,7 @@ from __future__ import annotations
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -211,17 +213,19 @@ def other_gates(binary: str, sock: str, pane: str, window: str, session: str) ->
     return False
 
 
-def zoom(binary: str, sock: str, pane: str, window: str, log: Callable[[str], None] = lambda m: None) -> None:
-    """Zoom %N's window on %N if it is split and not zoomed yet (see the docstring at the top)."""
+def zoom(binary: str, sock: str, pane: str, window: str, log: Callable[[str], None] = lambda m: None) -> bool:
+    """Zoom %N's window on %N if it is split and not zoomed yet (see the docstring at the top). True if it
+    was zoomed already (by the Mac, or a gate's mark from before): the next unzoom by anyone drops the mark."""
     st = _display(binary, sock, window, "#{window_panes} #{window_zoomed_flag} #{pane_id}").split()
     if len(st) != 3 or st[0] == "1" or st[1] != "0":
         if len(st) == 3 and st[1] == "1" and _display(binary, sock, pane, "#{pane_active}") != "1":
             log(f"control {pane}: its window is zoomed on {st[2]}, left as it is")
-        return
+        return len(st) == 3 and st[1] == "1"
     # checked and done in the server at once: two gates zooming together must not toggle it back off
     if _tmux(binary, sock, "if-shell", "-F", "-t", pane, "#{||:#{window_zoomed_flag},#{==:#{window_panes},1}}", "",
              f"set-option -w -t {window} @tailshare-zoom '{pane} {st[2]}' ; resize-pane -Z -t {pane}") is None:
         log(f"control {pane}: could not zoom {window}")
+    return False  # zoomed now: the %layout-change with Z is still to come
 
 
 def forget_zoom(binary: str, sock: str, pane: str, window: str) -> None:
@@ -258,8 +262,15 @@ def control_argv(req: dict, binary: str, session: str = "") -> list[str]:
     return argv + ["-t", f"={session}", ";", "set-option", "-t", f"={session}:", "destroy-unattached", "on"]
 
 
+def _exit(signum, _frame):
+    raise SystemExit(128 + signum)  # so finally runs: the session goes, and the zoom is undone
+
+
 def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None,
         log: Callable[[str], None] = lambda m: None) -> int:
+    if threading.current_thread() is threading.main_thread():  # logout, shutdown, sshd going away
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _exit)
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
     sock, pane, ro = req["socket"], req["pane"], req["readonly"]
@@ -349,7 +360,7 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
                             log(f"control {pane}: could not set destroy-unattached on {session}")
                             end("nosize")
                         else:  # attached: the app sees the zoom as %layout-change with Z
-                            zoom(binary, sock, pane, window, log)
+                            zoomed = zoom(binary, sock, pane, window, log)
                         continue
                 elif replies == 1 and w0 == b"%begin":
                     continue
@@ -370,6 +381,8 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         for t in threads:  # both stop within POLL of done
             t.join(POLL + 5)
     finally:
+        if child.poll() is None:
+            child.terminate()
         # %N's window stays where it was. A Mac's bare `tmux attach` may have landed here (the newest
         # session): then leave it to destroy-unattached instead of throwing the Mac out
         if session and _tmux(binary, sock, "display", "-p", "-t", f"={session}:", "#{session_attached}") == "0":

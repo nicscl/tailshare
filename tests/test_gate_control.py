@@ -465,6 +465,30 @@ class Proxy(unittest.TestCase):
         self.assertEqual(self.stop(), 0)
         self.assertEqual(self.zoomed(), "1 1")
 
+    def test_a_stale_mark_never_undoes_the_macs_zoom(self):
+        c = self.split()
+        self.t("select-pane", "-t", self.a)
+        self.t("resize-pane", "-Z", "-t", self.a)  # what a killed gate leaves: zoomed, and its mark
+        self.t("set-option", "-w", "-t", self.a, "@tailshare-zoom", f"{self.a} {c}")
+        self.start(flags=())
+        self.t("resize-pane", "-Z", "-t", self.a)  # the Mac unzooms ...
+        self.assertTrue(self.wait_until(
+            lambda: self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}") == ""))
+        self.t("resize-pane", "-Z", "-t", self.a)  # ... and zooms again: its own
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.zoomed(), "1 1")
+
+    def test_a_signal_still_unzooms(self):
+        import signal
+        c = self.split()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            p = self.gate()
+            self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"), sig)
+            p.send_signal(sig)
+            self.assertEqual(p.wait(5), 128 + sig)
+            self.assertTrue(self.wait_until(lambda: self.zoomed(c) == "0 1"), (sig, self.zoomed(c)))
+            self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
+
     def test_the_last_gate_unzooms(self):
         self.split()
         first, second = self.gate(), self.gate()

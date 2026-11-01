@@ -182,8 +182,10 @@ gates drop them always.
     That client gets the split pane and scales it to fit. If the Mac unzooms, or selects another pane,
     tmux unzooms and sends a `%layout-change` without Z; the gate doesn't zoom it again.
     The gate then drops the mark, so if the Mac zooms %N again by hand, that zoom is the Mac's and stays.
-  - A gate killed with SIGKILL leaves the window zoomed, with the mark; the next gate on %N unzooms it
-    when it leaves.
+  - SIGTERM and SIGHUP (logout, shutdown, sshd restarting) end the gate through its cleanup, so it still
+    unzooms. Only a gate killed with SIGKILL leaves the window zoomed, with the mark. The next gate on %N
+    unzooms it when it leaves, unless the window was unzoomed in between: a window already zoomed at attach
+    counts as seen zoomed, so if the Mac unzooms it then, the mark goes and the Mac's next zoom stays.
 
 This narrows what the client can do. It does not make a pane key safer: the same key can still run
 plain `attach`, which is a full tmux client.
