@@ -130,7 +130,8 @@ Set them before `tailshare install` so the launchd agent picks them up.
 under `level`, plus `"minutes"` (to empty on battery, to full while charging; null while it is estimated) and
 `"low_power"` under `full`. It is read when asked (IOKit on macOS, `/sys/class/power_supply` on Linux) and
 kept for 60 s. A machine without a battery, one that can't be read, and one set to `off` send no `power` at
-all. `tailshare machines` shows each machine's level.
+all. A value that isn't exactly `own=<mode>`/`others=<mode>` parts turns both off. A tagged machine has no
+owner, so nobody gets its `own` mode. `tailshare machines` shows each machine's level.
 
 ## Agent messaging
 

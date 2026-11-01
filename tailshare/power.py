@@ -2,7 +2,7 @@
 
 Each machine decides what it shares with TAILSHARE_BATTERY="own=<mode>,others=<mode>", modes off, level
 (battery, charging, on_ac, at) or full (also minutes and low_power). Own is a caller of this machine's
-tailnet user. Default own=full,others=off. A machine without a battery, or one that cannot be read, sends
+tailnet user; on a tagged machine (user tagged-devices) nobody is own. Default own=full,others=off. A machine without a battery, or one that cannot be read, sends
 no block at all, the same as off.
 
 The battery is read only when asked and kept for TTL seconds, so phones polling every 15 s add no work.
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import math
 import os
 import sys
 import threading
@@ -28,14 +29,15 @@ SYSFS = Path("/sys/class/power_supply")
 
 
 def parse_share(value: str | None) -> dict:
-    """{"own": mode, "others": mode} from TAILSHARE_BATTERY. A side that is set wrong shares nothing."""
+    """{"own": mode, "others": mode} from TAILSHARE_BATTERY. Anything but exact side=mode parts shares nothing."""
     out = dict(DEFAULT)
     for part in (value or "").split(","):
         if not part.strip():
             continue
-        side, _, mode = part.strip().partition("=")
-        if side in out:
-            out[side] = mode if mode in MODES else "off"
+        side, eq, mode = part.strip().partition("=")
+        if not eq or side not in out or mode not in MODES:
+            return {"own": "off", "others": "off"}
+        out[side] = mode
     return out
 
 
@@ -55,7 +57,8 @@ def clean(d) -> dict | None:
         return None
     pct, at = d.get("battery"), d.get("at")
     if (type(pct) is not int or not 0 <= pct <= 100 or type(d.get("charging")) is not bool
-            or type(d.get("on_ac")) is not bool or type(at) not in (int, float) or at > time.time() + 120):
+            or type(d.get("on_ac")) is not bool or type(at) not in (int, float) or not math.isfinite(at)
+            or not 0 < at <= time.time() + 120):
         return None
     out = {"battery": pct, "charging": d["charging"], "on_ac": d["on_ac"], "at": at}
     if type(d.get("minutes")) is int and d["minutes"] >= 0:
@@ -103,6 +106,8 @@ def iokit_sources() -> list[dict]:
     cf.CFGetTypeID.restype, cf.CFGetTypeID.argtypes = ctypes.c_ulong, [V]
     for f in ("CFNumberGetTypeID", "CFBooleanGetTypeID", "CFStringGetTypeID"):
         getattr(cf, f).restype = ctypes.c_ulong
+    for f in ("CFNumberGetValue", "CFBooleanGetValue", "CFStringGetCString"):  # Boolean: one byte
+        getattr(cf, f).restype = ctypes.c_bool
     cf.CFNumberGetValue.argtypes = [V, ctypes.c_int, V]
     cf.CFBooleanGetValue.argtypes = [V]
     cf.CFStringGetCString.argtypes = [V, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]

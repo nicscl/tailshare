@@ -20,9 +20,10 @@ class Share(unittest.TestCase):
         self.assertEqual(power.parse_share(""), {"own": "full", "others": "off"})
         self.assertEqual(power.parse_share("own=level,others=full"), {"own": "level", "others": "full"})
         self.assertEqual(power.parse_share(" others=level "), {"own": "full", "others": "level"})
-        self.assertEqual(power.parse_share("own=all"), {"own": "off", "others": "off"})  # set wrong: nothing
-        self.assertEqual(power.parse_share("own=,others=level"), {"own": "off", "others": "level"})
-        self.assertEqual(power.parse_share("me=full"), {"own": "full", "others": "off"})
+        self.assertEqual(power.parse_share("own=off,"), {"own": "off", "others": "off"})
+        for wrong in ("off", "OWN=off", " own = off ", "own=all", "own=,others=level", "me=full",
+                      "others=full,own", "own=full=off"):  # set wrong: nothing at all
+            self.assertEqual(power.parse_share(wrong), {"own": "off", "others": "off"}, wrong)
 
     def test_block(self):
         self.assertIsNone(power.block(READING, "off"))
@@ -38,6 +39,7 @@ class Share(unittest.TestCase):
         self.assertEqual(power.clean({**ok, "minutes": -1}), ok)
         for bad in ({**ok, "battery": 101}, {**ok, "battery": "4"}, {**ok, "battery": True},
                     {**ok, "charging": 1}, {**ok, "on_ac": None}, {**ok, "at": now + 600}, {**ok, "at": "1"},
+                    {**ok, "at": float("nan")}, {**ok, "at": float("-inf")}, {**ok, "at": 0}, {**ok, "at": -5},
                     {k: v for k, v in ok.items() if k != "at"}, [], "4%", None):
             self.assertIsNone(power.clean(bad), bad)
 
@@ -157,6 +159,22 @@ class Hello(unittest.TestCase):
         self.assertNotIn("power", self.hello("100.64.0.9", share))
         self.assertNotIn("power", self.hello("100.64.0.7", share))  # nobody the tailnet knows
         self.assertNotIn("power", self.hello("", share))
+
+    def test_tagged_machine_has_no_own(self):
+        net = StaticNet("srv", user="tagged-devices",
+                        usermap={"100.64.0.5": "tagged-devices", "100.64.0.2": "nick@example.com"})
+        self.b = make_bus("srv", net)
+        self.b.battery = power.Battery(lambda: dict(READING))
+        for ip in ("100.64.0.5", "100.64.0.2"):
+            self.assertNotIn("power", self.hello(ip, power.parse_share(None)), ip)
+
+    def test_machines_drops_a_nan_at(self):
+        self.b.store.x("INSERT INTO peers(host, ip, version, last_ok, agents, power) VALUES(?,?,?,?,?,?)",
+                       "deck", "100.64.0.3", "0.4", time.time(), "[]",
+                       '{"battery": 9, "charging": false, "on_ac": false, "at": NaN}')
+        rows = {m["host"]: m for m in self.b.machines()}
+        self.assertIsNone(rows["deck"]["power"])
+        json.dumps(self.b.machines(), allow_nan=False)
 
     def test_levels(self):
         share = power.parse_share("own=level,others=level")

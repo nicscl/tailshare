@@ -531,7 +531,8 @@ class Bus:
             if self.net.host_for_ip(ip) is None and time.time() - self.net.updated > 30:
                 self.net.refresh()
             out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
-            battery = self.battery.for_caller(own=bool(out["you"]["user"]) and out["you"]["user"] == self.net.user)
+            u = out["you"]["user"]  # tagged machines have no owner: other tagged devices aren't own
+            battery = self.battery.for_caller(own=bool(u) and u != "tagged-devices" and u == self.net.user)
             if battery:
                 out["power"] = battery
         return out
