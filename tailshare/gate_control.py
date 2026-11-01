@@ -262,7 +262,13 @@ def control_argv(req: dict, binary: str, session: str = "") -> list[str]:
     return argv + ["-t", f"={session}", ";", "set-option", "-t", f"={session}:", "destroy-unattached", "on"]
 
 
+_exiting: list[int] = []
+
+
 def _exit(signum, _frame):
+    if _exiting:
+        return  # a second signal must not cut the cleanup of the first short
+    _exiting.append(signum)
     raise SystemExit(128 + signum)  # so finally runs: the session goes, and the zoom is undone
 
 

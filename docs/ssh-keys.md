@@ -183,7 +183,9 @@ gates drop them always.
     tmux unzooms and sends a `%layout-change` without Z; the gate doesn't zoom it again.
     The gate then drops the mark, so if the Mac zooms %N again by hand, that zoom is the Mac's and stays.
   - SIGTERM and SIGHUP (logout, shutdown, sshd restarting) end the gate through its cleanup, so it still
-    unzooms. Only a gate killed with SIGKILL leaves the window zoomed, with the mark. The next gate on %N
+    unzooms; a second signal during that cleanup is ignored. A signal before the attach, or SIGKILL, ends
+    it without cleanup: its session is left for the next gate's sweep. Only SIGKILL after the attach leaves
+    the window zoomed, with the mark. The next gate on %N
     unzooms it when it leaves, unless the window was unzoomed in between: a window already zoomed at attach
     counts as seen zoomed, so if the Mac unzooms it then, the mark goes and the Mac's next zoom stays.
 

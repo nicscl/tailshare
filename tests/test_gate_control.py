@@ -428,7 +428,7 @@ class Proxy(unittest.TestCase):
         self.split()
         for kw in ({"flags": ("ignore-size",)}, {"readonly": True, "flags": ()}):
             self.start(**kw)
-            self.assertEqual(self.zoomed()[0], "0", kw)  # (attaching to %A makes it active, as before)
+            self.assertEqual(self.zoomed()[:1], "0", kw)  # (attaching to %A makes it active, as before)
             self.assertEqual(self.stop(), 0)
 
     def test_leaves_the_macs_own_zoom(self):
@@ -489,6 +489,18 @@ class Proxy(unittest.TestCase):
             self.assertTrue(self.wait_until(lambda: self.zoomed(c) == "0 1"), (sig, self.zoomed(c)))
             self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
 
+    def test_a_second_signal_does_not_cut_the_cleanup_short(self):
+        import signal
+        c = self.split()
+        for _ in range(4):
+            p = self.gate()
+            self.assertTrue(self.wait_until(lambda: self.zoomed() == "1 1"))
+            p.send_signal(signal.SIGHUP)
+            p.send_signal(signal.SIGTERM)  # at once, as a logout may do
+            self.assertEqual(p.wait(5), 128 + signal.SIGHUP)
+            self.assertTrue(self.wait_until(lambda: self.zoomed(c) == "0 1"), self.zoomed(c))
+            self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
+
     def test_the_last_gate_unzooms(self):
         self.split()
         first, second = self.gate(), self.gate()
@@ -511,10 +523,10 @@ class Proxy(unittest.TestCase):
         self.assertTrue(self.wait_until(lambda: len(self.sessions()) == 3), self.sessions())
         first.stdin.close()
         self.assertEqual(first.wait(5), 0)
-        self.assertTrue(self.wait_until(lambda: self.zoomed()[0] == "0"), self.zoomed())
+        self.assertTrue(self.wait_until(lambda: self.zoomed()[:1] == "0"), self.zoomed())
         second.stdin.close()
         self.assertEqual(second.wait(5), 0)
-        self.assertEqual(self.zoomed()[0], "0")
+        self.assertEqual(self.zoomed()[:1], "0")
         self.assertEqual(self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}"), "")
 
     def test_says_when_the_pane_is_gone(self):
