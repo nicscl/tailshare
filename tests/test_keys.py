@@ -542,11 +542,10 @@ class GateEndToEnd(unittest.TestCase):
         self.assertEqual(self.execs, [[self.tmux, "-S", self.sock, "attach", "-r", "-t", self.pane]])
 
     def test_control_mode_goes_through_the_filter(self):
-        with mock.patch("tailshare.gate_control.run", return_value=0) as run, \
-                mock.patch("os._exit", side_effect=SystemExit) as exit_:
-            with self.assertRaises(SystemExit):
+        with mock.patch("tailshare.gate_control.run", return_value=0) as run:
+            with self.assertRaises(SystemExit) as cm:
                 self.gate(f"{self.tmux} -S {self.sock} -C attach -r -f ignore-size -t {self.pane}")
-        exit_.assert_called_once_with(0)
+        self.assertEqual(cm.exception.code, 0)
         req = run.call_args.args[0]
         self.assertEqual((req["cc"], req["readonly"], req["pane"]), ("-C", True, self.pane))
         for cmd in (f"tmux -CC -S {self.sock} attach -t {self.pane}",  # the same protocol, unfiltered

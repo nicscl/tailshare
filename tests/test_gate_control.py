@@ -6,9 +6,14 @@ Run with: uv run python -m unittest discover tests
 from __future__ import annotations
 
 import io
+import fcntl
 import os
+import pty
+import struct
 import subprocess
+import sys
 import tempfile
+import termios
 import threading
 import time
 import unittest
@@ -42,10 +47,47 @@ class Filters(unittest.TestCase):
         self.assertTrue(gate_control.allowed_in("capture-pane -p -e -t %3", "%3", True))
         for line in ("refresh-client -C 80x24", "select-window -t %3"):
             self.assertFalse(gate_control.allowed_in(line, "%3", True), line)
+            self.assertFalse(gate_control.allowed_in(line, "%3", False, sizing=False), line)
+        self.assertTrue(gate_control.allowed_in("send-keys -H -t %3 68", "%3", False, sizing=False))
+
+    def test_out(self):
+        moved = []
+        o = gate_control.Outbound("%3", "@1", lambda: moved.append(1) or "@1")
+        keep = [b"%begin 1 2 1", b"%output %4 inside a reply is fine", b"%end 1 2 1", b"%output %3 hi",
+                b"%extended-output %3 5 : hi", b"%layout-change @1 abcd,80x24,0,0,3 abcd,80x24,0,0,3 *",
+                b"%pane-mode-changed %3", b"%pause %3", b"%continue %3", b"%exit"]
+        drop = [b"%output %4 secret", b"%extended-output %4 5 : secret", b"%window-renamed @2 secrets",
+                b"%sessions-changed", b"%session-changed $1 work", b"%layout-change @2 x", b"%pause %4",
+                b"%unlinked-window-add @9", b"%client-session-changed /dev/ttys1 $2 other"]
+        for line in keep:
+            self.assertTrue(o.allowed(line), line)
+        for line in drop:
+            self.assertFalse(o.allowed(line), line)
+        self.assertEqual(len(moved), 1)  # a foreign %layout-change re-checks which window %3 is in
+        o.allowed(b"%begin 5 6 1")
+        self.assertTrue(o.allowed(b"%end 5 6 0"))  # pane text in a reply, not its end
+        self.assertTrue(o.allowed(b"%session-changed $1 still inside the reply"))
+        self.assertTrue(o.allowed(b"%end 5 6 1"))
+        self.assertFalse(o.allowed(b"%session-changed $1 after it"))
 
     def test_long_lines_are_skipped(self):
         fh = io.BytesIO(b"a\n" + b"x" * (gate_control.MAX_LINE + 10) + b"\nb\n")
         self.assertEqual(list(gate_control.lines(fh)), [b"a", None, b"b"])
+
+    def test_fd_lines(self):
+        r, w = os.pipe()
+        data = b"a\n" + b"x" * (gate_control.MAX_LINE + 10) + b"\nb\nc"  # more than a pipe holds
+        threading.Thread(target=lambda: (os.write(w, data), os.close(w)), daemon=True).start()
+        self.assertEqual(list(gate_control.fd_lines(r, threading.Event())), [b"a", None, b"b", b"c"])
+        os.close(r)
+
+    def test_fd_lines_stops_without_input(self):
+        r, w = os.pipe()
+        stop = threading.Event()
+        stop.set()
+        with mock.patch.object(gate_control, "POLL", 0.1):
+            self.assertEqual(list(gate_control.fd_lines(r, stop)), [])
+        os.close(r), os.close(w)
 
     def test_parse(self):
         r = keys.parse_attach("/opt/homebrew/bin/tmux -S /tmp/s -C attach -r -f ignore-size -t %3")
@@ -153,16 +195,73 @@ class Proxy(unittest.TestCase):
     def size(self, target) -> str:
         return self.t("display", "-p", "-t", target, "#{window_width}x#{window_height}")
 
-    def test_sizes_the_window_it_shows(self):
+    def test_sizes_only_the_panes_window(self):
+        """The phone is the only client, and the session has three windows: only %A's takes its size."""
+        self.t("new-window", "-d", "cat")
         self.start(flags=())
         self.say("refresh-client -C 60x20")
-        self.assertTrue(self.wait_for(b"%end", count=2))
+        self.say(f"select-window -t {self.a}")
+        self.assertTrue(self.wait_for(b"%end", count=3))
         self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
-        self.t("break-pane", "-d", "-s", self.a)  # %A moves to a window of its own, not the current one
-        self.say(f"select-window -t {self.a}")  # brings it back to this client
+        self.assertEqual(self.t("list-windows", "-t", "=0", "-F", "#{window_width}x#{window_height}").split(),
+                         ["60x20", "80x24", "80x24"])
+        self.assertEqual(self.dropped, [])
+        self.assertEqual(len(self.sessions()), 2)  # its own, holding %A's window
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(self.sessions(), ["0"])
+        self.assertEqual(self.t("list-windows", "-t", "=0", "-F", "#{window_width}x#{window_height}").split(),
+                         ["60x20", "80x24", "80x24"])  # no client is left to size %A's window
+        self.assertTrue(self.t("display", "-p", "-t", self.a, "#{pane_id}"))
+
+    def test_takes_the_size_back_without_moving_the_mac(self):
+        pid, fd = pty.fork()
+        if pid == 0:  # the Mac's terminal, showing the other window
+            os.execve(self.tmux, [self.tmux, "-S", self.sock, "attach", "-t", "=0:1"], {**self.env, "TERM": "xterm"})
+        self.addCleanup(os.waitpid, pid, 0)
+        self.addCleanup(os.close, fd)
+        threading.Thread(target=self.drain, args=(fd,), daemon=True).start()
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 29, 100, 0, 0))
+        mac = lambda: self.t("list-clients", "-t", "=0", "-F", "#{window_index}")
+        self.assertTrue(self.wait_until(lambda: mac() == "1"))
+        self.start(flags=())
+        self.say("refresh-client -C 60x20")
         self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
+        self.t("select-window", "-t", "=0:0")  # the Mac comes to %A's window and takes the size
+        os.write(fd, b"x")
+        self.assertTrue(self.wait_until(lambda: self.size(self.a) == "100x28"), self.size(self.a))
+        self.t("select-window", "-t", "=0:1")  # and goes back to the other one
+        self.say(f"select-window -t {self.a}")
+        self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
+        self.assertEqual(mac(), "1")
         self.assertEqual(self.dropped, [])
         self.stop()
+
+    @staticmethod
+    def drain(fd):
+        try:
+            while os.read(fd, 65536):
+                pass
+        except OSError:
+            pass
+
+    def test_says_when_the_pane_moves(self):
+        self.start(flags=())
+        self.t("join-pane", "-d", "-s", self.a, "-t", self.b)  # into a window its session doesn't hold
+        self.assertTrue(self.wait_for(f"%tailshare-moved {self.a}".encode()))
+        self.thread.join(5)
+        self.assertEqual(self.sessions(), ["0"])
+
+    def test_ignore_size_never_sizes(self):
+        self.start()
+        self.say("refresh-client -C 60x20")
+        self.say(f"display -p -t {self.a} {FMT}")
+        self.assertTrue(self.wait_for(b"80 24 "))
+        self.assertEqual(len(self.dropped), 1)
+        self.assertEqual(self.sessions(), ["0"])
+        self.stop()
+
+    def sessions(self) -> list[str]:
+        return self.t("list-sessions", "-F", "#{session_name}").split()
 
     def test_read_only_never_sizes(self):
         self.start(readonly=True, flags=())
@@ -187,6 +286,23 @@ class Proxy(unittest.TestCase):
             self.thread.join(5)
         self.assertEqual(self.result.get("rc"), 0)
         self.assertNotIn("1", self.t("list-clients", "-F", "#{client_control_mode}"))  # the client left
+        self.assertEqual(self.sessions(), ["0"])
+
+    def test_exits_cleanly_when_idle(self):
+        """The process that ran it exits 0 with nothing on stderr, while its stdin is still open."""
+        script = ("import sys; from tailshare import gate_control as g; g.LEASE, g.POLL = 1.0, 0.2; "
+                  f"req = {{'socket': {self.sock!r}, 'pane': {self.a!r}, 'readonly': False, 'flags': [], "
+                  "'cc': '-C', 'tail': []}; sys.exit(g.run(req, sys.argv[1]))")
+        p = subprocess.Popen([sys.executable, "-c", script, self.tmux], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        p.stdin.write(b"refresh-client -C 60x20\n")
+        p.stdin.flush()
+        with p.stdout, p.stderr:
+            out, err = p.stdout.read(), p.stderr.read()  # until it exits; its stdin stays open
+        self.assertEqual(p.wait(5), 0)
+        self.assertEqual(err, b"")
+        self.assertTrue(out.rstrip(b"\n").endswith(f"%tailshare-idle {self.a}".encode()))
+        p.stdin.close()
 
     def wait_until(self, ok, timeout=5.0) -> bool:
         end = time.time() + timeout

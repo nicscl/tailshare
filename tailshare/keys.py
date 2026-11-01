@@ -461,9 +461,7 @@ def cmd_gate(_args) -> None:
             sys.exit("tailshare ssh-gate: -C attach takes no other commands")
         from . import gate_control
 
-        rc = gate_control.run(req, binary, log=log)
-        sys.stdout.flush()
-        os._exit(rc)  # the thread reading the app's stdin may still be blocked in it
+        sys.exit(gate_control.run(req, binary, log=log))
     os.execv(binary, gate_argv(req, binary))
 
 

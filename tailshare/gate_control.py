@@ -13,6 +13,13 @@ When the pane exits (or is left dead by remain-on-exit) the gate writes `%tailsh
 Once the app has set a size, it must send a line at least every LEASE seconds, or the gate writes
 `%tailshare-idle %N` and exits, so a phone that dropped off the network gives the window its size back.
 
+A client that may size (no -r, no -f ignore-size) is attached to a session of its own that holds only %N's
+window (linked, not moved), so its size can only reach that window: a client's size goes to every window
+of its session that no other client holds. `select-window -t %N` is run in that session, so taking the
+size back never changes which window the Mac shows. The gate removes that session when it ends, and tmux
+does too if the gate dies (destroy-unattached). If %N leaves that window, the gate writes `%tailshare-moved %N`
+and exits.
+
 This narrows what the app can do; it is not what makes a pane key safe. Plain attach still gives a full
 tmux client (see docs/ssh-keys.md: approving a key is approving shell access).
 """
@@ -21,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import subprocess
 import sys
 import threading
@@ -46,15 +54,15 @@ def size_of(line: str) -> tuple[int, int] | None:
     return (w, h) if COLS[0] <= w <= COLS[1] and ROWS[0] <= h <= ROWS[1] else None
 
 
-def allowed_in(line: str, pane: str, readonly: bool) -> bool:
+def allowed_in(line: str, pane: str, readonly: bool, sizing: bool = True) -> bool:
     """A command line from the app that may reach tmux. The size is the client's, never a window's
     (`-C @W:WxH`): under window-size latest, the Mac takes a client size back by typing, a window size it
     does not."""
     p = re.escape(pane)
-    if re.fullmatch(rf"send-keys -H -t {p}( [0-9a-f]{{2}})+", line) or line == f"select-window -t {pane}":
+    if re.fullmatch(rf"send-keys -H -t {p}( [0-9a-f]{{2}})+", line):
         return not readonly
-    if size_of(line):
-        return not readonly
+    if size_of(line) or line == f"select-window -t {pane}":
+        return sizing and not readonly
     m = re.fullmatch(rf"capture-pane -p -e -t {p}( -S -([0-9]{{1,5}}))?", line)
     if m:
         return m.group(2) is None or int(m.group(2)) <= MAX_HISTORY
@@ -72,11 +80,11 @@ class Outbound:
     def allowed(self, line: bytes) -> bool:
         w = line.split(b" ")
         if self.block is not None:
-            if w[0] in (b"%end", b"%error") and w[1:3] == self.block:
+            if w[0] in (b"%end", b"%error") and w[1:4] == self.block:
                 self.block = None
             return True
-        if w[0] == b"%begin" and len(w) >= 3:
-            self.block = w[1:3]
+        if w[0] == b"%begin" and len(w) >= 4:
+            self.block = w[1:4]  # time, number and flags, all of which a pane's text could only guess
             return True
         if w[0] in PANE_NOTICES:
             return w[1:2] == [self.pane]
@@ -101,22 +109,65 @@ def lines(fh: BinaryIO):
         yield raw.removesuffix(b"\n")
 
 
-def _display(binary: str, sock: str, pane: str, fmt: str) -> str:
+def fd_lines(fd: int, stop: threading.Event):
+    """lines() for a raw fd, giving up within POLL once `stop` is set, so the thread reading it can be
+    joined instead of being left blocked in a read at exit."""
+    buf, skipping = b"", False
+    while not stop.is_set():
+        if not select.select([fd], [], [], POLL)[0]:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            if buf and not skipping:
+                yield buf
+            return
+        buf += chunk
+        while (i := buf.find(b"\n")) >= 0:
+            line, buf = buf[:i], buf[i + 1 :]
+            yield None if skipping or len(line) > MAX_LINE else line
+            skipping = False
+        if len(buf) > MAX_LINE:
+            buf, skipping = b"", True
+
+
+def _tmux(binary: str, sock: str, *args: str) -> str | None:
+    """stdout of one tmux command, or None if it failed."""
     try:
-        cp = subprocess.run([binary, "-S", sock, "display", "-p", "-t", pane, fmt], capture_output=True,
-                            text=True, timeout=3, stdin=subprocess.DEVNULL, env=child_env())
+        cp = subprocess.run([binary, "-S", sock, *args], capture_output=True, text=True, timeout=3,
+                            stdin=subprocess.DEVNULL, env=child_env())
     except (OSError, subprocess.SubprocessError):
+        return None
+    return cp.stdout.strip() if cp.returncode == 0 else None
+
+
+def _display(binary: str, sock: str, pane: str, fmt: str) -> str:
+    return _tmux(binary, sock, "display", "-p", "-t", pane, fmt) or ""
+
+
+def own_session(binary: str, sock: str, pane: str, window: str) -> str:
+    """A new session holding only `window` (%N's), for a client that sizes; "" if it could not be made."""
+    if not re.fullmatch(r"@[0-9]{1,6}", window):
         return ""
-    return cp.stdout.strip() if cp.returncode == 0 else ""
+    name = f"tailshare-{pane[1:]}-{os.getpid()}"
+    # a session needs a window of its own to start with; it only holds the place until %N's is linked
+    first = _tmux(binary, sock, "new-session", "-d", "-P", "-F", "#{window_id}", "-s", name, "sleep 60")
+    if not first:
+        return ""
+    if (_tmux(binary, sock, "link-window", "-s", window, "-t", f"={name}:") is None
+            or _tmux(binary, sock, "kill-window", "-t", first) is None):
+        _tmux(binary, sock, "kill-session", "-t", f"={name}")
+        return ""
+    return name
 
 
 def child_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
 
-def control_argv(req: dict, binary: str) -> list[str]:
+def control_argv(req: dict, binary: str, session: str = "") -> list[str]:
     argv = [binary, "-C", "-S", req["socket"], "attach"] + (["-r"] if req["readonly"] else [])
-    return argv + (["-f", ",".join(req["flags"])] if req["flags"] else []) + ["-t", req["pane"]]
+    return argv + (["-f", ",".join(req["flags"])] if req["flags"] else []) + ["-t", f"={session}" if session
+                                                                               else req["pane"]]
 
 
 def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None,
@@ -124,9 +175,10 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
     sock, pane, ro = req["socket"], req["pane"], req["readonly"]
-    out = Outbound(pane, _display(binary, sock, pane, "#{window_id}"),
-                   lambda: _display(binary, sock, pane, "#{window_id}"))
-    child = subprocess.Popen(control_argv(req, binary), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    window = _display(binary, sock, pane, "#{window_id}")
+    out = Outbound(pane, window, lambda: _display(binary, sock, pane, "#{window_id}"))
+    session = "" if ro or "ignore-size" in req["flags"] else own_session(binary, sock, pane, window)
+    child = subprocess.Popen(control_argv(req, binary, session), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, env=child_env())
     write = threading.Lock()
     done = threading.Event()
@@ -152,14 +204,16 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
             child.terminate()
 
     def inbound() -> None:
-        for raw in lines(stdin):
+        for raw in fd_lines(stdin.fileno(), done):
             lease["last"] = time.monotonic()
             try:
                 line = raw.decode("ascii") if raw is not None else None
             except UnicodeDecodeError:
                 line = None
-            if line is not None and allowed_in(line, pane, ro):
+            if line is not None and allowed_in(line, pane, ro, bool(session)):
                 lease["sized"] = lease["sized"] or bool(size_of(line))
+                if line.startswith("select-window"):  # in its own session: -t %N would pick the Mac's
+                    raw = f"select-window -t ={session}:{window}".encode()
                 try:
                     child.stdin.write(raw + b"\n")
                     child.stdin.flush()
@@ -176,19 +230,34 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         while not done.wait(POLL):
             if not alive():
                 end()
+            elif session and _display(binary, sock, pane, "#{window_id}") != window:
+                end("moved")  # its window no longer shows %N
             elif lease["sized"] and time.monotonic() - lease["last"] > LEASE:
                 end("idle")
 
-    threading.Thread(target=inbound, daemon=True).start()
-    threading.Thread(target=watch, daemon=True).start()
-    for line in lines(child.stdout):
-        if gone.is_set():
-            break  # %tailshare-gone is the last line
-        if line is not None and out.allowed(line):
-            send(line)
-    child.wait()
-    child.stdout.close()
-    done.set()
-    if not gone.is_set() and not alive():
-        end()
+    threads = [threading.Thread(target=inbound, daemon=True), threading.Thread(target=watch, daemon=True)]
+    for t in threads:
+        t.start()
+    armed = not session
+    try:
+        for line in lines(child.stdout):
+            if gone.is_set():
+                break  # %tailshare-gone is the last line
+            if not armed and line and line.split(b" ")[0] in (b"%end", b"%error"):  # attached
+                armed = True  # tmux removes it if this client goes without the gate (set before, it would at once)
+                _tmux(binary, sock, "set-option", "-t", f"={session}", "destroy-unattached", "on")
+            if line is not None and out.allowed(line):
+                send(line)
+        child.wait()
+        child.stdout.close()
+        done.set()
+        if not gone.is_set() and not alive():
+            end()
+        elif not gone.is_set() and session and _display(binary, sock, pane, "#{window_id}") != window:
+            end("moved")  # its window left with it, and so did the session that held only that
+        for t in threads:  # both stop within POLL of done
+            t.join(POLL + 5)
+    finally:
+        if session:
+            _tmux(binary, sock, "kill-session", "-t", f"={session}")  # %N's window stays where it was
     return 0 if gone.is_set() else child.returncode

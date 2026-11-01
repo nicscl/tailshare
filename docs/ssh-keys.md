@@ -114,7 +114,7 @@ lines through in both directions, filtering each one.
 - `display -p -t %N '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{pane_dead}'`.
   This exact format and no other, since formats can run `#()`.
 - `refresh-client -C <w>x<h>`, with w from 20 to 1000 and h from 5 to 500 (no leading zeros), and
-  `select-window -t %N`. Both are dropped under `-r`. See "Sizing" below.
+  `select-window -t %N`. Both are dropped under `-r` and `-f ignore-size`. See "Sizing" below.
 
 Anything else is logged and dropped, including empty lines (tmux would detach) and lines over 64 KiB. To
 detach, close stdin.
@@ -134,21 +134,26 @@ and exits 0.
 
 #### Sizing
 
-A gate that sends `"control_size": 1` in `/hello` takes `refresh-client -C <w>x<h>` and `select-window -t %N`.
-Older gates drop both, and the window keeps its size.
+A gate that sends `"control_size": 1` in `/hello` takes `refresh-client -C <w>x<h>` and `select-window -t %N`
+from a client attached without `-r` and without `-f ignore-size`. Otherwise both are dropped, and older
+gates drop them always.
 
+- **A session of its own.** Such a client is not attached to %N's session. The gate makes a session
+  `tailshare-<N>-<pid>` that holds only %N's window (linked, so it stays where it was) and attaches the
+  client there. tmux gives a client's size to every window of its session that no other client holds, so
+  this is what keeps the size off the other windows. The gate kills that session when it ends, and tmux
+  removes it if the gate dies (`destroy-unattached`). It shows in `tmux ls` while the phone is attached.
+- If %N leaves that window (`join-pane`, `move-pane`), the gate sends `%tailshare-moved %N` as its last
+  line and exits 0. The client can attach again.
 - The size is the client's own, never a window's. The `@<window>:<w>x<h>` form is refused: under
   `window-size latest`, a window size stops the Mac's terminal from taking the size back when it types.
-- The size applies to the session's current window, which `attach -t %N` makes %N's window.
-  `select-window -t %N` makes this client the window's latest client again after another client typed.
-- If no other client is attached to the session, tmux resizes every window of that session that nobody
-  else is showing, and those windows keep that size after the client leaves. They take a new size only
-  when another client attaches.
-- A client that never sends a size does not change the window, with or without `-f ignore-size`. With
-  `-f ignore-size`, `refresh-client -C` is a no-op.
+  The Mac takes it back by typing in %N's window.
+- `select-window -t %N` takes the size back. The gate runs it as `select-window -t =<its session>:@<W>`,
+  so it never changes which window the Mac shows.
+- A window nobody is showing keeps the last size it had until a client shows it again.
 - The size goes back to the other clients when this client leaves. There is no command to clear it.
-- **Lease.** Once the client has sent a size, it must send a line at least every 30 seconds; the fixed
-  `display` line will do. Otherwise the gate sends `%tailshare-idle %N` as its last line and exits 0, so a
+- **Lease.** Once the client has sent a size, it must send a line at least every 30 seconds. Any line
+  counts, and the fixed `display` line will do. Otherwise the gate sends `%tailshare-idle %N` as its last line and exits 0, so a
   phone that dropped off the network without closing the connection doesn't hold the size.
 - `resize-window` is never accepted. It sets the window to manual size for good.
 
