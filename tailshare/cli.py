@@ -115,6 +115,14 @@ def cmd_update(args):
         print("watch them come up with: tailshare machines")
 
 
+def battery(p: dict | None) -> str:
+    """`57% charging`, `12% battery`, `100% on AC`; `?` for none (not shared, no battery, an old peer)."""
+    if not p:
+        return "?"
+    state = "charging" if p["charging"] else "on AC" if p["on_ac"] else "battery"
+    return f"{p['battery']}% {state}"
+
+
 def cmd_machines(_):
     try:
         rows = agent.call("/machines")["machines"]
@@ -124,7 +132,7 @@ def cmd_machines(_):
     w = max(len(m["host"]) for m in rows)
     for m in rows:
         state = "this machine" if m["self"] else ("online" if m["online"] else "offline") + f" · answered {core.relative_time(m['last_ok'])}"
-        print(f"{m['host']:<{w}}  {m['version'] or '?':<16} {m['agents']:>2} agents  {state}")
+        print(f"{m['host']:<{w}}  {m['version'] or '?':<16} {m['agents']:>2} agents  {battery(m.get('power')):<14} {state}")
         if m.get("update"):
             print(f"{'':<{w}}  last update check: {m['update']['result']}")
 

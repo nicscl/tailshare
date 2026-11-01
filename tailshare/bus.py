@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, core
+from . import __version__, core, power
 
 BUS_PORT = int(os.environ.get("TAILSHARE_BUS_PORT", "8789"))
 STATE_DIR = Path(os.environ.get("TAILSHARE_STATE", "~/.tailshare")).expanduser()
@@ -267,7 +267,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -324,6 +324,7 @@ class Bus:
         self.updater = None  # set by start_bus when self-update is available
         self.sessions = None  # set by start_bus: sessions.Sessions (index, search, ask, launch)
         self.keys = None  # set by start_bus: keys.Keys (SSH keys devices ask for)
+        self.battery = power.Battery()
 
     # -- agents ---------------------------------------------------------------
     def register(self, a: dict) -> dict:
@@ -530,6 +531,9 @@ class Bus:
             if self.net.host_for_ip(ip) is None and time.time() - self.net.updated > 30:
                 self.net.refresh()
             out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
+            battery = self.battery.for_caller(own=bool(out["you"]["user"]) and out["you"]["user"] == self.net.user)
+            if battery:
+                out["power"] = battery
         return out
 
     def _pane_alive(self, t: dict) -> bool:
@@ -625,11 +629,13 @@ class Bus:
         """This machine and every peer that has answered, with tailshare versions."""
         out = [{"host": self.net.host, "ip": self.net.ip, "online": True, "version": self.version(),
                 "last_ok": time.time(), "agents": len(self.local_agents()), "self": True,
-                "update": self.updater.status if self.updater else None}]
+                "update": self.updater.status if self.updater else None,
+                "power": power.clean(self.battery.for_caller(own=True))}]
         for p in self.store.q("SELECT * FROM peers WHERE last_ok IS NOT NULL ORDER BY host"):
             out.append({"host": p["host"], "ip": p["ip"], "version": p["version"], "last_ok": p["last_ok"],
                         "online": bool(self.net.peers.get(p["host"], {}).get("online")),
-                        "agents": len(json.loads(p["agents"])), "self": False})
+                        "agents": len(json.loads(p["agents"])), "self": False,
+                        "power": power.clean(json.loads(p["power"] or "null"))})
         return out
 
     def update_trigger(self, ip: str) -> dict:
@@ -724,10 +730,11 @@ class Bus:
             except Exception:  # noqa: BLE001
                 return
             self.store.x(
-                "INSERT INTO peers(host, ip, version, last_ok, agents, node) VALUES(?,?,?,?,?,?)"
+                "INSERT INTO peers(host, ip, version, last_ok, agents, node, power) VALUES(?,?,?,?,?,?,?)"
                 " ON CONFLICT(host) DO UPDATE SET ip=excluded.ip, version=excluded.version,"
-                " last_ok=excluded.last_ok, agents=excluded.agents, node=excluded.node",
+                " last_ok=excluded.last_ok, agents=excluded.agents, node=excluded.node, power=excluded.power",
                 h, p["ip"], str(d.get("version", "")), time.time(), json.dumps(d.get("agents", [])), p.get("id", ""),
+                json.dumps(power.clean(d.get("power"))),
             )
 
         if hosts:
