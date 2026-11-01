@@ -450,6 +450,15 @@ def _offered() -> Path:
     return bus.STATE_DIR / "claude-hooks.json"  # the hooks an upgrade added once: never again
 
 
+def _read_offered() -> set[str]:
+    """The record of hooks already offered; a missing or damaged one counts as none offered."""
+    try:
+        d = json.loads(_offered().read_text())
+    except (OSError, ValueError):
+        return set()
+    return {x for x in d if isinstance(x, str)} if isinstance(d, list) else set()
+
+
 def upgrade_claude_hooks() -> bool:
     """Add the hooks a newer tailshare uses where install-claude already ran. The service calls this
     when it starts, so an update brings them; settings without tailshare hooks are left alone. Each hook
@@ -461,14 +470,16 @@ def upgrade_claude_hooks() -> bool:
     groups = settings.get("hooks", {})
     if not any(_ours(h) for gs in groups.values() for g in gs for h in g.get("hooks", [])):
         return False
-    offered = set(json.loads(_offered().read_text())) if _offered().exists() else set()
+    offered = _read_offered()
     present = {f"{e}|{m}" for e, m, _ in _wanted()
                if any(m in h.get("command", "") for g in groups.get(e, []) for h in g.get("hooks", []))}
     changed = _add_hooks(settings, skip=offered - present)
     if changed:
         _write_settings(path, settings, ".json.bak-tailshare-upgrade")
     _offered().parent.mkdir(parents=True, exist_ok=True)
-    _offered().write_text(json.dumps(sorted(offered | {f"{e}|{m}" for e, m, _ in _wanted()})) + "\n")
+    tmp = _offered().with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(offered | {f"{e}|{m}" for e, m, _ in _wanted()})) + "\n")
+    os.replace(tmp, _offered())
     return changed
 
 

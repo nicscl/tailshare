@@ -914,7 +914,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _body(self, limit: int = 4 * MAX_BODY) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
-        if n > limit:
+        if n < 0 or n > limit:  # read(-1) would read until the peer closes
             raise BusError("request too large", 413)
         d = json.loads(self.rfile.read(n) or b"{}")
         if not isinstance(d, dict):

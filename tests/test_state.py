@@ -205,6 +205,34 @@ class CurlHook(unittest.TestCase):
             bus.request(f"http://127.0.0.1:{self.port}/bus/v1/register", {"id": "Z", "pad": "x" * (2 * 1024 * 1024)})
         self.assertIsNone(self.b.store.one("SELECT * FROM agents WHERE id='Z'"))
 
+    def test_negative_length_and_peer_limit(self):
+        import http.client
+
+        peer_port = free_port()
+        peer = make_bus("air", port=peer_port)
+        reg(peer, "S", "api")
+        srv = peer.listen("127.0.0.1", local=False)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        for port in (self.port, peer_port):  # read(-1) would read until the client closes
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.putrequest("POST", "/bus/v1/state")
+            c.putheader("X-Tailshare", "1")
+            c.putheader("Content-Length", "-1")
+            c.endheaders()
+            self.assertEqual(c.getresponse().status, 413, port)
+            c.close()
+        url = f"http://127.0.0.1:{peer_port}/bus/v1/state"
+        with self.assertRaises(bus.BusError) as cm:  # the peer API has no /state
+            bus.request(url, hook("Stop"))
+        self.assertEqual(cm.exception.code, 404)
+        big = hook("PreToolUse", tool_name="Write", tool_input={"content": "x" * (2 * 1024 * 1024)})
+        with self.assertRaises((bus.BusError, OSError)) as cm:  # nor its large limit
+            bus.request(url, big)
+        if isinstance(cm.exception, bus.BusError):
+            self.assertEqual(cm.exception.code, 413)
+        self.assertIsNone(peer.agent("S")["state"])
+
     def test_bus_down_or_disabled_never_blocks(self):
         cp = self.run_hook(hook("Stop"), port=free_port())  # nothing listening
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
@@ -299,6 +327,19 @@ class Install(unittest.TestCase):
         self.assertTrue(any(agent.STATE_MARK in c for c in self.commands("Stop")))
         self.assertTrue((dotfiles / "claude-settings.json.bak-tailshare").exists())  # next to the real file
         self.assertFalse(list(self.home.glob("*tmp*")) + list(dotfiles.glob("*tmp*")))  # no tmp left behind
+
+    def test_a_damaged_record_counts_as_nothing_offered(self):
+        old = {"hooks": {"SessionStart": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "/bin/tailshare agent hook session-start"}]}]}}
+        record = bus.STATE_DIR / "claude-hooks.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        for bad in ("", "{not json", '{"a": 1}', '[1, null, ["x"]]', "\xff\xfe"):
+            self.path.write_text(json.dumps(old))
+            record.write_text(bad)
+            self.assertTrue(agent.upgrade_claude_hooks(), repr(bad))
+            self.assertEqual(sum(agent.STATE_MARK in c for c in self.commands("PreToolUse")), 1)
+            self.assertIn("PreToolUse|" + agent.STATE_MARK, json.loads(record.read_text()))
+        self.assertFalse(list(record.parent.glob("*.tmp")))
 
     def test_upgrade_leaves_settings_that_never_joined(self):
         self.assertFalse(agent.upgrade_claude_hooks())
