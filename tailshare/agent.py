@@ -257,6 +257,8 @@ def cmd_ls(args):
             state = f"○ machine offline · seen {ago(a.get('last_seen', 0))}"
         else:
             state = f"○ seen {ago(a.get('last_seen', 0))}"
+        if a.get("online") and (st := bus.clean_state(a.get("state"))):
+            state += f" · {st['v'].replace('_', ' ')}" + (f" ({st['reason']})" if st.get("reason") else "")
         print(f"{a.get('user') or '-':<{u}}  {a['address']:<{w}}  {state}")
 
 
@@ -376,7 +378,81 @@ def cmd_hook(args):
     sys.exit(0)
 
 
+def cmd_codex_notify(args):
+    """Codex runs this after each turn with a JSON argument; the bus records the agent as idle.
+    Codex has no other events, so its agents are idle or unknown. Must never fail loudly."""
+    try:
+        d = json.loads(args.payload)
+        if isinstance(d, dict):
+            call("/state", d, timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+    sys.exit(0)
+
+
 HOOKS = {"SessionStart": "session-start", "UserPromptSubmit": "prompt"}
+# What the session is doing (working, waiting on the person, idle), for /hello. These hooks post their
+# input straight to the local bus with curl: PreToolUse runs before every tool call, and starting
+# Python there would add most of a second each time. They always exit 0, so they can never block a tool.
+STATE_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd")
+STATE_MARK = "/bus/v1/state"
+
+
+def state_command() -> str:
+    return ('[ "$TAILSHARE_HOOKS" = 0 ] || curl -s -m 2 -o /dev/null -H "X-Tailshare: 1"'
+            f' -H "Content-Type: application/json" --data-binary @- http://127.0.0.1:{bus.BUS_PORT}{STATE_MARK}'
+            ' >/dev/null 2>&1; exit 0')
+
+
+def _wanted() -> list[tuple[str, str, dict]]:
+    """(event, marker, hook) for every hook tailshare uses; the marker finds one already installed."""
+    t = exe()
+    out = [(e, "agent hook", {"type": "command", "command": f"{t} agent hook {n}", "timeout": 10}) for e, n in HOOKS.items()]
+    out += [(e, STATE_MARK, {"type": "command", "command": state_command(), "timeout": 5}) for e in STATE_EVENTS]
+    return out
+
+
+def _ours(h: dict) -> bool:
+    c = h.get("command", "")
+    return "agent hook" in c or STATE_MARK in c
+
+
+def _add_hooks(settings: dict) -> bool:
+    """Add the tailshare hooks that are missing. Never changes or removes anyone else's."""
+    hooks = settings.setdefault("hooks", {})
+    changed = False
+    for event, mark, hook in _wanted():
+        groups = hooks.setdefault(event, [])
+        if any(mark in h.get("command", "") for g in groups for h in g.get("hooks", [])):
+            continue
+        groups.append({"matcher": "", "hooks": [hook]})
+        changed = True
+    return changed
+
+
+def _write_settings(path: Path, settings: dict, backup: str) -> None:
+    if path.exists():
+        shutil.copy2(path, path.with_suffix(backup))
+    tmp = path.with_suffix(".json.tailshare-tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    if path.exists():
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)  # Claude Code never reads a half-written file
+
+
+def upgrade_claude_hooks() -> bool:
+    """Add the hooks a newer tailshare uses where install-claude already ran. The service calls this
+    when it starts, so an update brings them; settings without tailshare hooks are left alone."""
+    path = _settings_path()
+    if not path.exists():
+        return False
+    settings = json.loads(path.read_text())
+    if not any(_ours(h) for gs in settings.get("hooks", {}).values() for g in gs for h in g.get("hooks", [])):
+        return False
+    if not _add_hooks(settings):
+        return False
+    _write_settings(path, settings, ".json.bak-tailshare-upgrade")
+    return True
 
 
 def _settings_path() -> Path:
@@ -387,18 +463,8 @@ def cmd_install_claude(args):
     t = exe()
     path = _settings_path()
     settings = json.loads(path.read_text()) if path.exists() else {}
-    hooks = settings.setdefault("hooks", {})
-    changed = False
-    for event, name in HOOKS.items():
-        groups = hooks.setdefault(event, [])
-        if any("agent hook" in h.get("command", "") for g in groups for h in g.get("hooks", [])):
-            continue
-        groups.append({"matcher": "", "hooks": [{"type": "command", "command": f"{t} agent hook {name}", "timeout": 10}]})
-        changed = True
-    if changed:
-        if path.exists():
-            shutil.copy2(path, path.with_suffix(".json.bak-tailshare"))
-        path.write_text(json.dumps(settings, indent=2) + "\n")
+    if _add_hooks(settings):
+        _write_settings(path, settings, ".json.bak-tailshare")
         print(f"✓ hooks added to {path} (backup: settings.json.bak-tailshare)")
     else:
         print("✓ hooks already installed")
@@ -420,11 +486,12 @@ def cmd_uninstall_claude(args):
     if path.exists():
         settings = json.loads(path.read_text())
         hooks = settings.get("hooks", {})
-        for event in HOOKS:
-            groups = [
-                g for g in hooks.get(event, [])
-                if not any("agent hook" in h.get("command", "") for h in g.get("hooks", []))
-            ]
+        for event in list(hooks):
+            groups = []
+            for g in hooks[event]:
+                kept = [h for h in g.get("hooks", []) if not _ours(h)]
+                if kept or not g.get("hooks"):
+                    groups.append({**g, "hooks": kept} if kept != g.get("hooks") else g)
             if groups:
                 hooks[event] = groups
             else:
@@ -467,6 +534,9 @@ def add_parser(sub) -> None:
     p = s.add_parser("hook")  # called by Claude Code hooks
     p.add_argument("event", choices=sorted(HOOKS.values()))
     p.set_defaults(fn=cmd_hook)
+    p = s.add_parser("codex-notify")  # Codex's `notify` program
+    p.add_argument("payload", nargs="?", default="{}")
+    p.set_defaults(fn=cmd_codex_notify)
     p = s.add_parser("install-claude", help="join every Claude Code session to the bus (hooks + MCP)")
     p.set_defaults(fn=cmd_install_claude)
     p = s.add_parser("uninstall-claude", help="undo install-claude")

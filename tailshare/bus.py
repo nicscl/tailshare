@@ -2,7 +2,7 @@
 
 Every machine's share server also runs a mailbox for the agents on that machine:
 
-  127.0.0.1:BUS_PORT      local API for agents   (register, send, inbox, ack, agents)
+  127.0.0.1:BUS_PORT      local API for agents   (register, state, send, inbox, ack, agents)
   <tailnet ip>:BUS_PORT   peer API for mailboxes (hello, deliver)
 
 There is no hub. Addresses are ``host/harness/folder[/session]``, so the host part says
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
 import re
 import socket
@@ -110,6 +111,49 @@ _TARGET_RE = re.compile(r"[^\x00-\x1f\x7f]{0,128}")
 
 def clean_login(v: object) -> str:
     return v if isinstance(v, str) and _LOGIN_RE.fullmatch(v) else ""
+
+
+STATES = ("working", "waiting_input", "idle", "ended")
+REASONS = ("permission", "question", "plan", "elicitation")  # why a waiting_input waits; never free text
+_ASKS = {"AskUserQuestion": "question", "ExitPlanMode": "plan"}  # tools that wait on the person
+_NOTIFIED = {"permission_prompt": ("waiting_input", "permission"), "elicitation_dialog": ("waiting_input", "elicitation"),
+             "idle_prompt": ("idle", "")}
+
+
+def hook_state(d: dict) -> tuple[str, str, str]:
+    """(agent id, state, reason) from a Claude Code hook's input or a Codex notify payload, or empty
+    strings if the event says nothing about the state."""
+    if d.get("type") == "agent-turn-complete":  # Codex notify: the only event it has
+        return str(d.get("thread-id") or ""), "idle", ""
+    aid, event = str(d.get("session_id") or ""), d.get("hook_event_name")
+    state, reason = "", ""
+    if event == "PreToolUse" and d.get("tool_name") in _ASKS:
+        state, reason = "waiting_input", _ASKS[d["tool_name"]]
+    elif event in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+        state = "working"
+    elif event == "Notification":
+        state, reason = _NOTIFIED.get(d.get("notification_type"), ("", ""))
+    elif event == "Stop":
+        state = "idle"
+    elif event == "SessionStart" and d.get("source") != "compact":  # after a compaction it carries on working
+        state = "idle"
+    elif event == "SessionEnd":
+        state = "ended"
+    return (aid, state, reason) if aid and state else ("", "", "")
+
+
+def clean_state(s: object) -> dict | None:
+    """A peer's {v, reason?, since, at}, or None if it is missing or malformed."""
+    if not isinstance(s, dict) or s.get("v") not in STATES:
+        return None
+    since, at = s.get("since"), s.get("at")
+    ok = all(type(t) in (int, float) and math.isfinite(t) and 0 < t <= time.time() + 120 for t in (since, at))
+    if not ok or since > at:
+        return None
+    out = {"v": s["v"], "since": since, "at": at}
+    if s["v"] == "waiting_input" and s.get("reason") in REASONS:
+        out["reason"] = s["reason"]
+    return out
 
 
 def clean_tmux(t: object) -> dict:
@@ -267,7 +311,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -395,7 +439,29 @@ class Bus:
             "cwd": r["cwd"], "pid": r["pid"], "last_seen": r["last_seen"],
             "online": r["last_seen"] > time.time() - LIVE, "host": self.net.host,
             "tmux": json.loads(r["tmux"]) if r["tmux"] else {}, "login": LOGIN,
+            "state": json.loads(r["state"]) if r["state"] else None,
         }
+
+    def report_state(self, d: dict) -> dict:
+        """What an agent's harness says it is doing, from its hooks. Only agents that registered count."""
+        aid, state, reason = hook_state(d)
+        if not state:
+            return {"ok": False}
+        now = time.time()
+        with self.store.lock:
+            r = self.store.one("SELECT state FROM agents WHERE id=?", aid)
+            if r is None:
+                return {"ok": False}
+            old = json.loads(r["state"]) if r["state"] else {}
+            new = {"v": state, "since": now, "at": now}
+            if reason:
+                new["reason"] = reason
+            if old.get("v") == state and old.get("reason") == new.get("reason"):
+                new["since"] = old.get("since", now)  # the same state again: it began earlier
+            self.store.x("UPDATE agents SET state=? WHERE id=?", json.dumps(new), aid)
+            if state != "ended":  # a report shows the session is alive; a closed one is not online
+                self.store.x("UPDATE agents SET last_seen=? WHERE id=?", now, aid)
+        return {"ok": True, "state": new}
 
     def by_pid(self, pid: int) -> dict | None:
         r = self.store.one("SELECT * FROM agents WHERE pid=? ORDER BY last_seen DESC", pid)
@@ -415,7 +481,8 @@ class Bus:
             up = bool(self.net.peers.get(p["host"], {}).get("online"))
             for a in json.loads(p["agents"]):
                 a.update(host=p["host"], online=bool(a.get("online")) and up, host_online=up,
-                         tmux=clean_tmux(a.get("tmux")), login=clean_login(a.get("login")))
+                         tmux=clean_tmux(a.get("tmux")), login=clean_login(a.get("login")),
+                         state=clean_state(a.get("state")))
                 out.append(a)
         return {"host": self.net.host, "agents": out}
 
@@ -520,8 +587,8 @@ class Bus:
         """What any tailnet peer may know. With SHARE_PANES, also where each agent's tmux pane is,
         so a person can attach to it; SSH to that machine is still the gate. `you` is what the tailnet
         says about the caller, so a client can tell its own machines from ones shared with it."""
-        keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login") if SHARE_PANES else ())
-        agents = [{k: a[k] for k in keys} for a in self.local_agents()]
+        keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login", "state") if SHARE_PANES else ())
+        agents = [{k: a[k] for k in keys if a.get(k) is not None} for a in self.local_agents()]
         for a in agents:
             if a.get("tmux"):
                 a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
@@ -903,6 +970,8 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._reply(200, b.update_trigger(ip))
             elif (method, path) == ("POST", "/register"):
                 return self._reply(200, b.register(body))
+            elif (method, path) == ("POST", "/state"):
+                return self._reply(200, b.report_state(body))
             elif (method, path) == ("POST", "/send"):
                 return self._reply(200, b.send(str(body.get("from", "")), str(body.get("to", "")),
                                                str(body.get("body", "")), list(body.get("files") or [])))
@@ -956,6 +1025,13 @@ def start_bus() -> Bus | None:
         b.keys = keys.start(b)
     except Exception as e:  # noqa: BLE001
         log(f"keys not started: {e!r}")
+    try:
+        from . import agent
+
+        if agent.upgrade_claude_hooks():  # after an update, sessions that joined the bus get the new hooks
+            log("added newer tailshare hooks to Claude Code settings")
+    except Exception as e:  # noqa: BLE001
+        log(f"Claude Code hooks not upgraded: {e!r}")
     try:
         from .update import ENABLED, Updater
 

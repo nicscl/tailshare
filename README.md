@@ -168,6 +168,24 @@ claim in its Hostinfo, present only on nodes running Tailscale SSH. `tailshare` 
 and node id) that answered this machine as a tailshare peer (`port` is null for the others). Host names can repeat; `ip` and `id` do not. Only the machine owner's own devices may ask. Each pane in `/hello` carries
 `alive`, from the same `tmux display` check the SSH gate makes.
 
+**Agent state.** Claude Code sessions report what they are doing through their hooks, and each agent in
+`/hello` carries `state: {v, reason, since, at}` when it is known:
+- `v` is `working` (a prompt or a tool call), `waiting_input` (the person has to answer), `idle` (the turn is
+  over) or `ended` (the session closed).
+- `reason` comes only with `waiting_input`: `permission`, `question` (AskUserQuestion), `plan` (ExitPlanMode)
+  or `elicitation` (an MCP server asking). It is one of these words, never text from the agent.
+- `since` is when this state began, `at` the last hook that confirmed it (unix seconds). A `working` whose `at`
+  is old is a session that died mid-turn: the hooks say what happened, not what is happening now, so a reader
+  should drop a state that is stale or whose pane is gone, and fall back to its own guess.
+
+`state` is absent while nothing is known, and is shared exactly like panes (`TAILSHARE_SHARE_PANES=0` leaves
+it out too). The state hooks run `curl` to the local mailbox and always exit 0, so they never block a tool or
+add Python's start-up time to it. `install-claude` adds them; when the service starts after an update it adds
+any that are missing to a settings file that already has tailshare hooks, keeping your own hooks and a backup
+in `settings.json.bak-tailshare-upgrade`. Codex only says when a turn ends: add
+`notify = ["tailshare", "agent", "codex-notify"]` to `~/.codex/config.toml` (if `notify` is not already set)
+and its agents show `idle` after each turn.
+
 **Pairing the Hive app.** `tailshare hive pair` prints a QR code that makes this machine the Tailshare Hive
 app's first trusted machine, then waits until a phone uses it. The link is `tailsharehive://pair/<base64url JSON>`
 with `{v, ip, port, host, owner, hk, t, c, exp}`:
