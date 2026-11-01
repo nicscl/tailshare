@@ -16,9 +16,11 @@ Once the app has set a size, it must send a line at least every LEASE seconds, o
 A client that may size (no -r, no -f ignore-size) is attached to a session of its own that holds only %N's
 window (linked, not moved), so its size can only reach that window: a client's size goes to every window
 of its session that no other client holds. `select-window -t %N` is run in that session, so taking the
-size back never changes which window the Mac shows. The gate removes that session when it ends, and tmux
-does too if the gate dies (destroy-unattached). If %N leaves that window, the gate writes `%tailshare-moved %N`
-and exits.
+size back never changes which window the Mac shows. tmux removes that session once no client holds it
+(destroy-unattached, set right at attach), so a gate killed after attaching leaves nothing; a gate killed
+before that leaves a session the next gate removes (sweep). If the session cannot be made or armed, the gate
+writes `%tailshare-nosize %N` and exits, and the app attaches again with -f ignore-size. If %N leaves that
+window, the gate writes `%tailshare-moved %N` and exits.
 
 This narrows what the app can do; it is not what makes a pane key safe. Plain attach still gives a full
 tmux client (see docs/ssh-keys.md: approving a key is approving shell access).
@@ -144,6 +146,36 @@ def _display(binary: str, sock: str, pane: str, fmt: str) -> str:
     return _tmux(binary, sock, "display", "-p", "-t", pane, fmt) or ""
 
 
+def gate_running(pid: int) -> bool:
+    """Whether `pid` is another live `tailshare ssh-gate` (not one whose pid was reused)."""
+    if pid == os.getpid():
+        return False  # this gate has made no session yet: one with its name is a dead gate's
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True,
+                             timeout=3, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True  # can't tell: keep it
+    return "ssh-gate" in cmd.split()
+
+
+def sweep(binary: str, sock: str, log: Callable[[str], None] = lambda m: None) -> None:
+    """Remove sessions left by gates killed between making theirs and arming destroy-unattached: a gate's
+    name, no client, one window and that one linked (so the window lives on elsewhere), its gate gone."""
+    listed = _tmux(binary, sock, "list-sessions", "-F",
+                   "#{session_name} #{session_attached} #{session_windows} #{window_linked}") or ""
+    for row in listed.splitlines():
+        m = re.fullmatch(r"(tailshare-[0-9]{1,6}-([0-9]{1,10})) 0 1 1", row)
+        if m and not gate_running(int(m.group(2))):
+            _tmux(binary, sock, "kill-session", "-t", f"={m.group(1)}")
+            log(f"control: removed {m.group(1)}, left by a gate that is gone")
+
+
 def own_session(binary: str, sock: str, pane: str, window: str) -> str:
     """A new session holding only `window` (%N's), for a client that sizes; "" if it could not be made."""
     if not re.fullmatch(r"@[0-9]{1,6}", window):
@@ -166,8 +198,12 @@ def child_env() -> dict:
 
 def control_argv(req: dict, binary: str, session: str = "") -> list[str]:
     argv = [binary, "-C", "-S", req["socket"], "attach"] + (["-r"] if req["readonly"] else [])
-    return argv + (["-f", ",".join(req["flags"])] if req["flags"] else []) + ["-t", f"={session}" if session
-                                                                               else req["pane"]]
+    argv += ["-f", ",".join(req["flags"])] if req["flags"] else []
+    if not session:
+        return argv + ["-t", req["pane"]]
+    # in the same command, once attached (set before, it would remove the session at once): from here on a
+    # gate killed by any signal leaves nothing behind
+    return argv + ["-t", f"={session}", ";", "set-option", "-t", f"={session}:", "destroy-unattached", "on"]
 
 
 def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None,
@@ -177,7 +213,15 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     sock, pane, ro = req["socket"], req["pane"], req["readonly"]
     window = _display(binary, sock, pane, "#{window_id}")
     out = Outbound(pane, window, lambda: _display(binary, sock, pane, "#{window_id}"))
-    session = "" if ro or "ignore-size" in req["flags"] else own_session(binary, sock, pane, window)
+    sizing = not ro and "ignore-size" not in req["flags"]
+    if sizing:
+        sweep(binary, sock, log)
+    session = own_session(binary, sock, pane, window) if sizing else ""
+    if sizing and not session:  # never attach a sizing client where its size could reach other windows
+        log(f"control {pane}: no session of its own")
+        stdout.write(f"%tailshare-nosize {pane}\n".encode())
+        stdout.flush()
+        return 0
     child = subprocess.Popen(control_argv(req, binary, session), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, env=child_env())
     write = threading.Lock()
@@ -238,14 +282,22 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     threads = [threading.Thread(target=inbound, daemon=True), threading.Thread(target=watch, daemon=True)]
     for t in threads:
         t.start()
-    armed = not session
+    replies = 0 if session else 2  # attach's goes to the app; the set-option's is the gate's own
     try:
         for line in lines(child.stdout):
             if gone.is_set():
                 break  # %tailshare-gone is the last line
-            if not armed and line and line.split(b" ")[0] in (b"%end", b"%error"):  # attached
-                armed = True  # tmux removes it if this client goes without the gate (set before, it would at once)
-                _tmux(binary, sock, "set-option", "-t", f"={session}", "destroy-unattached", "on")
+            if replies < 2 and line:
+                w0 = line.split(b" ")[0]
+                if w0 in (b"%end", b"%error"):
+                    replies += 1
+                    if replies == 2:
+                        if w0 == b"%error":
+                            log(f"control {pane}: could not set destroy-unattached on {session}")
+                            end("nosize")
+                        continue
+                elif replies == 1 and w0 == b"%begin":
+                    continue
             if line is not None and out.allowed(line):
                 send(line)
         child.wait()
@@ -258,6 +310,8 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         for t in threads:  # both stop within POLL of done
             t.join(POLL + 5)
     finally:
-        if session:
-            _tmux(binary, sock, "kill-session", "-t", f"={session}")  # %N's window stays where it was
+        # %N's window stays where it was. A Mac's bare `tmux attach` may have landed here (the newest
+        # session): then leave it to destroy-unattached instead of throwing the Mac out
+        if session and _tmux(binary, sock, "display", "-p", "-t", f"={session}:", "#{session_attached}") == "0":
+            _tmux(binary, sock, "kill-session", "-t", f"={session}")
     return 0 if gone.is_set() else child.returncode

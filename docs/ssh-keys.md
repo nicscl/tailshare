@@ -141,8 +141,20 @@ gates drop them always.
 - **A session of its own.** Such a client is not attached to %N's session. The gate makes a session
   `tailshare-<N>-<pid>` that holds only %N's window (linked, so it stays where it was) and attaches the
   client there. tmux gives a client's size to every window of its session that no other client holds, so
-  this is what keeps the size off the other windows. The gate kills that session when it ends, and tmux
-  removes it if the gate dies (`destroy-unattached`). It shows in `tmux ls` while the phone is attached.
+  this is what keeps the size off the other windows. It shows in `tmux ls` while the phone is attached.
+- **Removing it.** `destroy-unattached` is set in the same tmux command as the attach, so tmux removes the
+  session once no client holds it, even if the gate is killed. When the gate ends it kills the session
+  itself, unless another client is in it: a bare `tmux attach` on the Mac can land there, as the most
+  recent session, and is not thrown out; the session goes when that client leaves. A gate killed before
+  the attach can leave the session behind; the next sizing gate removes it. It removes only a session
+  named `tailshare-<N>-<pid>` with no client and one window, linked, whose pid is not a running
+  `ssh-gate`.
+- If %N's own session is killed while the phone is attached, the phone's session is the window's only one,
+  and the window (with %N) goes when the phone leaves.
+- **`%tailshare-nosize %N`.** If the gate cannot make or arm that session, it sends this and exits 0
+  without attaching (or, if arming fails, as its last line right after the attach reply). The client
+  attaches again with `-f ignore-size`. A sizing client is never attached where its size could reach other
+  windows, and its sizing lines are never dropped without a reply.
 - If %N leaves that window (`join-pane`, `move-pane`), the gate sends `%tailshare-moved %N` as its last
   line and exits 0. The client can attach again.
 - The size is the client's own, never a window's. The `@<window>:<w>x<h>` form is refused: under
@@ -153,8 +165,8 @@ gates drop them always.
 - A window nobody is showing keeps the last size it had until a client shows it again.
 - The size goes back to the other clients when this client leaves. There is no command to clear it.
 - **Lease.** Once the client has sent a size, it must send a line at least every 30 seconds. Any line
-  counts, and the fixed `display` line will do. Otherwise the gate sends `%tailshare-idle %N` as its last line and exits 0, so a
-  phone that dropped off the network without closing the connection doesn't hold the size.
+  counts, and the fixed `display` line will do. Otherwise the gate sends `%tailshare-idle %N` as its last
+  line and exits 0, so a phone that dropped off the network without closing the connection doesn't hold the size.
 - `resize-window` is never accepted. It sets the window to manual size for good.
 
 This narrows what the client can do. It does not make a pane key safer: the same key can still run

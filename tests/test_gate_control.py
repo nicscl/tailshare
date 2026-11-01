@@ -304,6 +304,86 @@ class Proxy(unittest.TestCase):
         self.assertTrue(out.rstrip(b"\n").endswith(f"%tailshare-idle {self.a}".encode()))
         p.stdin.close()
 
+    def gate(self):
+        script = ("import sys; from tailshare import gate_control as g; "
+                  f"req = {{'socket': {self.sock!r}, 'pane': {self.a!r}, 'readonly': False, 'flags': [], "
+                  "'cc': '-C', 'tail': []}; sys.exit(g.run(req, sys.argv[1]))")
+        p = subprocess.Popen([sys.executable, "-c", script, self.tmux], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env)
+        self.addCleanup(lambda: (p.stdin.close(), p.stdout.close(), p.kill(), p.wait()))
+        return p
+
+    def test_a_killed_gate_leaves_no_session(self):
+        p = self.gate()
+        p.stdin.write(b"refresh-client -C 60x20\n")
+        p.stdin.flush()
+        self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
+        p.kill()  # no finally: only tmux can clean up
+        p.wait()
+        self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
+
+    def left(self, name: str):
+        """What a gate killed before arming destroy-unattached leaves: %A's window linked, no client."""
+        self.t("new-session", "-d", "-s", name, "sleep 60")
+        self.t("link-window", "-s", self.a, "-t", f"={name}:")
+        self.t("kill-window", "-t", f"={name}:0")
+
+    def test_a_new_gate_removes_what_a_dead_one_left(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        reused = subprocess.Popen(["sleep", "30"])  # its pid was a gate's once
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "ssh-gate"])
+        for q in (reused, live):
+            self.addCleanup(q.wait)
+            self.addCleanup(q.kill)
+        for name in (f"tailshare-9-{dead.pid}", f"tailshare-8-{reused.pid}", f"tailshare-7-{live.pid}",
+                     "tailshare-notes", "tailshare-1-x", "tailshare-1-2-3"):
+            self.left(name)
+        self.t("new-session", "-d", "-s", "tailshare-6-1", "cat")  # its own window: not a gate's
+        self.start(flags=())
+        self.say("refresh-client -C 60x20")
+        self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
+        names = self.sessions()
+        self.assertNotIn(f"tailshare-9-{dead.pid}", names)
+        self.assertNotIn(f"tailshare-8-{reused.pid}", names)
+        for kept in (f"tailshare-7-{live.pid}", "tailshare-notes", "tailshare-1-x", "tailshare-1-2-3",
+                     "tailshare-6-1"):
+            self.assertIn(kept, names)
+        self.assertIn(self.a, self.t("list-panes", "-a", "-F", "#{pane_id}").split())
+        self.stop()
+
+    def test_no_session_of_its_own_says_nosize(self):
+        self.t("new-session", "-d", "-s", f"tailshare-{self.a[1:]}-{os.getpid()}", "cat")  # its name is taken
+        before = self.sessions()
+        self.start(flags=())
+        self.thread.join(5)
+        self.assertEqual(self.result.get("rc"), 0)
+        self.assertEqual(self.out, f"%tailshare-nosize {self.a}\n".encode())
+        self.assertEqual(self.sessions(), before)
+        os.close(self.win)
+
+    def test_leaves_a_mac_that_attached_to_its_session(self):
+        self.start(flags=())
+        self.say("refresh-client -C 60x20")
+        self.assertTrue(self.wait_until(lambda: len(self.sessions()) == 2), self.sessions())
+        mine = [n for n in self.sessions() if n.startswith("tailshare-")][0]
+        fd, tty = os.openpty()  # not pty.fork(): this process has threads now
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 29, 100, 0, 0))
+        # as a bare `tmux attach` may, when the phone's is the most recently active session
+        mac = subprocess.Popen([self.tmux, "-S", self.sock, "attach", "-t", f"={mine}"], stdin=tty, stdout=tty, stderr=tty,
+                               env={**self.env, "TERM": "xterm"}, start_new_session=True)
+        os.close(tty)
+        self.addCleanup(os.close, fd)
+        self.addCleanup(lambda: (mac.kill(), mac.wait()))
+        threading.Thread(target=self.drain, args=(fd,), daemon=True).start()
+        attached = lambda: self.t("display", "-p", "-t", f"={mine}:", "#{session_attached}")
+        self.assertTrue(self.wait_until(lambda: attached() == "2"), attached())
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(attached(), "1")  # the Mac is still there
+        self.t("detach-client", "-s", f"={mine}")
+        mac.wait(5)
+        self.assertTrue(self.wait_until(lambda: self.sessions() == ["0"]), self.sessions())
+
     def wait_until(self, ok, timeout=5.0) -> bool:
         end = time.time() + timeout
         while time.time() < end:
