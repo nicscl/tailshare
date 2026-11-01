@@ -3,12 +3,15 @@
 The app sends `<tmux> -S <socket> -C attach [-r] [-f ignore-size] -t %N` over `ssh -T`. Instead of exec'ing
 tmux, the gate runs it as a child and passes lines through:
 
-- to tmux, only three commands on %N: send-keys -H (never with -r), capture-pane, and display with one
-  fixed format (formats can run `#()`, so no other is allowed);
+- to tmux, only these commands on %N: send-keys -H, capture-pane, display with one fixed format (formats
+  can run `#()`, so no other is allowed), and refresh-client -C <w>x<h> / select-window to set the size
+  of %N's window (never resize-window, which pins it). Under -r only capture-pane and display;
 - to the app, only command replies and the notifications about %N and its window. Other panes' output
   never leaves this machine.
 
 When the pane exits (or is left dead by remain-on-exit) the gate writes `%tailshare-gone %N` and exits.
+Once the app has set a size, it must send a line at least every LEASE seconds, or the gate writes
+`%tailshare-idle %N` and exits, so a phone that dropped off the network gives the window its size back.
 
 This narrows what the app can do; it is not what makes a pane key safe. Plain attach still gives a full
 tmux client (see docs/ssh-keys.md: approving a key is approving shell access).
@@ -21,19 +24,36 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from typing import BinaryIO, Callable
 
 FMT = "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{pane_dead}"
 MAX_LINE = 65536  # bytes, either way
 MAX_HISTORY = 10000  # lines capture-pane may reach back
 POLL = 1.0  # seconds between checks that the pane is still there
+LEASE = 30.0  # seconds without a line from the app, once it has set a size, before the gate lets go
+SIZE = re.compile(r"refresh-client -C ([1-9][0-9]{1,3})x([1-9][0-9]{0,2})")
+COLS, ROWS = (20, 1000), (5, 500)
 PANE_NOTICES = (b"%output", b"%extended-output", b"%pane-mode-changed", b"%pause", b"%continue")
 
 
+def size_of(line: str) -> tuple[int, int] | None:
+    """(cols, rows) of a `refresh-client -C <w>x<h>` within bounds."""
+    m = SIZE.fullmatch(line)
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    return (w, h) if COLS[0] <= w <= COLS[1] and ROWS[0] <= h <= ROWS[1] else None
+
+
 def allowed_in(line: str, pane: str, readonly: bool) -> bool:
-    """A command line from the app that may reach tmux."""
+    """A command line from the app that may reach tmux. The size is the client's, never a window's
+    (`-C @W:WxH`): under window-size latest, the Mac takes a client size back by typing, a window size it
+    does not."""
     p = re.escape(pane)
-    if re.fullmatch(rf"send-keys -H -t {p}( [0-9a-f]{{2}})+", line):
+    if re.fullmatch(rf"send-keys -H -t {p}( [0-9a-f]{{2}})+", line) or line == f"select-window -t {pane}":
+        return not readonly
+    if size_of(line):
         return not readonly
     m = re.fullmatch(rf"capture-pane -p -e -t {p}( -S -([0-9]{{1,5}}))?", line)
     if m:
@@ -111,6 +131,7 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     write = threading.Lock()
     done = threading.Event()
     gone = threading.Event()
+    lease = {"sized": False, "last": time.monotonic()}
 
     def send(line: bytes) -> None:
         with write:
@@ -123,20 +144,22 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     def alive() -> bool:
         return _display(binary, sock, pane, "#{pane_id} #{pane_dead}") == f"{pane} 0"
 
-    def end_gone() -> None:
+    def end(why: str = "gone") -> None:
         if not gone.is_set():
             gone.set()
-            send(f"%tailshare-gone {pane}".encode())
+            send(f"%tailshare-{why} {pane}".encode())
             done.set()
             child.terminate()
 
     def inbound() -> None:
         for raw in lines(stdin):
+            lease["last"] = time.monotonic()
             try:
                 line = raw.decode("ascii") if raw is not None else None
             except UnicodeDecodeError:
                 line = None
             if line is not None and allowed_in(line, pane, ro):
+                lease["sized"] = lease["sized"] or bool(size_of(line))
                 try:
                     child.stdin.write(raw + b"\n")
                     child.stdin.flush()
@@ -152,7 +175,9 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     def watch() -> None:
         while not done.wait(POLL):
             if not alive():
-                end_gone()
+                end()
+            elif lease["sized"] and time.monotonic() - lease["last"] > LEASE:
+                end("idle")
 
     threading.Thread(target=inbound, daemon=True).start()
     threading.Thread(target=watch, daemon=True).start()
@@ -165,5 +190,5 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     child.stdout.close()
     done.set()
     if not gone.is_set() and not alive():
-        end_gone()
+        end()
     return 0 if gone.is_set() else child.returncode

@@ -113,6 +113,8 @@ lines through in both directions, filtering each one.
 - `capture-pane -p -e -t %N`, optionally ending in `-S -<n>` with n ≤ 10000.
 - `display -p -t %N '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{pane_dead}'`.
   This exact format and no other, since formats can run `#()`.
+- `refresh-client -C <w>x<h>`, with w from 20 to 1000 and h from 5 to 500 (no leading zeros), and
+  `select-window -t %N`. Both are dropped under `-r`. See "Sizing" below.
 
 Anything else is logged and dropped, including empty lines (tmux would detach) and lines over 64 KiB. To
 detach, close stdin.
@@ -128,8 +130,27 @@ detach, close stdin.
 Other panes' output and the names of other windows and sessions never leave the machine.
 
 When %N exits, or is left dead by `remain-on-exit`, the gate sends `%tailshare-gone %N` as its last line
-and exits 0. `refresh-client` is not allowed, so the control client never sets a size, and tmux leaves the
-window's size alone. `-f ignore-size` is accepted but not needed.
+and exits 0.
+
+#### Sizing
+
+A gate that sends `"control_size": 1` in `/hello` takes `refresh-client -C <w>x<h>` and `select-window -t %N`.
+Older gates drop both, and the window keeps its size.
+
+- The size is the client's own, never a window's. The `@<window>:<w>x<h>` form is refused: under
+  `window-size latest`, a window size stops the Mac's terminal from taking the size back when it types.
+- The size applies to the session's current window, which `attach -t %N` makes %N's window.
+  `select-window -t %N` makes this client the window's latest client again after another client typed.
+- If no other client is attached to the session, tmux resizes every window of that session that nobody
+  else is showing, and those windows keep that size after the client leaves. They take a new size only
+  when another client attaches.
+- A client that never sends a size does not change the window, with or without `-f ignore-size`. With
+  `-f ignore-size`, `refresh-client -C` is a no-op.
+- The size goes back to the other clients when this client leaves. There is no command to clear it.
+- **Lease.** Once the client has sent a size, it must send a line at least every 30 seconds; the fixed
+  `display` line will do. Otherwise the gate sends `%tailshare-idle %N` as its last line and exits 0, so a
+  phone that dropped off the network without closing the connection doesn't hold the size.
+- `resize-window` is never accepted. It sets the window to manual size for good.
 
 This narrows what the client can do. It does not make a pane key safer: the same key can still run
 plain `attach`, which is a full tmux client.
@@ -140,7 +161,8 @@ plain `attach`, which is a full tmux client.
 
 ```json
 "ssh": {"login": "Glaciar", "owner": "nick@example.com", "port": 22,
-        "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true, "control": 1}
+        "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true, "control": 1,
+        "control_size": 1}
 ```
 
 - `host_keys` go straight into `known_hosts`, so there is no trust-on-first-use.
@@ -150,6 +172,7 @@ plain `attach`, which is a full tmux client.
   - `TAILSHARE_SSH_ENROLL=0`;
   - sshd reads keys from somewhere other than `~/.ssh/authorized_keys`.
 - `control: 1` means the gate takes `-C attach` (see "Control mode" above). Older versions leave it out.
+- `control_size: 1` means it also takes the sizing commands and the lease (see "Sizing" above).
 - `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine, and `host_keys` are then
   tailscaled's keys from `tailscale status`, not `/etc/ssh`. It ignores `authorized_keys`;
   access there follows the tailnet's SSH policy instead.

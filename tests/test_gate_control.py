@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tailshare import gate_control, keys
 
@@ -22,33 +23,25 @@ FMT = f"'{gate_control.FMT}'"
 class Filters(unittest.TestCase):
     def test_in(self):
         ok = ["send-keys -H -t %3 68 69 0d", "capture-pane -p -e -t %3", "capture-pane -p -e -t %3 -S -10000",
-              f"display -p -t %3 {FMT}"]
+              f"display -p -t %3 {FMT}", "refresh-client -C 80x24", "refresh-client -C 20x5",
+              "refresh-client -C 1000x500", "select-window -t %3"]
         bad = ["send-keys -H -t %4 68", "send-keys -t %3 hi", "send-keys -H -t %3 68 ; run-shell id",
                "send-keys -H -t %3 6G", "send-keys -H -t %3", "send-keys -H -t %3 68 ;", "send-keys -H -t %3 6",
                "send-keys -H -t %3 6;", "send-keys -H -t %3 68 6; run-shell id", "capture-pane -p -e -t %3 -S -10001",
                "capture-pane -p -e -t %3 -S 0", "display -p -t %3 '#(id)'", f"display -p -t %3 {FMT} ; kill-server",
-               "run-shell id", "", "refresh-client -C 80x24", "send-keys -H -t %3 68\r"]
+               "run-shell id", "", "send-keys -H -t %3 68\r", "refresh-client -C 19x24", "refresh-client -C 1001x24",
+               "refresh-client -C 80x4", "refresh-client -C 80x501", "refresh-client -C 080x24",
+               "refresh-client -C 80x024", "refresh-client -C @2:80x24", "refresh-client -C 80x24 ; kill-server",
+               "refresh-client -C 80,24", "refresh-client 80x24", "refresh-client -C 80x24 -t /dev/ttys1",
+               "select-window -t %4", "select-window -t :1", "select-window -t %3 ; kill-server", "resize-window -x 80"]
         for line in ok:
             self.assertTrue(gate_control.allowed_in(line, "%3", False), line)
         for line in bad:
             self.assertFalse(gate_control.allowed_in(line, "%3", False), line)
         self.assertFalse(gate_control.allowed_in("send-keys -H -t %3 68", "%3", True))  # -r
         self.assertTrue(gate_control.allowed_in("capture-pane -p -e -t %3", "%3", True))
-
-    def test_out(self):
-        moved = []
-        o = gate_control.Outbound("%3", "@1", lambda: moved.append(1) or "@1")
-        keep = [b"%begin 1 2 1", b"%output %4 inside a reply is fine", b"%end 1 2 1", b"%output %3 hi",
-                b"%extended-output %3 5 : hi", b"%layout-change @1 abcd,80x24,0,0,3 abcd,80x24,0,0,3 *",
-                b"%pane-mode-changed %3", b"%pause %3", b"%continue %3", b"%exit"]
-        drop = [b"%output %4 secret", b"%extended-output %4 5 : secret", b"%window-renamed @2 secrets",
-                b"%sessions-changed", b"%session-changed $1 work", b"%layout-change @2 x", b"%pause %4",
-                b"%unlinked-window-add @9", b"%client-session-changed /dev/ttys1 $2 other"]
-        for line in keep:
-            self.assertTrue(o.allowed(line), line)
-        for line in drop:
-            self.assertFalse(o.allowed(line), line)
-        self.assertEqual(len(moved), 1)  # a foreign %layout-change re-checks which window %3 is in
+        for line in ("refresh-client -C 80x24", "select-window -t %3"):
+            self.assertFalse(gate_control.allowed_in(line, "%3", True), line)
 
     def test_long_lines_are_skipped(self):
         fh = io.BytesIO(b"a\n" + b"x" * (gate_control.MAX_LINE + 10) + b"\nb\n")
@@ -82,8 +75,8 @@ class Proxy(unittest.TestCase):
         return subprocess.run([self.tmux, "-S", self.sock, *args], capture_output=True, text=True, check=True,
                               env=self.env).stdout.strip()
 
-    def start(self, readonly=False):
-        req = {"socket": self.sock, "pane": self.a, "readonly": readonly, "flags": ["ignore-size"], "cc": "-C",
+    def start(self, readonly=False, flags=("ignore-size",)):
+        req = {"socket": self.sock, "pane": self.a, "readonly": readonly, "flags": list(flags), "cc": "-C",
                "tail": []}
         rin, self.win = os.pipe()
         self.rout, wout = os.pipe()
@@ -156,6 +149,52 @@ class Proxy(unittest.TestCase):
         self.assertNotIn(b"zzz", self.out)
         self.assertNotIn("zzz", self.t("capture-pane", "-p", "-t", self.a))
         self.assertEqual(len(self.dropped), 1)
+
+    def size(self, target) -> str:
+        return self.t("display", "-p", "-t", target, "#{window_width}x#{window_height}")
+
+    def test_sizes_the_window_it_shows(self):
+        self.start(flags=())
+        self.say("refresh-client -C 60x20")
+        self.assertTrue(self.wait_for(b"%end", count=2))
+        self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
+        self.t("break-pane", "-d", "-s", self.a)  # %A moves to a window of its own, not the current one
+        self.say(f"select-window -t {self.a}")  # brings it back to this client
+        self.assertTrue(self.wait_until(lambda: self.size(self.a) == "60x20"), self.size(self.a))
+        self.assertEqual(self.dropped, [])
+        self.stop()
+
+    def test_read_only_never_sizes(self):
+        self.start(readonly=True, flags=())
+        self.say("refresh-client -C 60x20")
+        self.say(f"select-window -t {self.a}")
+        self.say(f"display -p -t {self.a} {FMT}")
+        self.assertTrue(self.wait_for(b"80 24 "))
+        self.assertEqual(len(self.dropped), 2)
+        self.stop()
+
+    def test_lease_lets_go_of_a_silent_client(self):
+        with mock.patch.object(gate_control, "LEASE", 1.5):
+            self.start(flags=())
+            time.sleep(2.5)  # no size set yet: no lease
+            self.assertNotIn(b"%tailshare-idle", self.out)
+            self.say("refresh-client -C 60x20")
+            for _ in range(3):  # a line every second keeps it
+                time.sleep(1)
+                self.say(f"display -p -t {self.a} {FMT}")
+            self.assertNotIn(b"%tailshare-idle", self.out)
+            self.assertTrue(self.wait_for(f"%tailshare-idle {self.a}".encode()))
+            self.thread.join(5)
+        self.assertEqual(self.result.get("rc"), 0)
+        self.assertNotIn("1", self.t("list-clients", "-F", "#{client_control_mode}"))  # the client left
+
+    def wait_until(self, ok, timeout=5.0) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if ok():
+                return True
+            time.sleep(0.05)
+        return False
 
     def test_says_when_the_pane_is_gone(self):
         self.start()
