@@ -460,7 +460,8 @@ class Bus:
             new = {"v": state, "since": now, "at": now}
             if reason:
                 new["reason"] = reason
-            if old.get("v") == state and old.get("reason") == new.get("reason"):
+            turn_over = d.get("type") == "agent-turn-complete"  # Codex says only this: each one is a new idle
+            if old.get("v") == state and old.get("reason") == new.get("reason") and not turn_over:
                 new["since"] = old.get("since", now)  # the same state again: it began earlier
             self.store.x("UPDATE agents SET state=? WHERE id=?", json.dumps(new), aid)
             if state != "ended":  # a report shows the session is alive; a closed one is not online

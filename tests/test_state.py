@@ -101,6 +101,22 @@ class Reports(unittest.TestCase):
         self.b.report_state(hook("Stop"))
         self.assertEqual(self.state()["v"], "idle")
 
+    def test_each_codex_turn_is_a_new_idle(self):
+        reg(self.b, "T", "api", harness="codex")
+        done = {"type": "agent-turn-complete", "thread-id": "T"}
+        self.b.report_state(done)
+        first = self.b.agent("T")["state"]
+        time.sleep(0.01)
+        self.b.report_state(done)
+        second = self.b.agent("T")["state"]
+        self.assertEqual(second["v"], "idle")
+        self.assertGreater(second["since"], first["since"])  # Codex never reports working in between
+        self.b.report_state(hook("Stop"))
+        stop = self.state()
+        time.sleep(0.01)
+        self.b.report_state(hook("Notification", notification_type="idle_prompt"))
+        self.assertEqual(self.state()["since"], stop["since"])  # Claude's idle reminder is the same idle
+
     def test_report_counts_as_seen(self):
         self.b.store.x("UPDATE agents SET last_seen=0")
         self.b.report_state(hook("Stop"))
