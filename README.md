@@ -120,10 +120,18 @@ tailshare status                        # server, launchd, tailscale, serve rout
 | `TAILSHARE_PORT` | `8787` | localhost port of the share server |
 | `TAILSHARE_SERVE` | `1` | `0` leaves `tailscale serve` alone (agent mailbox only, no file links) |
 | `TAILSHARE_SHARE_PANES` | `1` | `0` keeps agents' tmux panes and login out of what other machines can read |
+| `TAILSHARE_BATTERY` | `own=full,others=off` | what `/hello` says about this machine's battery: to the owner's own devices (`own`) and to anyone else (`others`), each `off`, `level` or `full` (see below) |
 | `TAILSHARE_SSH_ENROLL` | `1` | `0` refuses SSH key requests from devices |
 | `TAILSHARE_LINKS` | `ip` | `ip` for `http://100.x.y.z/`, `dns` for `https://<name>.ts.net/` |
 
 Set them before `tailshare install` so the launchd agent picks them up.
+
+**Battery.** `/hello` carries `"power": {"battery": 57, "charging": false, "on_ac": false, "at": <unix s>}`
+under `level`, plus `"minutes"` (to empty on battery, to full while charging; null while it is estimated) and
+`"low_power"` under `full`. It is read when asked (IOKit on macOS, `/sys/class/power_supply` on Linux) and
+kept for 60 s. A machine without a battery, one that can't be read, and one set to `off` send no `power` at
+all. A value that isn't exactly `own=<mode>`/`others=<mode>` parts turns both off. A tagged machine has no
+owner, so nobody gets its `own` mode. `tailshare machines` shows each machine's level.
 
 ## Agent messaging
 
