@@ -10,9 +10,15 @@ import json
 import os
 import sys
 
-from . import __version__, agent, bus, sessions, sessions_cli
+from . import __version__, agent, bus, sessions, sessions_cli, squads_cli
 
 TOOLS = [
+    {
+        "name": "squad",
+        "description": ("The squad this session belongs to (its members, their roles and agent addresses), or with "
+                        "`squad` (a name or id) another of the user's squads. Read-only: the person edits squads."),
+        "inputSchema": {"type": "object", "properties": {"squad": {"type": "string"}}},
+    },
     {
         "name": "whoami",
         "description": "Your address on the tailshare agent bus (host/harness/folder[/session]).",
@@ -126,6 +132,15 @@ def _tool(name: str, args: dict) -> str:
         r = agent.call("/sessions/ask", {"ref": args["session"], "question": args["question"], "from": me["address"]},
                        timeout=sessions.ASK_TIMEOUT + 60)
         return f"{r['host']}:{r['id'][:8]} {r.get('name') or ''} answered:\n\n{r['answer']}\n\n({agent.NOTE})"
+    if name == "squad":
+        ref = str(args.get("squad") or "")
+        if ref:
+            return json.dumps(squads_cli._find(ref), indent=2)
+        tag = me.get("squad") or agent.squad_tag()
+        if not tag:
+            return "This session is not part of a squad. Squads: " + json.dumps(
+                [{"id": s["id"], "name": s["name"]} for s in agent.call("/squads")["squads"]])
+        return json.dumps({"you": tag["member"], "squad": agent.call(f"/squads/{tag['id']}")["squad"]}, indent=2)
     raise ValueError(f"unknown tool {name}")
 
 
