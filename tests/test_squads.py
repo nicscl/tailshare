@@ -66,7 +66,14 @@ class Icons(unittest.TestCase):
         with self.assertRaises(svg.Bad):  # whatever the declaration says, the bytes are read as UTF-8
             svg.clean('<?xml version="1.0" encoding="UTF-16"?>' + ICON)
         self.assertTrue(svg.clean("\t\n" + ICON + "\r\n"))
-        self.assertTrue(svg.clean('<?xml version="1.0" encoding="UTF-8"?>' + ICON))
+        for d in ('<?xml version="1.0" encoding="UTF-8"?>', "<?xml version='1.1' standalone='yes'?>"):
+            self.assertTrue(svg.clean(d + ICON))
+        for d in ('<?xml version="1.0" encoding="UTF-7"?>', '<?xml version="1.0" encoding="utf-8"?>',
+                  '<?xml version="2.0"?>'):
+            with self.assertRaises(svg.Bad, msg=d):
+                svg.clean(d + ICON)
+        with self.assertRaises(svg.Bad):  # UTF-7's "<"
+            svg.clean('<?xml version="1.0" encoding="UTF-7"?>+ADw-svg viewBox="0 0 1 1"/>')
         with self.assertRaises(squads.Bad):  # nor in squad text, where a lone surrogate would fail to encode
             squads.clean_member(member(instructions="a\ud800b"))
 

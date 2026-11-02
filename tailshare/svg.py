@@ -211,9 +211,9 @@ def clean(text: object) -> str:
         stack.append((local, len(out)))
         out.append("<" + " ".join(parts) + ">")
 
-    def decl(version, encoding, standalone):
-        if encoding and encoding.lower() != "utf-8":
-            raise Bad("encoding must be UTF-8")
+    def decl(version, encoding, standalone):  # the app's rule: version 1.0 or 1.1, encoding only "UTF-8" if given
+        if version not in ("1.0", "1.1") or encoding not in (None, "UTF-8"):
+            raise Bad('only <?xml version="1.0" encoding="UTF-8"?> (1.1, and no encoding, also do)')
 
     def end(tag):
         local, at = stack.pop()
