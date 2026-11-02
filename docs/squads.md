@@ -109,16 +109,20 @@ for the owner only; any other write, a sharee's for one, gets 403. The owner wri
 - on the local API, a caller that sends `~/.tailshare/keys.token` as `X-Tailshare-Keys`, as `tailshare squad
   edit` does. Every process of that account can read the file, an agent's included: the check keeps agents
   from editing squads by accident or through the plain API, not one set on reading the token.
-- on the peer API, a device of the same tailnet user (the Hive app), with each write signed by one of its keys
-  installed on this machine (below). Unsigned, a machine never writes there: neither this one, by its tailnet
+- on the peer API, a device of the same tailnet user (the Hive app), with each write signed by its plan key
+  installed on this machine with the squads grant (below). Unsigned, a machine never writes there: neither this one, by its tailnet
   address, nor one that runs tailshare (it has answered `/hello`). Those write through their own local API, so
   the token cannot be stepped around through the peer API.
 
 ### Signed writes
 
-A device signs each squad write with one of its SSH keys installed on the machine it writes to: a start key's
-plan key (no Face ID), or the pane key. The key must be the owner's (enrolled from the owner's device) and not
-removed. Any of the owner's addresses may send a signed write, so the iPad, whose iSH runs tailshare, writes
+A device signs each squad write with the plan key of a start key installed on the machine it writes to. The
+plan key needs no Face ID, so saving does not prompt. The key must be the owner's (enrolled from the owner's
+device) and not removed. It must also hold the squads grant. The person gives it when approving the start key,
+with `tailshare keys approve --squads` or by answering yes when asked, and a signed approval carries it to the
+other machines. No other key signs squad writes: not the start key, which asks for Face ID, and not a pane key,
+which the app keeps as a file in iSH. A key enrolled from a computer gets the grant the same way, only when the
+person gives it. Any of the owner's addresses may send a signed write, so the iPad, whose iSH runs tailshare, writes
 the same way as the iPhone. The signed message is UTF-8, seven lines joined by `\n` with no newline at the end:
 
 ```
@@ -143,6 +147,7 @@ the reason is one of these:
 - `replayed`
 - `revoked`
 - `unknown_key`, when no key by that id of the owner is installed here
+- `no_grant`, when the key is installed but was not granted squad edits, or is not a start key's plan key
 
 Each agent in `/hello` carries `squad: {id, member}` when it is a squad member, for the owner's machines and
 devices only.

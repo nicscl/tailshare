@@ -242,6 +242,48 @@ class Flow(unittest.TestCase):
         self.assertIn("start keys must be ecdsa-sha2-nistp256", str(cm.exception))
         self.assertTrue(r["request_id"])
 
+    def p256(self, name):
+        path = self.tmp / name
+        subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-C", "", "-f", str(path)], check=True,
+                       env={"PATH": "/usr/bin:/bin", "HOME": str(self.tmp)}, stdin=subprocess.DEVNULL)
+        return keys.parse_pubkey((self.tmp / f"{name}.pub").read_text())
+
+    def test_squad_grant_is_explicit_for_the_plan_key_only_and_fans_out_signed(self):
+        """Only a start key's plan key, and only when the person grants it, may sign squad edits (docs/squads.md)."""
+        start_pub, plan_pub = self.p256("start"), self.p256("plan")
+        r = self.air_keys.enroll(PHONE, {"pubkey": start_pub, "plan_pubkey": plan_pub, "purpose": "start",
+                                         "device_name": "iPad"})
+        p = self.air_keys.pending()["pending"][0]
+        payload = keys.approval_doc("nick", "air", p, "k" + "a" * 12, "start", ["air", "pro"])
+        sig = sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE)
+        body = {"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "start", "payload": payload,
+                "signature": sig, "squads": True}
+        with self.assertRaises(bus.BusError) as cm:  # the grant must be in what was signed, not only asked for
+            self.air_keys.approve(body)
+        self.assertIn("signed for another request", str(cm.exception))
+        payload = keys.approval_doc("nick", "air", p, "k" + "a" * 12, "start", ["air", "pro"], squads=True)
+        sig = sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE)
+        out = self.air_keys.approve({**body, "payload": payload, "signature": sig})
+        self.assertEqual(sorted((i["host"], i["squads"]) for i in out["installed"]), [("air", True), ("pro", True)], out)
+        self.assertEqual([k["squads"] for k in self.pro_keys.ls()["keys"]], [1])
+        # without it: nothing
+        r2 = self.enroll()
+        out = self.air_keys.approve({"confirm": r2["fingerprint"][-6:], "id": r2["request_id"], "mode": "pane"})
+        self.assertFalse(out["installed"][0]["squads"])
+        self.assertEqual({k["id"]: k["squads"] for k in self.air_keys.ls()["keys"]},
+                         {"kaaaaaaaaaaaa": 1, out["key_id"]: 0})
+        other = self.p256("other")
+        with self.assertRaises(bus.BusError) as cm:  # a pane key never gets it
+            self.air_keys.install_here("k" + "c" * 12, {**p, "pubkey": other, "fingerprint": keys.fingerprint(other),
+                                                        "plan_pubkey": ""}, "pane", "test", squads=True)
+        self.assertIn("only a start key's plan key", str(cm.exception))
+        doc = json.loads(keys.approval_doc("nick", "air", p, "k" + "d" * 12, "pane", ["pro"]))
+        doc.update(squads=True, nonce="e" * 32)
+        payload = sessions.canonical(doc)
+        with self.assertRaises(bus.BusError) as cm:  # nor through a signed approval
+            self.pro_keys.check_approval(payload, sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE))
+        self.assertIn("squads is only a start key's grant", str(cm.exception))
+
     def test_device_revokes_its_own_key(self):
         r = self.enroll()
         payload, sig = self.signed(r)

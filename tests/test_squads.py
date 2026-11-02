@@ -505,7 +505,7 @@ class Signed(unittest.TestCase):
         b.net.ipmap.update({"100.9.9.9": "air", "100.96.0.1": "ipad", "100.1.1.1": "iphone"})
         b.store.x("INSERT INTO peers(host, ip, last_ok) VALUES('ipad', '100.96.0.1', 1)")  # it runs tailshare (iSH)
         self.start, self.plan, self.other = (self.keygen(n) for n in ("start", "plan", "other"))
-        self.install("k0123456789ab", self.start, self.plan)  # the iPad's start key and its plan key
+        self.install("k0123456789ab", self.start, self.plan)  # the iPad's start key and its plan key, granted
 
     def keygen(self, name, kind=("-t", "ecdsa", "-b", "256")):
         path = self.m.tmp / name
@@ -513,12 +513,12 @@ class Signed(unittest.TestCase):
                        check=True, env={**ENV, "HOME": str(self.m.tmp)}, stdin=subprocess.DEVNULL)
         return path
 
-    def install(self, key_id, key, plan=None, user="nick@example.com"):
+    def install(self, key_id, key, plan=None, user="nick@example.com", grant=True):
         pub = lambda p: " ".join(Path(f"{p}.pub").read_text().split()[:2])  # noqa: E731
         self.m.bus.store.x("INSERT INTO ssh_keys(id, pubkey, fingerprint, device, node, user, mode, approved_by,"
-                           " installed, plan_pubkey) VALUES(?,?,?,?,?,?,?,?,?,?)", key_id, pub(key),
+                           " installed, plan_pubkey, squads) VALUES(?,?,?,?,?,?,?,?,?,?,?)", key_id, pub(key),
                            keys.fingerprint(pub(key)), "iPad", "n1", user, "start" if plan else "pane", "test", 1,
-                           pub(plan) if plan else "")
+                           pub(plan) if plan else "", int(grant and bool(plan)))
 
     def sign(self, key, raw, key_id="k0123456789ab", method="PATCH", path="/bus/v1/squads/sq1", host="air",
              ts=None, nonce=None, namespace=keys.SQUADS_NAMESPACE):
@@ -544,25 +544,30 @@ class Signed(unittest.TestCase):
     def test_a_signed_write_lands_from_the_ipad_and_from_a_phone(self):
         raw = self.body("From the iPad")
         self.assertEqual(self.write("100.96.0.1", raw, self.sign(self.plan, raw))["squad"]["name"], "From the iPad")
-        raw = self.body("With the start key")  # either key of the pair signs
-        self.assertEqual(self.write("100.1.1.1", raw, self.sign(self.start, raw))["squad"]["name"], "With the start key")
+        raw = self.body("From the phone")
+        self.assertEqual(self.write("100.1.1.1", raw, self.sign(self.plan, raw))["squad"]["name"], "From the phone")
         mid = "m_new"
         raw = json.dumps({"base_rev": None, **member(name="New")}).encode()
         out = self.write("100.1.1.1", raw, self.sign(self.plan, raw, path=f"/bus/v1/squads/sq1/members/{mid}"),
                          path=f"/squads/sq1/members/{mid}")
         self.assertEqual(out["member"]["name"], "New")
 
-    def test_an_ed25519_pane_key_signs_too(self):
-        """The app's pane key, where the host has no start keys."""
+    def test_only_a_granted_plan_key_signs(self):
+        """Not the start key (Face ID on every save), not a pane key (the app's is a file in iSH), not a plan key
+        the person did not grant squad edits."""
+        raw = self.body("X")
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(self.start, raw)), "bad_signature")
         pane = self.keygen("pane", ("-t", "ed25519"))
         self.install("k0000000000aa", pane)
-        raw = self.body("Pane key")
-        self.assertEqual(self.write("100.96.0.1", raw, self.sign(pane, raw, key_id="k0000000000aa"))["squad"]["name"],
-                         "Pane key")
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(pane, raw, key_id="k0000000000aa")), "no_grant")
+        start2, plan2 = self.keygen("start2"), self.keygen("plan2")
+        self.install("k0000000000bb", start2, plan2, grant=False)
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(plan2, raw, key_id="k0000000000bb")), "no_grant")
+        self.assertEqual(self.m.squads.squad("sq1")["name"], "S")
 
     def test_the_signature_covers_host_method_path_body_and_key(self):
         raw = self.body("X")
-        self.install("k00000000000e", self.other)
+        self.install("k00000000000e", self.keygen("start3"), self.other)  # another granted pair
         for why, headers in [
             ("another machine", self.sign(self.plan, raw, host="pro")),
             ("another method", self.sign(self.plan, raw, method="PUT")),
@@ -570,7 +575,8 @@ class Signed(unittest.TestCase):
             ("another body", self.sign(self.plan, self.body("Y"))),
             ("another installed key's id", self.sign(self.plan, raw, key_id="k00000000000e")),
             ("another namespace", self.sign(self.plan, raw, namespace="tailshare-keys")),
-            ("a key not installed here", self.sign(self.other, raw)),
+            ("another pair's plan key", self.sign(self.other, raw)),
+            ("a key not installed here", self.sign(self.keygen("stray"), raw)),
         ]:
             self.assertEqual(self.refused("100.96.0.1", raw, headers), "bad_signature", why)
         self.m.net.host = "air2"  # signed for the name this machine has now
@@ -595,7 +601,7 @@ class Signed(unittest.TestCase):
         self.write("100.1.1.1", raw, h)
         self.assertEqual(self.refused("100.1.1.1", raw, h), "replayed")  # before the stale base_rev's 409
         self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.plan, raw, key_id="k999999999999")), "unknown_key")
-        self.install("k00000000000e", self.other, user="eve@example.com")  # installed here, but not the owner's
+        self.install("k00000000000e", self.keygen("start3"), self.other, user="eve@example.com")  # not the owner's
         raw = self.body("Y")
         self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.other, raw, key_id="k00000000000e")), "unknown_key")
         self.m.bus.store.x("INSERT INTO revoked_keys(id, at) VALUES('k0123456789ab', 1)")  # revoked, row not yet gone
