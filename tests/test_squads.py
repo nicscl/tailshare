@@ -605,6 +605,7 @@ class Signed(unittest.TestCase):
             ("a key not installed here", self.sign(self.keygen("stray"), raw)),
         ]:
             self.assertEqual(self.refused("100.96.0.1", raw, headers), "bad_signature", why)
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(self.plan, raw), method="PUT"), "bad_signature")
         self.m.net.host = "air2"  # signed for the name this machine has now
         self.assertEqual(self.refused("100.96.0.1", raw, self.sign(self.plan, raw)), "bad_signature")
         self.assertEqual(self.write("100.96.0.1", raw, self.sign(self.plan, raw, host="air2"))["squad"]["name"], "X")
@@ -615,6 +616,25 @@ class Signed(unittest.TestCase):
                          "bad_signature")
         self.assertEqual(self.refused("100.96.0.1", raw, {**h, "X-Tailshare-Signature": "!" * 40}), "bad_signature")
         self.assertEqual(self.m.squads.squad("sq1")["name"], "X")
+
+    def test_a_put_signed_as_put_lands(self):
+        raw = json.dumps({"base_rev": None, "name": "New"}).encode()
+        out = self.write("100.1.1.1", raw, self.sign(self.plan, raw, method="PUT", path="/bus/v1/squads/sq9"),
+                         path="/squads/sq9", method="PUT")
+        self.assertEqual(out["squad"]["name"], "New")
+
+    def test_signature_checks_are_limited_per_address(self):
+        raw = self.body("X")
+        bad = {**self.sign(self.plan, raw), "X-Tailshare-Signature": "A" * 40}
+        for _ in range(keys.VERIFY_PER_MINUTE):
+            self.assertEqual(self.refused("100.1.1.1", raw, bad), "bad_signature")
+        with self.assertRaises(bus.BusError) as c:
+            self.write("100.1.1.1", raw, self.sign(self.plan, raw))
+        self.assertEqual((c.exception.code, c.exception.extra["reason"]), (429, "rate_limited"))
+        self.assertEqual(self.write("100.96.0.1", raw, self.sign(self.plan, raw))["squad"]["name"], "X")  # another address
+        self.m.bus.keys._verified["100.1.1.1"] = [time.time() - 61] * keys.VERIFY_PER_MINUTE  # a minute later
+        raw = self.body("Y")
+        self.assertEqual(self.write("100.1.1.1", raw, self.sign(self.plan, raw))["squad"]["name"], "Y")
 
     def test_old_replayed_and_unknown_keys(self):
         raw = self.body("X")

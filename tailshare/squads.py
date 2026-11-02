@@ -581,7 +581,7 @@ class Squads:
         if not local:  # a device signs each write with one of its keys installed here (the iPad's comes from a machine)
             if self.bus.keys is None:
                 raise bus.BusError("signature", 403, {"reason": "unknown_key", "detail": "SSH keys are off on this machine"})
-            self.bus.keys.check_signed(method, "/bus/v1" + path, signed[0], signed[1], self.owner)
+            self.bus.keys.check_signed(method, "/bus/v1" + path, signed[0], signed[1], self.owner, ip)
         if local and (self.bus.keys is None or len(self.bus.keys.token) < 64
                       or not secrets.compare_digest(token.encode(), self.bus.keys.token.encode())):
             raise bus.BusError("local squad edits need ~/.tailshare/keys.token: use `tailshare squad edit`", 403)

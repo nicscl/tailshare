@@ -131,13 +131,14 @@ the same way as the iPhone. The signed message is UTF-8, seven lines joined by `
 tailshare-squad-write/1
 <host>          the machine's name, as its /hello "host"
 <METHOD>        PUT or PATCH
-<path>          /bus/v1/squads/<id>[/members/<member>], without the query
+<path>          /bus/v1/squads/<id>[/members/<member>], as sent, without the query
 <time>          unix seconds
 <nonce>         32 lowercase hex characters, new for each write
 <body sha256>   lowercase hex, of the exact body bytes sent
 ```
 
-It is signed as `ssh-keygen -Y sign -n tailshare-squads` signs (SSHSIG, sha256). It is sent in headers:
+The path is the raw one in the request line, not decoded or normalized: sign exactly the bytes you send. The
+query string is not signed, and writes do not read it. It is signed as `ssh-keygen -Y sign -n tailshare-squads` signs (SSHSIG, sha256). It is sent in headers:
 `X-Tailshare-Key` (the key id, `k` and 12 hex), `X-Tailshare-Time`, `X-Tailshare-Nonce` and
 `X-Tailshare-Signature` (the SSHSIG blob in base64, without the armor lines). The time may be at most 60 s from
 the machine's clock, and a nonce is used once. A refusal is `403 {"error": "signature", "reason": …}`, where
@@ -150,6 +151,9 @@ the reason is one of these:
 - `revoked`
 - `unknown_key`, when no key by that id of the owner is installed here
 - `no_grant`, when the key is installed but was not granted squad edits, or is not a start key's plan key
+
+Each signature check runs `ssh-keygen`, so one address gets 30 a minute. Past that the answer is `429 {"error":
+"signature", "reason": "rate_limited"}`.
 
 Each agent in `/hello` carries `squad: {id, member}` when it is a squad member, for the owner's machines and
 devices only.

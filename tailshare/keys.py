@@ -57,6 +57,7 @@ _KEY_ID_RE = re.compile(r"k[0-9a-f]{12}")
 _EXE_RE = re.compile(r"/[A-Za-z0-9._/+-]+")
 SQUADS_NAMESPACE = "tailshare-squads"  # a device's signed squad write; never valid as a launch or a key approval
 SIGNED_WINDOW = 60  # how far a signed write's time may be from this machine's clock
+VERIFY_PER_MINUTE = 30  # signature checks per address: each one runs ssh-keygen
 SIGNED_HEADERS = ("X-Tailshare-Key", "X-Tailshare-Time", "X-Tailshare-Nonce", "X-Tailshare-Signature")
 
 SCHEMA = """
@@ -558,6 +559,7 @@ class Keys:
         self.signers = signers or SIGNERS
         self.keys_file = keys_file  # None: ~/.ssh/authorized_keys
         self.token = load_token(token_file or token_path(), create=True)
+        self._verified: dict[str, list[float]] = {}  # address -> times of its recent signature checks
         with self.store.lock:
             self.store.db.executescript(SCHEMA)
             cols = {r[1] for r in self.store.db.execute("PRAGMA table_info(key_requests)")}
@@ -890,7 +892,7 @@ class Keys:
         return {"denied": True}
 
     # -- signed writes from devices ------------------------------------------------------
-    def check_signed(self, method: str, path: str, raw: bytes, headers: dict, owner: str) -> dict:
+    def check_signed(self, method: str, path: str, raw: bytes, headers: dict, owner: str, ip: str = "") -> dict:
         """A device's signed write (docs/squads.md): signed with the plan key of one of `owner`'s start keys
         installed here with the squads grant, for this machine, this method, path and body, recently and once. The
         pane key (a file in iSH, say) and the start key (Face ID on every save) never sign one. Returns the key's
@@ -918,6 +920,14 @@ class Keys:
         if not row["squads"] or not row["plan_pubkey"]:
             raise no("no_grant", f"key {key_id} was not granted squad edits on {self.host}: approve its start key "
                      "again with `tailshare keys approve --squads`")
+        with self.store.lock:
+            recent = [t for t in self._verified.get(ip, []) if t > now - 60]
+            if len(recent) >= VERIFY_PER_MINUTE:
+                raise bus.BusError("signature", 429, {"reason": "rate_limited", "detail": "too many signed writes from "
+                                   "this device in the last minute; try again shortly"})
+            self._verified[ip] = [*recent, now]
+            for a in [a for a, ts in self._verified.items() if not ts or ts[-1] <= now - 60]:
+                del self._verified[a]
         message = "\n".join(["tailshare-squad-write/1", self.host, method, path, ts, nonce,
                               hashlib.sha256(raw).hexdigest()])
         armored = "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(sig[i : i + 70] for i in range(0, len(sig), 70)) \
