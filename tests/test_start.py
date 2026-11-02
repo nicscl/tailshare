@@ -515,6 +515,9 @@ class Keys(unittest.TestCase):
         self.assertEqual(keys.default_mode("pane", []), "pane")
 
 
+PAIR_VECTOR = "SHA256:EqpHWj31Me8a5Z+bo7GEb85e0WI41CUMdLoe1MA/XcE"  # the app checks against the same pair
+
+
 class Enroll(unittest.TestCase):
     """A start key goes through the same enroll and approve as an attach key, with its purpose kept."""
 
@@ -544,7 +547,11 @@ class Enroll(unittest.TestCase):
         p = self.k.pending()["pending"][0]
         self.assertEqual((p["purpose"], p["want"]), ("start", ["start", "skip"]))
         self.assertEqual(p["plan_fingerprint"], keys.fingerprint(keys.parse_pubkey(self.plan)))
-        tail = p["fingerprint"][-keys.CONFIRM_CHARS:]
+        self.assertEqual(p["pair_fingerprint"], r["pair_fingerprint"])
+        with self.assertRaises(bus.BusError) as e:  # the start key's own code is not enough
+            self.k.approve({"id": r["request_id"], "mode": "start", "confirm": p["fingerprint"][-keys.CONFIRM_CHARS:]})
+        self.assertEqual(e.exception.code, 403)
+        tail = p["pair_fingerprint"][-keys.CONFIRM_CHARS:]
         with self.assertRaises(bus.BusError):
             self.k.approve({"id": r["request_id"], "mode": "pane", "confirm": tail})
         out = self.k.approve({"id": r["request_id"], "mode": "start", "confirm": tail})  # grant less than asked
@@ -558,6 +565,47 @@ class Enroll(unittest.TestCase):
             f"{keys.parse_pubkey(self.plan)} tailshare:{kid} plan iPhone"])
         self.k.rm({"key_id": kid})  # removing the start key removes its plan key
         self.assertFalse([x for x in (self.tmp / "authorized_keys").read_text().splitlines() if "ecdsa" in x])
+
+    def test_pair_fingerprint_vector(self):
+        start = ("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAECAwQFBgcICQoLDA0ODxAREhMU"
+                 "FRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=")  # 04 01..40: the point bytes 1 to 64
+        plan = ("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEBBQkNERUZHSElKS0xNTk9QUVJT"
+                "VFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8=")  # 04 40..7f
+        self.assertEqual(keys.pair_fingerprint(start, plan), PAIR_VECTOR)
+        self.assertNotEqual(keys.pair_fingerprint(plan, start), PAIR_VECTOR)  # the order matters
+        self.assertEqual(keys.confirm_code({"pubkey": start, "plan_pubkey": plan, "fingerprint": "x"}), PAIR_VECTOR[-6:])
+        self.assertEqual(keys.confirm_code({"pubkey": start, "plan_pubkey": "", "fingerprint": "SHA256:abcdefgh"}), "cdefgh")
+
+    def test_someone_elses_plan_key_does_not_get_the_code(self):
+        mine = self.start_request()  # the phone, on its own address
+        subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-N", "", "-f", str(self.tmp / "evil")], capture_output=True)
+        evil = (self.tmp / "evil.pub").read_text().strip()
+        self.k.bus.net.ipmap["100.6.6.6"] = "laptop"
+        self.k.bus.net.usermap["100.6.6.6"] = "nick@example.com"
+        theirs = self.k.enroll("100.6.6.6", {"pubkey": self.pub, "plan_pubkey": evil, "device_name": "iPhone",
+                                             "purpose": "start", "want": ["start"]})
+        self.assertNotEqual(theirs["pair_fingerprint"][-6:], mine["pair_fingerprint"][-6:])
+        for code in (mine["fingerprint"][-6:], mine["pair_fingerprint"][-6:]):  # what the person sees on the phone
+            with self.assertRaises(bus.BusError) as e:
+                self.k.approve({"id": theirs["request_id"], "mode": "start", "confirm": code})
+            self.assertEqual(e.exception.code, 403)
+        for rid, code in ((theirs["request_id"], theirs["pair_fingerprint"][-6:]),
+                          (mine["request_id"], mine["pair_fingerprint"][-6:])):
+            with self.assertRaises(bus.BusError) as e:  # same start key, another plan key: neither, until one is denied
+                self.k.approve({"id": rid, "mode": "start", "confirm": code})
+            self.assertEqual(e.exception.code, 409)
+        self.k.deny({"id": theirs["request_id"]})
+        out = self.k.approve({"id": mine["request_id"], "mode": "start", "confirm": mine["pair_fingerprint"][-6:]})
+        self.assertIn(keys.parse_pubkey(self.plan), (self.tmp / "authorized_keys").read_text())
+        self.assertNotIn(keys.parse_pubkey(evil), (self.tmp / "authorized_keys").read_text())
+        self.assertTrue(out["key_id"])
+
+    def test_a_new_plan_key_is_a_new_request(self):
+        first = self.start_request()
+        subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-N", "", "-f", str(self.tmp / "plan2")], capture_output=True)
+        again = self.start_request(plan_pubkey=(self.tmp / "plan2.pub").read_text().strip())
+        self.assertNotEqual(first["request_id"], again["request_id"])  # not the old request, whose code is the old pair's
+        self.assertEqual(self.start_request()["request_id"], first["request_id"])
 
     def test_start_keys_are_p256(self):
         ed = self.tmp / "ed"

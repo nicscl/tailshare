@@ -46,7 +46,13 @@ tailshare keys approve 3f2a91c0 --start=safe   # grants less: start, never skip 
 ```
 
 A start request carries two keys: the start key (`pubkey`) and its **plan key** (`plan_pubkey`, a different
-key). `keys approve` shows both fingerprints and installs both, as a pair. The plan key can only dry-run:
+key). `keys approve` shows both fingerprints and installs both, as a pair. The code the person types is the
+last 6 characters of the **pair fingerprint**, which the device shows instead of the start key's:
+`"SHA256:" + base64(sha256(start key blob ‖ plan key blob))` without `=` padding, each blob the decoded base64
+field of its key line (both P-256, so of fixed length). It covers both keys, so a request that pairs someone
+else's start key with its own plan key does not get the device's code. The request view and `keys pending`
+carry `pair_fingerprint`. A pending request with the same start key and another plan key blocks approving
+either one until the wrong one is denied. The plan key can only dry-run:
 the gate never confirms a plan or attaches to anything for it. Both lines share the key id, so a plan made with
 the plan key belongs to the pair and the start key can confirm it. Removing the key (`tailshare keys rm`, or
 the device revoking it) removes both lines.
