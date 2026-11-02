@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -92,9 +93,24 @@ class Block(unittest.TestCase):
 
     def test_key_line(self):
         k = {"id": "k0123456789ab", "device": "Nick's iPhone", "pubkey": "ssh-ed25519 AAAA", "mode": "pane"}
-        self.assertEqual(keys.key_line(k, "/u/bin/tailshare"),
+        self.assertEqual(keys.key_line(k, "/u/bin/tailshare", "/u/bin/python"),  # -I: no PYTHON* from the client
+                         'restrict,pty,command="/u/bin/python -I -m tailshare ssh-gate" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
+        self.assertEqual(keys.key_line(k, "/u/bin/tailshare", ""),  # an interpreter path that is not plain
                          'restrict,pty,command="/u/bin/tailshare ssh-gate" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
         self.assertEqual(keys.key_line({**k, "mode": "shell"}, "/x"), "ssh-ed25519 AAAA tailshare:k0123456789ab Nick's-iPhone")
+        self.assertEqual(keys.key_line(k, "", ""),  # neither: fail closed, as start keys do
+                         'restrict,pty,command="/usr/bin/false" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
+
+    def test_gate_python_imports_tailshare_under_I(self):
+        """A `pip install --user` or a checkout is off sys.path under -I: those keep the console script."""
+        keys.gate_python.cache_clear()
+        self.addCleanup(keys.gate_python.cache_clear)
+        self.assertEqual(keys.gate_python(), sys.executable)  # the suite's interpreter has tailshare installed
+        keys.gate_python.cache_clear()
+        with mock.patch.object(keys.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+            self.assertEqual(keys.gate_python(), "")
+        self.assertEqual(run.call_args.args[0], [sys.executable, "-I", "-c", "import tailshare"])
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
 
 
 class Gate(unittest.TestCase):
@@ -194,7 +210,7 @@ class Flow(unittest.TestCase):
         out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane"})
         self.assertEqual([i["host"] for i in out["installed"]], ["air"])
         text = (self.tmp / "air" / "authorized_keys").read_text()
-        self.assertIn(f'restrict,pty,command="/u/bin/tailshare ssh-gate" {keys.parse_pubkey(self.phone_pub)} '
+        self.assertIn(f'restrict,pty,command="{sys.executable} -I -m tailshare ssh-gate" {keys.parse_pubkey(self.phone_pub)} '
                       f"tailshare:{out['key_id']} Nick's-iPhone", text)
         self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
         st = self.air_keys.status(PHONE, r["request_id"])

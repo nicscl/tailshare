@@ -19,6 +19,7 @@ the command prompt, or anything over -CC), so a pane key is a shell key and is a
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import json
 import os
@@ -278,10 +279,19 @@ def install_problem() -> str:
     return ""
 
 
+@functools.lru_cache(maxsize=1)
 def gate_python() -> str:
-    """The interpreter tailshare runs under, for start keys' lines, or "" when its path is not plain."""
+    """The interpreter tailshare runs under, for the keys' lines, or "" when its path is not plain or tailshare
+    does not import under it with -I (a `pip install --user`, or a checkout on PYTHONPATH): -I leaves those out."""
     p = sys.executable
-    return p if p and _EXE_RE.fullmatch(p) and os.access(p, os.X_OK) else ""
+    if not (p and _EXE_RE.fullmatch(p) and os.access(p, os.X_OK)):
+        return ""
+    try:
+        ok = subprocess.run([p, "-I", "-c", "import tailshare"], cwd="/", env={"PATH": "/usr/bin:/bin"},
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    return p if ok else ""
 
 
 def key_lines(k: dict, exe: str, python: str | None = None) -> list[str]:
@@ -295,16 +305,18 @@ def key_line(k: dict, exe: str, python: str | None = None, plan: bool = False) -
     comment = "tailshare:" + k["id"] + (" plan" if plan else "") + " " + k["device"].replace(" ", "-")
     if k["mode"] == "shell":
         return f"{k['pubkey']} {comment}"
+    # the interpreter itself with -I: PYTHONPATH, PYTHONSTARTUP and friends act before any of tailshare's code
+    # runs, so the console script's shebang (no -I) would let an AcceptEnv'd variable load code
+    py = gate_python() if python is None else python
     if k["mode"] in ("start", "start-skip"):  # no pty: it only takes `tailshare-start` (tailshare/start.py)
         grant = "skip" if k["mode"] == "start-skip" else "safe"
-        # the interpreter itself with -I: PYTHONPATH, PYTHONSTARTUP and friends act before any of tailshare's code
-        # runs, so the console script's shebang (no -I) would let an AcceptEnv'd variable load code
-        py = gate_python() if python is None else python
         # the plan key (no Face ID) shares the start key's id, so its plans are the pair's, but it only dry-runs
         flags = f"--start={grant} --key={k['id']}" + (" --plan" if plan else "")
         cmd = f"{py} -I -m tailshare ssh-gate {flags}" if py else "/usr/bin/false"
         return f'restrict,command="{cmd}" {k["plan_pubkey"] if plan else k["pubkey"]} {comment}'
-    return f'restrict,pty,command="{exe} ssh-gate" {k["pubkey"]} {comment}'
+    # an interpreter path that is not plain keeps the console script: attaching still works, without -I
+    cmd = f"{py} -I -m tailshare ssh-gate" if py else f"{exe} ssh-gate" if exe else "/usr/bin/false"
+    return f'restrict,pty,command="{cmd}" {k["pubkey"]} {comment}'
 
 
 def replace_block(old: str, lines: list[str]) -> str:
