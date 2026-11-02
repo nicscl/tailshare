@@ -1,12 +1,14 @@
 """Squads: the icon subset, validation, compare-and-set writes, what sharees see, and syncing between an owner's
 machines. Everything runs on temp state and loopback buses; nothing touches ~/.tailshare or a real tmux."""
 
+import hashlib
 import json
 import os
 import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -257,6 +259,30 @@ class Views(unittest.TestCase):
         self.assertEqual(reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})["squad"],
                          {"id": "sq1", "member": "m1"})  # the member itself, registering again
         self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
+
+    def test_two_registrations_at_once_get_one_tag(self):
+        self.m.put("sq5", name="R", members=[{"id": "m1", **member(host="air", folder="/u/projects/app")}])
+        tag = {"id": "sq5", "member": "m1"}
+        real = self.m.squads.check_tag
+        barrier = threading.Barrier(2, timeout=2)
+
+        def slow(*a):  # both check before either writes, unless the check is under the lock
+            out = real(*a)
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return out
+
+        self.m.squads.check_tag = slow
+        threads = [threading.Thread(target=reg, args=(self.m.bus, f"a{i}", "app"),
+                                                  kwargs={"squad": tag, "cwd": "/u/projects/app"}) for i in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        held = [r["id"] for r in self.m.bus.store.q("SELECT id FROM agents WHERE squad!=''")]
+        self.assertEqual(len(held), 1, held)
 
     def test_sharees_get_no_start_options(self):
         sq = self.m.squads.squad("sq1")
@@ -523,7 +549,7 @@ class Signed(unittest.TestCase):
     def sign(self, key, raw, key_id="k0123456789ab", method="PATCH", path="/bus/v1/squads/sq1", host="air",
              ts=None, nonce=None, namespace=keys.SQUADS_NAMESPACE):
         ts, nonce = str(int(time.time() if ts is None else ts)), nonce or secrets.token_hex(16)
-        msg = "\n".join(["tailshare-squad-write/1", host, method, path, ts, nonce, __import__("hashlib").sha256(raw).hexdigest()])
+        msg = "\n".join(["tailshare-squad-write/1", host, method, path, ts, nonce, hashlib.sha256(raw).hexdigest()])
         cp = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", str(key), "-n", namespace], input=msg.encode(),
                             capture_output=True, check=True, env={**ENV, "HOME": str(self.m.tmp)})
         sig = "".join(l for l in cp.stdout.decode().splitlines() if not l.startswith("-----"))

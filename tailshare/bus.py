@@ -399,10 +399,10 @@ class Bus:
         user = self._user_for(a)
         tmux = clean_tmux(a.get("tmux"))
         squad = clean_squad_tag(a.get("squad"))
-        squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
-        with self.store.lock:
+        with self.store.lock:  # the tag's "no other live holder" and the write that takes it, as one step
+            squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
             row = self.store.one("SELECT address FROM agents WHERE id=?", aid)
             if row and row["address"].split(":")[0] == base:
                 address = row["address"]  # keep a collision suffix stable

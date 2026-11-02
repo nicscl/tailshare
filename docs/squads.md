@@ -74,7 +74,9 @@ every option must still be allowed by its `start.json`: a squad never widens wha
 The session runs in tmux session `squad-<name>`, one window per member, with `TAILSHARE_SQUAD` and
 `TAILSHARE_MEMBER` set, and registers on the bus as that member. The bus keeps an agent's squad tag only if
 the member runs on this machine, is of the agent's kind and has its folder, and no other live agent holds the
-tag (a `claude -p` run in a member's shell inherits the variables, and is not the member). A member that already has a live agent is
+tag (a `claude -p` run in a member's shell inherits the variables, and is not the member). An agent counts
+as live for 90 s after it was last heard from: a member that crashed and is started again within that time
+runs without its tag, as the gate also says `running` until then. A member that already has a live agent is
 refused (`running`). The plan says `changed` when the member's instructions differ from the last time it was
 started here.
 
