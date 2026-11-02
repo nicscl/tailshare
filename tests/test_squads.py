@@ -48,6 +48,12 @@ class Icons(unittest.TestCase):
             '<svg viewBox="0 0 1 1">' + "<g>" * 11 + "</g>" * 11 + "</svg>",
             '<svg viewBox="0 0 1 1"><path d="M0 0' + " L1 1" * 2001 + '"/></svg>',
             "x" * (svg.MAX_BYTES + 1),
+            '<svg viewBox="0 0 1e-310 1"/>',  # would be stored as width 0
+            '<svg viewBox="0 0 1 1"><circle r="0.0000001"/></svg>',
+            '<svg viewBox="0 0 1 1"><path d="M\u0662 2"/></svg>',  # an Arabic-Indic digit
+            '<svg viewBox="0 0 1 1"><path d="M1\u00a02"/></svg>',  # NBSP is no XML whitespace
+            '<svg viewBox="0 0 1 1"><path d="M0 0" fill="&#x72;ed"/></svg>',
+            '<svg viewBox="0 0 1 1"><path d="M0 0" fill="&amp;"/></svg>',
         ]
         for b in bad:
             with self.assertRaises(svg.Bad, msg=b[:60]):
@@ -223,13 +229,66 @@ class Views(unittest.TestCase):
 
     def test_agent_hint(self):
         self.assertNotIn("agent", self.m.squads.squad("sq1")["members"][0])
-        a = reg(self.m.bus, "s1", "app", squad={"id": "sq1", "member": "m1"})
+        a = reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
         self.assertEqual(a["squad"], {"id": "sq1", "member": "m1"})
         self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], a["address"])
         self.assertEqual(reg(self.m.bus, "s2", "x", squad={"id": "../", "member": "m1"})["squad"], None)
         hello = self.m.bus.hello("100.1.1.1")
         self.assertIn("squad", next(x for x in hello["agents"] if x["address"] == a["address"]))
         self.assertTrue(all("squad" not in x for x in self.m.bus.hello("100.2.2.2")["agents"]))  # owner only
+
+    def test_a_tag_is_kept_only_for_the_member_itself(self):
+        """/register is any local process: a tag sticks only for the member's kind and folder on its host, and
+        only for one live agent (a `claude -p` in a member's shell inherits TAILSHARE_SQUAD/MEMBER)."""
+        self.m.put("sq3", name="B", members=[{"id": "m1", **member(host="pro")}])
+        for i, (harness, cwd, sid) in enumerate([("codex", "/u/projects/app", "sq1"), ("claude", "/tmp/elsewhere", "sq1"),
+                                                  ("claude", "/u/projects/app", "sq3"), ("claude", "/u/projects/app", "nope")]):
+            a = reg(self.m.bus, f"x{i}", "app", harness=harness, cwd=cwd, squad={"id": sid, "member": "m1"})
+            self.assertIsNone(a["squad"], (harness, cwd, sid))
+        self.assertEqual(self.m.squads.squad("sq1")["members"][0].get("agent", ""), "")
+        real = reg(self.m.bus, "s1", "app", cwd="/u/projects/app/", squad={"id": "sq1", "member": "m1"})
+        self.assertEqual(real["squad"], {"id": "sq1", "member": "m1"})
+        child = reg(self.m.bus, "s2", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.assertIsNone(child["squad"])
+        self.assertEqual(reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})["squad"],
+                         {"id": "sq1", "member": "m1"})  # the member itself, registering again
+        self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
+
+    def test_sharees_get_no_start_options(self):
+        sq = self.m.squads.squad("sq1")
+        m = sq["members"][0]
+        self.m.patch("sq1/members/m1", base_rev=m["rev"], start={
+            "options": {"add_dirs": ["/u/secret/clientX"], "resume": "0b6c7d1e-aaaa", "permission_mode": "bypassPermissions"},
+            "prompt": "go", "prompt_from": "alex@example.com"})
+        alex = self.get("100.2.2.2", "/squads/sq1")["squad"]["members"][0]
+        self.assertEqual(alex["start"], {"prompt": "go", "prompt_from": "alex@example.com", "skip": True})
+        self.assertNotIn("/u/secret", json.dumps(alex))
+        self.assertIn("add_dirs", self.get("100.1.1.1", "/squads/sq1")["squad"]["members"][0]["start"]["options"])
+
+    def test_no_writes_from_a_machine_on_the_peer_api(self):
+        """A program on this machine (by its tailnet IP) or on another of the owner's tailshare machines would
+        otherwise skip the local API's token; devices, which run no bus, still write."""
+        self.m.net.ip = "100.9.9.9"
+        self.m.net.usermap.update({"100.9.9.9": "nick@example.com", "100.4.4.4": "nick@example.com"})
+        self.m.net.ipmap.update({"100.9.9.9": "air", "100.4.4.4": "pro", "100.1.1.1": "iphone"})
+        self.m.bus.store.x("INSERT INTO peers(host, ip, last_ok) VALUES('pro', '100.4.4.4', 1)")
+        rev = self.m.squads.squad("sq1")["rev"]
+        for ip in ("100.9.9.9", "100.4.4.4"):
+            with self.assertRaises(bus.BusError) as c:
+                self.m.squads.route("PATCH", "/squads/sq1", {"name": "X", "base_rev": rev}, False, ip, {})
+            self.assertEqual(c.exception.code, 403, ip)
+        out = self.m.squads.route("PATCH", "/squads/sq1", {"name": "From the phone", "base_rev": rev}, False, "100.1.1.1", {})
+        self.assertEqual(out["squad"]["name"], "From the phone")
+
+    def test_remote_agent_hint_only_from_the_owners_machine(self):
+        self.m.put("sq4", name="C", members=[{"id": "m1", **member(host="pro")}])
+        tag = {"id": "sq4", "member": "m1"}
+        self.m.bus.store.x("INSERT INTO peers(host, ip, last_ok, agents) VALUES('pro', '100.4.4.4', 1, ?)",
+                           json.dumps([{"address": "pro/claude/app", "online": True, "last_seen": 1, "squad": tag}]))
+        self.m.net.peers["pro"] = {"ip": "100.4.4.4", "user": "eve@example.com"}  # someone else's "pro"
+        self.assertEqual(self.m.squads.squad("sq4")["members"][0].get("agent", ""), "")
+        self.m.net.peers["pro"]["user"] = "nick@example.com"
+        self.assertEqual(self.m.squads.squad("sq4")["members"][0]["agent"], "pro/claude/app")
 
 
 class Replication(unittest.TestCase):
@@ -278,6 +337,34 @@ class Replication(unittest.TestCase):
         pro.bus.discover(["air"])
         self.assertEqual(len(pro.squads.squad("sq1")["members"]), 2)
         self.assertEqual(air.squads.sum("sq1"), pro.squads.sum("sq1"))
+
+    def test_no_pull_from_another_users_machine(self):
+        """A peer of another tailnet user advertising sums is never asked for a squad."""
+        pro = Machine(self, "pro")
+        hello = {"squads": {"sq1": [9, "evil"]}, "squad_sums": {"sq1": "0" * 16}}
+        with mock.patch.object(bus, "request") as req, mock.patch.object(pro.squads, "merge") as merge:
+            pro.squads.sync_from("air", {"ip": "127.0.0.1", "port": 1, "user": "eve@example.com"}, hello)
+            pro.squads.sync_from("air", {"ip": "127.0.0.1", "port": 1}, hello)  # no user known
+            req.assert_not_called()
+            merge.assert_not_called()
+            pro.squads.sync_from("air", {"ip": "127.0.0.1", "port": 1, "user": "nick@example.com"}, hello)
+            req.assert_called_once()  # the same user's machine is asked
+
+    def test_merge_keeps_only_this_owners_squads(self):
+        """A same-user peer's reply that carries a squad of another owner, with newer revs, stores nothing."""
+        pro = Machine(self, "pro")
+        now = int(time.time() * 1000)
+        d = {"owner": "eve@example.com", "id": "sqE", "name": "Eve's", "rev": [now, "air"], "shares": [],
+             "members": [{"id": "m1", **member(), "rev": [now, "air"]}]}
+        for owner in ("eve@example.com", "", None, "nick@example.com "):
+            self.assertEqual(pro.squads.merge({**d, "owner": owner}), 0, owner)
+        self.assertEqual(pro.bus.store.q("SELECT * FROM squads"), [])
+        self.assertEqual(pro.bus.store.q("SELECT * FROM squad_members"), [])
+        with mock.patch.object(bus, "request", return_value={"squad": d}):
+            pro.squads.sync_from("air", {"ip": "127.0.0.1", "port": 1, "user": "nick@example.com"},
+                                 {"squad_sums": {"sqE": "1" * 16}})
+        self.assertEqual(pro.squads.ids(deleted=True), [])
+        self.assertEqual(pro.squads.merge({**d, "owner": "nick@example.com"}), 2)  # the same doc as its owner's
 
     def test_no_sync_from_another_user(self):
         air = Machine(self, "air", user="eve@example.com")
@@ -332,7 +419,7 @@ class Starting(unittest.TestCase):
     def setUp(self):
         self.m = Machine(self, "air")
         (self.m.tmp / "projects" / "app").mkdir(parents=True)
-        root = (self.m.tmp / "projects").resolve()
+        root = self.root = (self.m.tmp / "projects").resolve()
         p = mock.patch.object(bus, "STATE_DIR", self.m.tmp)
         p.start()
         self.addCleanup(p.stop)
@@ -364,10 +451,15 @@ class Starting(unittest.TestCase):
             with self.assertRaises(start.Refused) as c:
                 start.build(item, self.cfg, "safe", "air")
             self.assertEqual(c.exception.out["error"], err, item)
-        reg(self.m.bus, "s1", "app", squad={"id": "sq1", "member": "m1"})
+        reg(self.m.bus, "s1", "app", cwd=str(self.root / "app"), squad={"id": "sq1", "member": "m1"})
         with self.assertRaises(start.Refused) as c:
             start.build({"squad": {"id": "sq1", "member": "m1"}}, self.cfg, "safe", "air")
         self.assertEqual(c.exception.out["error"], "running")
+
+    def test_one_owner_only(self):
+        self.m.bus.store.x("INSERT INTO squads VALUES('old@example.com', 'sqO', '{}', 1, 'air', 0, 1)")
+        with self.assertRaises(start.Refused):  # the machine's login changed: whose squads are these?
+            start.build({"squad": {"id": "sq1", "member": "m1"}}, self.cfg, "safe", "air")
 
     def test_changed_since_the_last_start(self):
         con = start._db(self.m.tmp / "start.db")

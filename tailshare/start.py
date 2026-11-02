@@ -316,6 +316,8 @@ def squad_member(tag: object, host: str) -> tuple[dict, dict]:
         raise Refused("bad_request", "squad", "no squads on this host") from None
     try:
         con.row_factory = sqlite3.Row
+        if con.execute("SELECT COUNT(DISTINCT owner) FROM squads").fetchone()[0] > 1:  # the login changed here
+            raise Refused("bad_request", "squad", "squads of more than one owner on this host")
         heads = con.execute("SELECT * FROM squads WHERE id=? AND deleted=0", (tag["id"],)).fetchall()
         if len(heads) != 1:
             raise Refused("bad_request", "squad", "no such squad on this host")

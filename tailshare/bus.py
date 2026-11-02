@@ -399,6 +399,7 @@ class Bus:
         user = self._user_for(a)
         tmux = clean_tmux(a.get("tmux"))
         squad = clean_squad_tag(a.get("squad"))
+        squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:

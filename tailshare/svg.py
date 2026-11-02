@@ -1,8 +1,9 @@
 """The SVG subset squad and member icons may use, checked and re-serialized (docs/squads.md).
 
-One spec with the Hive app's parser: anything outside it is refused, never cleaned up, so what is stored is
-exactly what both sides would draw. The stdlib's expat parses, with DOCTYPE, entities, comments and
-processing instructions refused before they can do anything."""
+The same subset as the Hive app's parser, though the app may refuse some inputs this accepts. Anything
+outside the subset is refused, never cleaned up, and what is stored is one canonical ASCII form that both sides
+draw alike. The stdlib's expat parses, with DOCTYPE, entities, comments and processing instructions refused
+before they can do anything."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ MAX_ELEMENTS = 200
 MAX_DEPTH = 10
 MAX_SEGMENTS = 2000
 MAX_NUMBER = 1e6
+MIN_NUMBER = 1e-6  # smallest non-zero magnitude
 
 NS = "http://www.w3.org/2000/svg"
 ELEMENTS = {"svg", "g", "path", "circle", "ellipse", "rect", "line", "polyline", "polygon"}
@@ -33,9 +35,10 @@ TRANSFORMS = {"matrix": (6,), "translate": (1, 2), "scale": (1, 2), "rotate": (1
 # how many numbers each path command takes per repetition
 PATH_ARGS = {"m": 2, "l": 2, "h": 1, "v": 1, "c": 6, "s": 4, "q": 4, "t": 2, "a": 7, "z": 0}
 
-_NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
+_NUM = r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"  # ASCII digits: \d takes ٢
 _NUM_RE = re.compile(_NUM)
-_SEP = re.compile(r"[\s,]*")
+_W = "[ \t\n\r]"  # XML whitespace, not \s (which takes NBSP and the rest)
+_SEP = re.compile(r"[ \t\n\r,]*")
 _COLOR = re.compile(r"#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}")
 # what XML 1.0 allows (Char), less the BOM: anything else, NUL first, could make a parser guess UTF-16 or UCS-4
 _NOT_XML = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufefe\uff00-\ufffd\U00010000-\U0010ffff]")
@@ -49,7 +52,7 @@ def _number(s: str) -> float:
     if not re.fullmatch(_NUM, s):
         raise Bad(f"not a number: {s[:20]!r}")
     n = float(s)
-    if not math.isfinite(n) or abs(n) > MAX_NUMBER:
+    if not math.isfinite(n) or abs(n) > MAX_NUMBER or 0 < abs(n) < MIN_NUMBER:  # the app flushes those to 0
         raise Bad("number out of range")
     return n
 
@@ -59,10 +62,10 @@ def _fmt(n: float) -> str:
 
 
 def _numbers(s: str) -> list[float]:
-    s = s.strip()
+    s = s.strip(' \t\n\r')
     if not s:
         return []
-    parts = re.split(r"\s*,\s*|\s+", s)
+    parts = re.split(f"{_W}*,{_W}*|{_W}+", s)
     return [_number(p) for p in parts]
 
 
@@ -111,7 +114,7 @@ def _path(d: str, budget: list[int]) -> str:
 
 def _transform(s: str) -> str:
     out, i = [], 0
-    for m in re.finditer(r"\s*([a-z]+)\s*\(([^()]*)\)\s*,?", s):
+    for m in re.finditer(f"{_W}*([a-z]+){_W}*\\(([^()]*)\\){_W}*,?", s):
         if m.start() != i:
             raise Bad("transform")
         i = m.end()
@@ -151,11 +154,11 @@ def _value(el: str, name: str, v: str, budget: list[int]) -> str:
             raise Bad("viewBox")
         return " ".join(map(_fmt, nums))
     if name == "opacity":
-        n = _number(v.strip())
+        n = _number(v.strip(' \t\n\r'))
         if not 0 <= n <= 1:
             raise Bad("opacity")
         return _fmt(n)
-    n = _number(v.strip())  # geometry, width, height, stroke-width
+    n = _number(v.strip(' \t\n\r'))  # geometry, width, height, stroke-width
     if n < 0 and name in ("r", "rx", "ry", "width", "height", "stroke-width"):
         raise Bad(f"negative {name}")
     return _fmt(n)
@@ -173,6 +176,8 @@ def clean(text: object) -> str:
         raise Bad("icon must be a string")
     if _NOT_XML.search(text):
         raise Bad("character not allowed in XML, or a BOM")
+    if "&" in text:  # no entity or character references: nothing in the subset needs one
+        raise Bad("& not allowed")
     raw = text.encode()  # no lone surrogates left after the check: valid UTF-8
     if len(raw) > MAX_BYTES:
         raise Bad(f"icon over {MAX_BYTES // 1024} KB")
@@ -201,7 +206,7 @@ def clean(text: object) -> str:
             if " " in name:
                 raise Bad("namespaced attribute")
             if name in DROPPED.get(local, ()):
-                _number(attrs[name].strip().removesuffix("px"))
+                _number(attrs[name].strip(' \t\n\r').removesuffix("px"))
                 continue
             if name not in ATTRS[local]:
                 raise Bad(f"attribute {name!r} on {local}")
@@ -223,7 +228,7 @@ def clean(text: object) -> str:
             out.append(f"</{local}>")
 
     def chars(data):
-        if data.strip():
+        if data.strip(' \t\n\r'):
             raise Bad("text not allowed")
 
     p = expat.ParserCreate("UTF-8", namespace_separator=" ")  # whatever the document declares

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import posixpath
 import re
 import secrets
@@ -233,12 +234,41 @@ class Squads:
         tag = {"id": sid, "member": m["id"]}
         if m["host"] == self.bus.net.host:
             rows = [self.bus._agent(r) for r in self.store.q("SELECT * FROM agents WHERE squad=?", json.dumps(tag, sort_keys=True))]
-        else:
-            p = self.store.one("SELECT agents FROM peers WHERE host=?", m["host"])
+        else:  # only a machine of the squad's owner speaks for its members: a same-named host may be anyone's
+            peer = self.bus.net.peers.get(m["host"]) or {}
+            p = self.store.one("SELECT agents FROM peers WHERE host=?", m["host"]) if peer.get("user") == self.owner else None
             rows = [a for a in (json.loads(p["agents"]) if p else []) if isinstance(a, dict) and a.get("squad") == tag]
         rows = [a for a in rows if a.get("online")]
         rows.sort(key=lambda a: (a.get("last_seen") or 0, str(a.get("address"))))
         return str(rows[-1]["address"]) if rows else ""
+
+    def _machine(self, ip: str) -> bool:
+        """Whether `ip` is this machine or one that runs tailshare (it answered /hello), rather than a device."""
+        net = self.bus.net
+        host = net.host_for_ip(ip)
+        if ip == net.ip or host == net.host:
+            return True
+        if host and self.store.one("SELECT 1 FROM peers WHERE host=?", host):
+            return True
+        return bool(self.store.one("SELECT 1 FROM peers WHERE ip=?", ip))
+
+    def check_tag(self, tag: dict, aid: str, harness: str, cwd: str) -> dict:
+        """The squad tag an agent registers with, if it is that member: on this machine, of its kind, in its
+        folder, and no other live agent is it already (a `claude -p` inside a member's shell inherits the env).
+        Else {}: a tag decides who squadmates and the app talk to, and whether the member may be started."""
+        if not tag:
+            return {}
+        try:
+            d = self.squad(tag["id"])
+        except bus.BusError:
+            return {}
+        m = next((x for x in (d or {}).get("members", []) if x["id"] == tag["member"]), None)
+        if m is None or m["host"] != self.bus.net.host or m["kind"] != harness \
+                or not cwd or os.path.realpath(cwd) != os.path.realpath(m["folder"]):
+            return {}
+        other = self.store.one("SELECT 1 FROM agents WHERE squad=? AND id!=? AND last_seen>?",
+                               json.dumps(tag, sort_keys=True), aid, time.time() - bus.LIVE)
+        return {} if other else tag
 
     def ids(self, deleted: bool = False) -> list[str]:
         try:
@@ -278,9 +308,15 @@ class Squads:
         d = self.squad(sid)
         if d is None:
             return None
+        from .start import skips
+
         d.pop("shares", None)
-        if not share["show_paths"]:
-            for m in d["members"]:
+        for m in d["members"]:
+            st = m.get("start") or {}
+            # no options: they hold folders (add_dirs), a resume id, models; only whether it runs unasked
+            m["start"] = {"prompt": st.get("prompt") or "", "prompt_from": st.get("prompt_from") or "",
+                          "skip": skips(m["kind"], st.get("options") or {})}
+            if not share["show_paths"]:
                 m["folder"] = posixpath.basename(m["folder"]) or "/"
         return d
 
@@ -537,6 +573,10 @@ class Squads:
             raise bus.BusError("not found", 404)
         if not own:  # a sharee's writes, or anyone else's, never land
             raise bus.BusError("only the squad's owner can change it", 403)
+        if not local and self._machine(ip):
+            # a program on one of the owner's machines (this one included, by its tailnet IP) would skip the token
+            # the local API asks for: machines write through their own local API; the peer API is for devices
+            raise bus.BusError("squad edits from a machine go through its own local API: `tailshare squad edit`", 403)
         if local and (self.bus.keys is None or len(self.bus.keys.token) < 64
                       or not secrets.compare_digest(token.encode(), self.bus.keys.token.encode())):
             raise bus.BusError("local squad edits need ~/.tailshare/keys.token: use `tailshare squad edit`", 403)

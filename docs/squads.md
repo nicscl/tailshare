@@ -53,8 +53,9 @@ check. Your own edit of the text clears the mark; `tailshare squad edit` does th
 ## Sharing
 
 A share lets another tailnet user see a squad: `{"user": "alex@example.com", "can": ["see"], "show_paths":
-false}`. They get a copy without your share list and, unless `show_paths` is true, with each folder cut down to
-its last part. They cannot change it, and their machines do not store it. Seeing is all a share allows: it
+false}`. They get a copy without your share list and without members' start options (which hold folders, a
+resume id and models): of `start` only the prompt and `skip`, whether the member runs without asking. Unless
+`show_paths` is true, each folder is cut down to its last part. They cannot change it, and their machines do not store it. Seeing is all a share allows: it
 grants no messaging, attaching or starting.
 
 ## Starting a member
@@ -71,7 +72,9 @@ the request may not also set `kind`, `cwd`, `name`, `instructions` or `options`:
 every option must still be allowed by its `start.json`: a squad never widens what a machine accepts.
 
 The session runs in tmux session `squad-<name>`, one window per member, with `TAILSHARE_SQUAD` and
-`TAILSHARE_MEMBER` set, and registers on the bus as that member. A member that already has a live agent is
+`TAILSHARE_MEMBER` set, and registers on the bus as that member. The bus keeps an agent's squad tag only if
+the member runs on this machine, is of the agent's kind and has its folder, and no other live agent holds the
+tag (a `claude -p` run in a member's shell inherits the variables, and is not the member). A member that already has a live agent is
 refused (`running`). The plan says `changed` when the member's instructions differ from the last time it was
 started here.
 
@@ -101,9 +104,14 @@ On the local API (`127.0.0.1`) and the peer API, under `/bus/v1`:
 
 Every write carries `base_rev`, the rev it was read at. A stale one gets `409 {"error": "conflict", "squad"
 | "member": <current>}`; invalid input gets `400 {"error": "bad_request", "field": …, "reason": …}`. Writes are
-for the owner only: from the peer API, a machine or device of the same tailnet user; on the local API, a caller
-that sends `~/.tailshare/keys.token` as `X-Tailshare-Keys`, as `tailshare squad edit` does. A sharee's write
-gets 403.
+for the owner only; any other write, a sharee's for one, gets 403. The owner writes:
+
+- on the local API, a caller that sends `~/.tailshare/keys.token` as `X-Tailshare-Keys`, as `tailshare squad
+  edit` does. Every process of that account can read the file, an agent's included: the check keeps agents
+  from editing squads by accident or through the plain API, not one set on reading the token.
+- on the peer API, a device of the same tailnet user (the Hive app). Not a machine: neither this one, by its
+  tailnet address, nor one that runs tailshare (it has answered `/hello`). Those write through their own local
+  API, so the token cannot be stepped around through the peer API.
 
 Each agent in `/hello` carries `squad: {id, member}` when it is a squad member, for the owner's machines and
 devices only.
