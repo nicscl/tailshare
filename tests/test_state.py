@@ -184,13 +184,37 @@ class Skip(unittest.TestCase):
         return {a["address"]: a.get("skip") for a in self.b.hello(ip)["agents"]}
 
     def test_modes(self):
-        self.assertEqual(bus.SKIP_MODES, ("bypassPermissions", "auto"))  # auto counts until Nicholas rules on it
-        for mode, want in [("bypassPermissions", True), ("auto", True), ("default", False), ("plan", False),
+        self.assertEqual(bus.SKIP_MODES, ("bypassPermissions",))  # auto is its own mode (Nicholas, 2026-11-02)
+        for mode, want in [("bypassPermissions", True), ("auto", False), ("default", False), ("plan", False),
                            ("acceptEdits", False), ("dontAsk", False)]:
             self.assertEqual(bus.hook_skip(hook("Stop", permission_mode=mode)), ("S", want), mode)
         for d in (hook("Stop"), hook("Stop", permission_mode=""), hook("Stop", permission_mode=["auto"]),
                   {"permission_mode": "auto"}, {"session_id": 7, "permission_mode": "auto"}):
             self.assertEqual(bus.hook_skip(d), ("", None), d)
+
+    def test_permission_mode_is_the_hooks_own(self):
+        modes = lambda ip="100.1.1.1": {a["address"]: a.get("permission_mode") for a in self.b.hello(ip)["agents"]}
+        self.assertEqual(modes(), {"pro/claude/api": None, "pro/claude/web": None})
+        self.b.report_state(hook("Stop", permission_mode="auto"))
+        self.assertEqual((modes()["pro/claude/api"], self.skips()["pro/claude/api"]), ("auto", False))
+        self.b.report_state(hook("Stop", permission_mode="bypassPermissions"))
+        self.assertEqual((modes()["pro/claude/api"], self.skips()["pro/claude/api"]), ("bypassPermissions", True))
+        self.b.report_state(hook("Stop", permission_mode="yolo"))  # not a mode tailshare knows: none, and no skip
+        self.assertEqual((modes()["pro/claude/api"], self.skips()["pro/claude/api"]), (None, False))
+        self.b.report_state(hook("Stop", permission_mode="auto"))
+        for pid in (777, 0):  # registering again keeps it, with or without a pid
+            self.b.register({"id": "S", "harness": "claude", "cwd": "/x/api", "pid": pid})
+            self.assertEqual(modes()["pro/claude/api"], "auto", pid)
+        for ip in ("100.2.2.2", "100.3.3.3", "100.9.9.9"):  # the owner only, like skip
+            self.assertTrue(all("permission_mode" not in a for a in self.b.hello(ip)["agents"]), ip)
+        self.assertTrue(all("permission_mode" not in a for a in self.b.hello()["agents"]))
+        air = make_bus("air", StaticNet("air", peers={"pro": {"ip": "127.0.0.1", "port": free_port(), "online": True}}))
+        air.store.x("INSERT INTO peers(host, last_ok, agents) VALUES('pro', 1, ?)", json.dumps(
+            [{"address": "pro/claude/a", "permission_mode": "auto"}, {"address": "pro/claude/b", "permission_mode": "x"},
+             {"address": "pro/claude/c", "permission_mode": ["auto"]}, {"address": "pro/claude/d"}]))
+        got = {a["address"]: a.get("permission_mode", "absent") for a in air.directory()["agents"] if a["host"] == "pro"}
+        self.assertEqual(got, {"pro/claude/a": "auto", "pro/claude/b": "absent", "pro/claude/c": "absent",
+                               "pro/claude/d": "absent"})
 
     def test_follows_the_hooks_and_is_unknown_until_one(self):
         self.assertEqual(self.skips(), {"pro/claude/api": None, "pro/claude/web": None})  # omitted, never guessed
@@ -209,7 +233,7 @@ class Skip(unittest.TestCase):
         self.assertIsNone(self.b.store.one("SELECT 1 FROM agents WHERE id='nobody'"))
 
     def test_only_the_owner_sees_it(self):
-        self.b.report_state(hook("Stop", permission_mode="auto"))
+        self.b.report_state(hook("Stop", permission_mode="bypassPermissions"))
         self.assertIs(self.skips("100.1.1.1")["pro/claude/api"], True)
         for ip in ("100.2.2.2", "100.3.3.3", "100.9.9.9"):  # another user, a tagged device, an unknown caller
             self.assertTrue(all("skip" not in a for a in self.b.hello(ip)["agents"]), ip)

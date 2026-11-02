@@ -290,9 +290,14 @@ class Views(unittest.TestCase):
             "options": {"add_dirs": ["/u/secret/clientX"], "resume": "0b6c7d1e-aaaa", "permission_mode": "bypassPermissions"},
             "prompt": "go", "prompt_from": "alex@example.com"})
         alex = self.get("100.2.2.2", "/squads/sq1")["squad"]["members"][0]
-        self.assertEqual(alex["start"], {"prompt": "go", "prompt_from": "alex@example.com", "skip": True})
+        self.assertEqual(alex["start"], {"prompt": "go", "prompt_from": "alex@example.com", "skip": True,
+                                         "auto": False})
         self.assertNotIn("/u/secret", json.dumps(alex))
         self.assertIn("add_dirs", self.get("100.1.1.1", "/squads/sq1")["squad"]["members"][0]["start"]["options"])
+        m = self.m.squads.squad("sq1")["members"][0]
+        self.m.patch("sq1/members/m1", base_rev=m["rev"], start={"options": {"permission_mode": "auto"}, "prompt": "go"})
+        alex = self.get("100.2.2.2", "/squads/sq1")["squad"]["members"][0]
+        self.assertEqual((alex["start"]["skip"], alex["start"]["auto"]), (False, True))  # its own label, not skipping
 
     def test_no_unsigned_writes_on_the_peer_api(self):
         """A program on this machine (by its tailnet IP) or on another of the owner's tailshare machines would

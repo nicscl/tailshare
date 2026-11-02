@@ -193,8 +193,9 @@ caller never gets it), each agent in `/hello` carries `skip: true` when it runs 
 asks, and nothing when that is not known. This is a display hint, not a security signal: any local process can
 post a hook or start a process with misleading flags, so a missing or false `skip` never means an agent is safe.
 - Claude: from the `permission_mode` in each of its hooks, so it follows a mode change mid-session. Modes
-  `bypassPermissions` and `auto` count as skip (`bus.SKIP_MODES`, the same set as start.json's). Unknown until
-  its first hook.
+  `bypassPermissions` counts as skip (`bus.SKIP_MODES`, the same set as start.json's). `auto` does not: Claude
+  decides when to ask. The owner also gets the mode itself as `permission_mode` (one of Claude's modes), so
+  the app can mark `auto` on its own. Unknown until its first hook.
 - Codex: from its real argv (macOS `kern.procargs2`, Linux `/proc`), read once per process when it registers, and
   only for a process of the account the mailbox runs as whose program is `codex`. A prompt is one argument, so
   what it says is never taken for a flag. `--dangerously-bypass-approvals-and-sandbox` (`--yolo`) or a

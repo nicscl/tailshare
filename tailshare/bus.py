@@ -165,9 +165,16 @@ def clean_state(s: object) -> dict | None:
     return out
 
 
-# Claude permission modes that run without asking. auto counts until Nicholas decides otherwise; start.json's
-# skip check should use this same set, so that decision is this one line.
-SKIP_MODES = ("bypassPermissions", "auto")
+# Claude permission modes that run without asking, as start.skips() counts them. auto is not one: Claude
+# decides when to ask (Nicholas, 2026-11-02), so it is shown as its own mode, not as skipping.
+SKIP_MODES = ("bypassPermissions",)
+CLAUDE_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")
+
+
+def hook_mode(d: dict) -> str:
+    """A Claude Code hook's permission_mode when it is one tailshare knows, else ""."""
+    mode = d.get("permission_mode")
+    return mode if isinstance(mode, str) and mode in CLAUDE_MODES else ""
 
 
 def hook_skip(d: dict) -> tuple[str, bool | None]:
@@ -451,7 +458,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "squad"), ("agents", "skip")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "squad"), ("agents", "skip"), ("agents", "mode")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -523,9 +530,10 @@ class Bus:
         tmux = clean_tmux(a.get("tmux"))
         squad = clean_squad_tag(a.get("squad"))
         pid = int(a.get("pid") or 0)
-        was = self.store.one("SELECT pid, skip FROM agents WHERE id=?", aid)
+        was = self.store.one("SELECT pid, skip, mode FROM agents WHERE id=?", aid)
         # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's
         skip = was["skip"] if was and (was["pid"] == pid or harness != "codex") else ""
+        mode = was["mode"] if was and harness != "codex" else ""  # Claude's permission_mode, from its hooks
         if harness == "codex" and pid and not (was and was["pid"] == pid):  # once per process, outside the lock
             skip = {True: "1", False: "0", None: ""}[pid_skip(pid)]
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
@@ -540,13 +548,13 @@ class Bus:
                 clash = any(r["address"].split(":")[0] == base for r in live)
                 address = f"{base}:{slug(aid)[:4]}" if clash else base
             self.store.x(
-                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux, squad, skip)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
+                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux, squad, skip, mode)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
                 " harness=excluded.harness, cwd=excluded.cwd, session=excluded.session,"
                 " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user, tmux=excluded.tmux,"
-                " squad=excluded.squad, skip=excluded.skip",
+                " squad=excluded.squad, skip=excluded.skip, mode=excluded.mode",
                 aid, address, harness, cwd, session, pid, now, now, user,
-                json.dumps(tmux) if tmux else "", json.dumps(squad, sort_keys=True) if squad else "", skip,
+                json.dumps(tmux) if tmux else "", json.dumps(squad, sort_keys=True) if squad else "", skip, mode,
             )
             self._claim(aid, address, user)
         return self.agent(aid)
@@ -592,13 +600,14 @@ class Bus:
             "state": json.loads(r["state"]) if r["state"] else None,
             "squad": json.loads(r["squad"]) if r["squad"] else None,
             "skip": {"1": True, "0": False}.get(r["skip"]),  # a display hint (hook_skip): None when unknown
+            "permission_mode": r["mode"] or None,  # Claude's, from its hooks (hook_mode): a hint like skip
         }
 
     def report_state(self, d: dict) -> dict:
         """What an agent's harness says it is doing, from its hooks. Only agents that registered count."""
         sid, skip = hook_skip(d)
         if skip is not None:  # every hook says the mode, which Shift+Tab can change mid-session
-            self.store.x("UPDATE agents SET skip=? WHERE id=?", "1" if skip else "0", sid)
+            self.store.x("UPDATE agents SET skip=?, mode=? WHERE id=?", "1" if skip else "0", hook_mode(d), sid)
         aid, state, reason = hook_state(d)
         if not state:
             return {"ok": False}
@@ -641,6 +650,8 @@ class Bus:
                          state=clean_state(a.get("state")))
                 if not isinstance(a.get("skip"), bool):  # a JSON boolean or nothing
                     a.pop("skip", None)
+                if a.get("permission_mode") not in CLAUDE_MODES:  # a mode tailshare knows, or nothing
+                    a.pop("permission_mode", None)
                 out.append(a)
         return {"host": self.net.host, "agents": out}
 
@@ -767,10 +778,12 @@ class Bus:
             battery = self.battery.for_caller(own=own)
             if battery:
                 out["power"] = battery
-            if own:  # which agents run without asking: the owner's machines and devices only
+            if own:  # which agents run without asking, and in which mode: the owner's machines and devices only
                 for a, f in zip(agents, full):
                     if f["skip"] is not None:
                         a["skip"] = f["skip"]
+                    if f["permission_mode"]:
+                        a["permission_mode"] = f["permission_mode"]
             if own:  # what a start key may start here (tailshare/start.py); never the folders
                 from . import start
 

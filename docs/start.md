@@ -16,6 +16,7 @@ machine that should accept starts.
   "roots": ["~/Projects"],
   "max_running": 12,
   "skip_permissions": false,
+  "auto": false,
   "kinds": {
     "claude": {"options": ["permission_mode", "model", "effort", "resume", "add_dirs", "skip_permissions"]},
     "codex": {"options": ["approval", "sandbox", "model"], "bin": "/opt/homebrew/bin/codex"}
@@ -30,6 +31,7 @@ machine that should accept starts.
   `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and must not be writable by others.
 - `max_running`: how many windows tailshare-started sessions may have open at once (1 to 100, default 12).
 - `skip_permissions`: whether a session may run with permissions skipped at all (see below). Default false.
+- `auto`: whether a Claude session may run in auto mode (`permission_mode: auto`, see below). Default false.
 
 tailshare running as root never starts anything.
 
@@ -129,7 +131,7 @@ These all count as skipping permissions:
 
 | kind | values |
 |---|---|
-| claude | `skip_permissions: true`, `permission_mode: bypassPermissions`, `permission_mode: auto` |
+| claude | `skip_permissions: true`, `permission_mode: bypassPermissions` |
 | codex | `skip_permissions: true`, `sandbox: danger-full-access` |
 
 Each needs all three: `skip_permissions: true` in the machine's config, the key granted `--start=skip`, and the
@@ -138,6 +140,13 @@ skipped runs any command without asking.
 
 This is the one place tailshare starts sessions that may skip permissions. Relaunching an old session
 ([sessions.md](sessions.md)) still never accepts `bypassPermissions`.
+
+## Auto mode
+
+Claude's `permission_mode: auto` is its own mode, not skipping permissions: Claude decides which actions to
+take without asking, with its own checks. It needs `auto: true` in the machine's config and `permission_mode`
+among the options allowed for claude; it does not need the `--start=skip` grant. The plan says `"auto": true`
+so the app can label it. Without `auto: true` it is refused (`not_allowed`, field `options.permission_mode`).
 
 ## Limits and errors
 
@@ -160,6 +169,8 @@ This is the one place tailshare starts sessions that may skip permissions. Relau
 
 ## What a device can see
 
-`/hello` carries a `start` block (`kinds`, the options per kind and whether `skip` is possible) only to devices
+`/hello` carries a `start` block (`kinds`, the options per kind, whether `skip` is possible and, when claude's options include
+`permission_mode`, `permission_modes: {"claude": [...]}`, the modes a device may pick: `auto` only with `auto:
+true`, `bypassPermissions` only with `skip_permissions: true`) only to devices
 of the machine's own tailnet user, and only when starting is on. `GET /bus/v1/sessions/start/folders` lists the
 folders under the roots (two levels deep, at most 200, no hidden folders or symlinks) to the same devices only.
