@@ -304,12 +304,62 @@ def argv_for(kind: str, exe: str, cwd: str, name: str, opts: dict, instructions:
     return a
 
 
+def squad_member(tag: object, host: str) -> tuple[dict, dict]:
+    """(squad header, member) for a start's `squad: {id, member}`, from this machine's own copy of its owner's
+    squads (docs/squads.md), read-only. The member must be one that runs on this machine."""
+    if not isinstance(tag, dict) or not bus.clean_squad_tag(tag):
+        raise Refused("bad_request", "squad", "{id, member}")
+    path = bus.STATE_DIR / "bus.db"
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        raise Refused("bad_request", "squad", "no squads on this host") from None
+    try:
+        con.row_factory = sqlite3.Row
+        heads = con.execute("SELECT * FROM squads WHERE id=? AND deleted=0", (tag["id"],)).fetchall()
+        if len(heads) != 1:
+            raise Refused("bad_request", "squad", "no such squad on this host")
+        h = heads[0]
+        m = con.execute("SELECT * FROM squad_members WHERE owner=? AND squad=? AND id=? AND deleted=0",
+                        (h["owner"], h["id"], tag["member"])).fetchone()
+        if m is None:
+            raise Refused("bad_request", "squad.member", "no such member in the squad")
+        live = con.execute("SELECT 1 FROM agents WHERE squad=? AND last_seen>?",
+                           (json.dumps({"id": tag["id"], "member": tag["member"]}, sort_keys=True),
+                            time.time() - bus.LIVE)).fetchone()
+    except sqlite3.Error:
+        raise Refused("bad_request", "squad", "no squads on this host") from None
+    finally:
+        con.close()
+    head, member = {"id": h["id"], **json.loads(h["doc"])}, {"id": m["id"], **json.loads(m["doc"])}
+    if member["host"] != host:
+        raise Refused("bad_request", "squad.member", f"this member runs on {member['host']}, not {host}")
+    if live:
+        raise Refused("running", "squad.member", "this member's agent is already running")
+    return head, member
+
+
+def _from_squad(item: dict, host: str) -> tuple[dict, dict]:
+    """The item a squad member stands for: kind, folder, name, instructions, options and prompt from the squad;
+    a prompt in the request takes the squad's place, and device_name is the request's."""
+    head, m = squad_member(item.get("squad"), host)
+    for k in ("kind", "cwd", "name", "instructions", "options"):
+        if item.get(k) not in (None, "", {}):
+            raise Refused("bad_request", k, "a squad member's comes from the squad")
+    st = m.get("start") or {}
+    out = {"kind": m["kind"], "cwd": m["folder"], "name": m["name"], "instructions": m.get("instructions") or "",
+           "options": st.get("options") or {}, "prompt": item.get("prompt") or st.get("prompt") or "",
+           "device_name": item.get("device_name"), "_session": item.get("_session")}
+    return out, {"id": head["id"], "name": head["name"], "member": m["id"]}
+
+
 def build(item: object, cfg: dict, grant: str, host: str) -> dict:
-    """The plan for one start, or Refused. Deterministic for the same item, config and grant."""
+    """The plan for one start, or Refused. Deterministic for the same item, config, grant and squad."""
     if not isinstance(item, dict):
         raise Refused("bad_request")
+    squad = None
     if item.get("squad") is not None:
-        raise Refused("bad_request", "squad", "squads are not supported on this host yet")
+        item, squad = _from_squad(item, host)
     kind = item.get("kind")
     if kind not in KINDS:
         raise Refused("bad_request", "kind")
@@ -332,12 +382,14 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         session = opts.get("resume") or session
     exe = binary(kind, cfg)
     env = {"TAILSHARE_AGENT_NAME": name, "TAILSHARE_STARTED_BY": device or "a device",
+           **({"TAILSHARE_SQUAD": squad["id"], "TAILSHARE_MEMBER": squad["member"]} if squad else {}),
            "PATH": os.pathsep.join(dict.fromkeys([os.path.dirname(exe), os.path.expanduser("~/.local/bin"),
                                                   "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))}
     return {"host": host, "kind": kind, "cwd": cwd, "name": name, "options": opts, "skip": skip,
             "argv": argv_for(kind, exe, cwd, name, opts, instructions and INSTRUCTIONS, prompt and PROMPT, session), "env": env,
             "prompt": prompt,
-            "tmux": {"session": SESSION, "window": slug(name)}, "session": session,
+            "tmux": {"session": squad_session(squad["name"]) if squad else SESSION, "window": slug(name)},
+            "session": session, **({"squad": squad} if squad else {}),
             "instructions": instructions,
             "instructions_sha256": hashlib.sha256(instructions.encode()).hexdigest() if instructions else ""}
 
@@ -395,6 +447,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, key TEXT NOT NULL, item TEXT NOT NULL, plan TEXT NOT NULL,
   created REAL NOT NULL, expires REAL NOT NULL, used REAL, result TEXT);
 CREATE TABLE IF NOT EXISTS confirms(key TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS member_starts(squad TEXT NOT NULL, member TEXT NOT NULL, instructions_sha256 TEXT NOT NULL,
+  at REAL NOT NULL, PRIMARY KEY(squad, member));
 """
 
 
@@ -415,8 +469,24 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
     return con
 
 
+def squad_session(name: str) -> str:
+    return "squad-" + slug(name).replace(".", "-")  # tmux reads "." in a target as a pane
+
+
 def _canon(d: dict) -> str:
-    return json.dumps(d, sort_keys=True, separators=(",", ":"))
+    return json.dumps({k: v for k, v in d.items() if k != "changed"}, sort_keys=True, separators=(",", ":"))
+
+
+def _changed(con: sqlite3.Connection, plan: dict) -> str:
+    """For a squad member: whether its instructions differ from the last time it was started here."""
+    sq = plan.get("squad")
+    if not sq:
+        return ""
+    r = con.execute("SELECT instructions_sha256, at FROM member_starts WHERE squad=? AND member=?",
+                    (sq["id"], sq["member"])).fetchone()
+    if r is None or r["instructions_sha256"] == plan["instructions_sha256"]:
+        return ""
+    return f"instructions changed since this member last started ({time.strftime('%Y-%m-%d %H:%M', time.localtime(r['at']))})"
 
 
 def dry_run(con: sqlite3.Connection, starts: object, cfg: dict, grant: str, key: str, host: str) -> list[dict]:
@@ -448,6 +518,9 @@ def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: 
         pid, now = secrets.token_hex(16), time.time()
         con.execute("INSERT INTO plans(id, key, item, plan, created, expires) VALUES(?,?,?,?,?,?)",
                     (pid, key, json.dumps(item), _canon(plan), now, now + PLAN_TTL))
+        changed = _changed(con, plan)
+        if changed:
+            plan = {**plan, "changed": changed}
         out.append({"plan_id": pid, "expires": round(now + PLAN_TTL), "plan": plan})
     return out
 
@@ -496,6 +569,9 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
         con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(e.out), pid))
         raise
     con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(result), pid))
+    if plan.get("squad"):
+        con.execute("INSERT OR REPLACE INTO member_starts(squad, member, instructions_sha256, at) VALUES(?,?,?,?)",
+                    (plan["squad"]["id"], plan["squad"]["member"], plan["instructions_sha256"], time.time()))
     return result
 
 
