@@ -490,6 +490,15 @@ class Starting(unittest.TestCase):
             start.build({"squad": {"id": "sq1", "member": "m1"}}, self.cfg, "safe", "air")
         self.assertEqual(c.exception.out["error"], "running")
 
+    def test_a_claude_member_gets_a_session_id(self):
+        con = start._db(self.m.tmp / "start.db")
+        self.addCleanup(con.close)
+        out = start.dry_run(con, [{"squad": {"id": "sq1", "member": "m1"}, "device_name": "iPhone"}], self.cfg, "safe",
+                            "key", "air")
+        plan = out[0]["plan"]
+        self.assertRegex(plan["session"], r"^[0-9a-f-]{36}$")
+        self.assertIn(f"--session-id={plan['session']}", plan["argv"])
+
     def test_one_owner_only(self):
         self.m.bus.store.x("INSERT INTO squads VALUES('old@example.com', 'sqO', '{}', 1, 'air', 0, 1)")
         with self.assertRaises(start.Refused):  # the machine's login changed: whose squads are these?
