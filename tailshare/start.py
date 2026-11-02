@@ -510,9 +510,9 @@ def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: 
     for item in starts:
         try:
             if isinstance(item, dict):
-                item = {k: v for k, v in item.items() if not k.startswith("_")}
-                if item.get("kind") == "claude":
-                    item["_session"] = str(uuid.uuid4())
+                # every item gets one: a squad member's kind is only known once build() reads the squad,
+                # and build() keeps it only for a Claude start that does not resume
+                item = {**{k: v for k, v in item.items() if not k.startswith("_")}, "_session": str(uuid.uuid4())}
             plan = build(item, cfg, grant, host)
         except Refused as e:
             out.append(e.out)
