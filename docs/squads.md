@@ -138,7 +138,8 @@ tailshare-squad-write/1
 ```
 
 The path is the raw one in the request line, not decoded or normalized: sign exactly the bytes you send. The
-query string is not signed, and writes do not read it. It is signed as `ssh-keygen -Y sign -n tailshare-squads` signs (SSHSIG, sha256). It is sent in headers:
+query string is not signed, so a write with one (even a bare `?`) is refused with `400 bad_request`, field
+`query`. It is signed as `ssh-keygen -Y sign -n tailshare-squads` signs (SSHSIG, sha256). It is sent in headers:
 `X-Tailshare-Key` (the key id, `k` and 12 hex), `X-Tailshare-Time`, `X-Tailshare-Nonce` and
 `X-Tailshare-Signature` (the SSHSIG blob in base64, without the armor lines). The time may be at most 60 s from
 the machine's clock, and a nonce is used once. A refusal is `403 {"error": "signature", "reason": …}`, where

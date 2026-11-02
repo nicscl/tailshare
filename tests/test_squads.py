@@ -667,8 +667,8 @@ class Signed(unittest.TestCase):
         url = self.m.serve(self)
         self.m.net.usermap["127.0.0.1"] = "nick@example.com"
 
-        def send(raw, headers):
-            req = urllib.request.Request(url + "/squads/sq1", raw, {"X-Tailshare": "1", **headers}, method="PATCH")
+        def send(raw, headers, query=""):
+            req = urllib.request.Request(url + "/squads/sq1" + query, raw, {"X-Tailshare": "1", **headers}, method="PATCH")
             try:
                 with urllib.request.urlopen(req, timeout=10) as r:
                     return r.status, json.load(r)
@@ -678,6 +678,9 @@ class Signed(unittest.TestCase):
         raw = self.body("Over HTTP")
         code, out = send(raw.replace(b", ", b",  "), self.sign(self.plan, raw))  # same JSON, other bytes
         self.assertEqual((code, out["error"], out["reason"]), (403, "signature", "bad_signature"))
+        for query in ("?x", "?", "?tombstones=1"):  # the query is not signed, so a write may not carry one
+            code, out = send(raw, self.sign(self.plan, raw), query)
+            self.assertEqual((code, out["error"], out["field"]), (400, "bad_request", "query"), query)
         code, out = send(raw, self.sign(self.plan, raw))
         self.assertEqual((code, out["squad"]["name"]), (200, "Over HTTP"))
 
