@@ -101,7 +101,8 @@ FIDO security key (`ed25519-sk`), which only signs after a physical touch. The r
 3. The nonce was never used before (stored until it expires): one signature, one launch.
 4. The session exists here, is a Claude Code session, and its folder matches the signed `cwd`.
 5. The mode is one of `manual`, `plan`, `dontAsk`, `acceptEdits`, `auto`. **`bypassPermissions` is never
-   accepted**, signed or not.
+   accepted**, signed or not. (Starting a *new* session from a device with a start key is a separate path with
+   its own skip rule: see [start.md](start.md).)
 6. The session is not running right now (on the bus or in `claude agents`): `--bg` would start a second copy.
    Message the running one instead.
 7. tailshare is not running as root. The two servers run it as root, so they never launch.

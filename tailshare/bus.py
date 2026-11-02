@@ -604,9 +604,16 @@ class Bus:
                 self.net.refresh()
             out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
             u = out["you"]["user"]  # tagged machines have no owner: other tagged devices aren't own
-            battery = self.battery.for_caller(own=bool(u) and u != "tagged-devices" and u == self.net.user)
+            own = bool(u) and u != "tagged-devices" and u == self.net.user
+            battery = self.battery.for_caller(own=own)
             if battery:
                 out["power"] = battery
+            if own:  # what a start key may start here (tailshare/start.py); never the folders
+                from . import start
+
+                caps = start.capabilities()
+                if caps:
+                    out["start"] = caps
         return out
 
     def _pane_alive(self, t: dict) -> bool:
@@ -719,6 +726,15 @@ class Bus:
             raise BusError("auto-update is off on this machine", 409)
         self.require_same_user(ip)
         return self.updater.trigger()
+
+    def start_folders(self, ip: str) -> dict:
+        """The folders a start may use, for the owner's own devices: they say what is on this machine."""
+        from . import start
+
+        self.require_same_user(ip)
+        if not self.net.user or self.net.user == "tagged-devices":
+            raise BusError("this machine has no single tailnet owner", 403)
+        return {"folders": start.folders()}
 
     def require_same_user(self, ip: str) -> None:
         """Only machines owned by this machine's tailnet user may update it or read its sessions."""
@@ -966,6 +982,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello(ip))
+                if (method, path) == ("GET", "/sessions/start/folders"):
+                    return self._reply(200, b.start_folders(ip))
                 if (method, path) == ("GET", "/peers"):
                     return self._reply(200, {"peers": b.peer_list(ip)})
                 if (method, path) == ("POST", "/hive/pair"):
