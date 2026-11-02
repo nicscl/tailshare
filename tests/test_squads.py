@@ -2,6 +2,7 @@
 machines. Everything runs on temp state and loopback buses; nothing touches ~/.tailshare or a real tmux."""
 
 import hashlib
+import http.client
 import json
 import os
 import secrets
@@ -11,8 +12,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -664,21 +663,20 @@ class Signed(unittest.TestCase):
         self.assertIn("owner", str(c.exception))
 
     def test_over_http_the_exact_bytes_are_signed(self):
-        url = self.m.serve(self)
+        self.m.serve(self)
         self.m.net.usermap["127.0.0.1"] = "nick@example.com"
 
-        def send(raw, headers, query=""):
-            req = urllib.request.Request(url + "/squads/sq1" + query, raw, {"X-Tailshare": "1", **headers}, method="PATCH")
-            try:
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    return r.status, json.load(r)
-            except urllib.error.HTTPError as e:
-                return e.code, json.load(e)
+        def send(raw, headers, query=""):  # http.client sends the target as given (urllib drops a #fragment)
+            c = http.client.HTTPConnection("127.0.0.1", self.m.bus.port, timeout=10)
+            self.addCleanup(c.close)
+            c.request("PATCH", "/bus/v1/squads/sq1" + query, raw, {"X-Tailshare": "1", **headers})
+            r = c.getresponse()
+            return r.status, json.load(r)
 
         raw = self.body("Over HTTP")
         code, out = send(raw.replace(b", ", b",  "), self.sign(self.plan, raw))  # same JSON, other bytes
         self.assertEqual((code, out["error"], out["reason"]), (403, "signature", "bad_signature"))
-        for query in ("?x", "?", "?tombstones=1"):  # the query is not signed, so a write may not carry one
+        for query in ("?x", "?", "?tombstones=1", ";x", ";", "#x", "#"):  # not signed, so a write may not carry one
             code, out = send(raw, self.sign(self.plan, raw), query)
             self.assertEqual((code, out["error"], out["field"]), (400, "bad_request", "query"), query)
         code, out = send(raw, self.sign(self.plan, raw))

@@ -1017,8 +1017,10 @@ class _Handler(BaseHTTPRequestHandler):
                     raise BusError("squads are not available on this machine", 409)
                 from .keys import SIGNED_HEADERS
 
-                if method != "GET" and "?" in self.path:  # a signature does not cover the query: writes take none
-                    raise BusError("bad_request", 400, {"field": "query", "reason": "squad writes take no query string"})
+                if method != "GET" and any(c in self.path for c in "?;#"):
+                    # urlparse splits these off the path, so a signature would not cover them: writes take none
+                    raise BusError("bad_request", 400, {"field": "query",
+                                                        "reason": "squad writes take no query, ;params or #fragment"})
                 signed = {h: self.headers.get(h, "") for h in SIGNED_HEADERS}
                 return self._reply(200, b.squads.route(method, path, body, local, ip, qs,
                                                        self.headers.get("X-Tailshare-Keys", ""),
