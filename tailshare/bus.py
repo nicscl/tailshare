@@ -184,7 +184,6 @@ _CODEX_BOOL = {"--strict-config", "--oss", "--approve-for-me", "--full-auto", "-
                "--worktree", "--search", "--no-alt-screen", "--no-daemon", "--skip-git-repo-check", "--ephemeral",
                "--ignore-user-config", "--ignore-rules", "--json", "--last", "--all", "--include-non-interactive"}
 _CODEX_BYPASS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo"}
-_CODEX_SESSIONS = {"exec", "e", "resume", "fork", "review"}  # subcommands that run a session from these flags
 _CODEX_COMMANDS = {"agents", "login", "logout", "mcp", "mcp-server", "plugin", "app-server", "remote-control", "app",
                    "completion", "update", "doctor", "sandbox", "debug", "apply", "a", "queue", "archive", "delete",
                    "migrate-rollouts", "unarchive", "cloud", "exec-server", "features", "help"}
@@ -235,12 +234,19 @@ def proc_argv(pid: int) -> list[str] | None:
     space-joined args; None if it cannot be read."""
     try:
         if sys.platform.startswith("linux"):
-            return open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")[:-1] or None
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+            if argv and argv[-1] == "":  # the closing NUL; a process that rewrote its argv may have none
+                argv.pop()
+            return argv or None
         if sys.platform != "darwin":
             return None
         import ctypes
 
         libc = ctypes.CDLL("/usr/lib/libc.dylib", use_errno=True)
+        libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        libc.sysctl.restype = ctypes.c_int
         mib, size = (ctypes.c_int * 3)(1, 49, pid), ctypes.c_size_t(0)  # CTL_KERN, KERN_PROCARGS2
         if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or not 4 < size.value <= 4 << 20:
             return None

@@ -248,6 +248,9 @@ class Skip(unittest.TestCase):
                            ([c, "fix it", "--yolo"], True), ([c, "exec", "-s", "danger-full-access", "go"], True),
                            ([c, "resume", "--last", "--approve-for-me"], False),
                            ([c, "--", "--yolo"], None), ([c, "-m", "--yolo"], None),  # a value, not a flag
+                           ([c, "-s", "danger-full-access", "--", "-s", "read-only"], True),  # after --: the prompt
+                           ([c, "-c"], None), ([c, "--yolo", "-m"], None), ([c, "--sandbox"], None),  # missing values
+                           ([c, "go", "-s", "danger-full-access"], True), ([c, "go", "--new-flag"], None),
                            # unclear: say nothing
                            ([c, "-s", "read-only", "-c", "sandbox_mode=danger-full-access"], None),
                            ([c, "--new-flag", "-s", "danger-full-access"], None), ([c, "--yolo=1"], None),
@@ -291,9 +294,18 @@ class Skip(unittest.TestCase):
         self.assertIsNone(bus.pid_skip(0))
         self.assertIsNone(bus.pid_skip(1))
 
+    def test_linux_argv(self):
+        for raw, want in [(b"codex\0--yolo\0go\0", ["codex", "--yolo", "go"]), (b"codex\0--yolo", ["codex", "--yolo"]),
+                          (b"codex\0\0", ["codex", ""]), (b"", None)]:
+            with mock.patch.object(bus.sys, "platform", "linux"), \
+                    mock.patch("builtins.open", mock.mock_open(read_data=raw)) as f:
+                self.assertEqual(bus.proc_argv(42), want, raw)
+                f.return_value.__exit__.assert_called()  # closed
+
     def test_codex_pid_is_the_codex_ancestor(self):
-        agent._codex_pid.cache_clear()
-        self.addCleanup(agent._codex_pid.cache_clear)
+        p = mock.patch.object(agent, "_codex_found", 0)
+        p.start()
+        self.addCleanup(p.stop)
         parent = 9
         table = "\n".join(["  9   8 /bin/zsh -l", "  8   7 /Users/n/.codex/bin/codex --yolo", "  7   6 node /opt/homebrew/bin/codex --yolo",
                             "  6   1 /Applications/Ghostty.app/Contents/MacOS/ghostty"])
@@ -301,12 +313,13 @@ class Skip(unittest.TestCase):
         with mock.patch.object(agent.subprocess, "run", return_value=out), mock.patch.object(agent.os, "getppid", return_value=parent):
             self.assertEqual(agent._codex_pid(), 8)
             self.assertEqual(agent._codex_pid(), 8)
-            self.assertEqual(agent.subprocess.run.call_count, 1)  # once per process
-        agent._codex_pid.cache_clear()
+            self.assertEqual(agent.subprocess.run.call_count, 1)  # once found, kept
+        agent._codex_found = 0
         no = SimpleNamespace(returncode=0, stdout="  9   1 /bin/zsh -l")
         with mock.patch.object(agent.subprocess, "run", return_value=no), mock.patch.object(agent.os, "getppid", return_value=parent):
             self.assertEqual(agent._codex_pid(), 0)
-        agent._codex_pid.cache_clear()
+            self.assertEqual(agent._codex_pid(), 0)
+            self.assertEqual(agent.subprocess.run.call_count, 2)  # not found: asked again, not kept
         with mock.patch.object(agent.subprocess, "run", side_effect=OSError("no ps")):
             self.assertEqual(agent._codex_pid(), 0)
 
