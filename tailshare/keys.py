@@ -259,13 +259,32 @@ def install_problem() -> str:
     return ""
 
 
-def key_line(k: dict, exe: str) -> str:
-    comment = "tailshare:" + k["id"] + " " + k["device"].replace(" ", "-")
+def gate_python() -> str:
+    """The interpreter tailshare runs under, for start keys' lines, or "" when its path is not plain."""
+    p = sys.executable
+    return p if p and _EXE_RE.fullmatch(p) and os.access(p, os.X_OK) else ""
+
+
+def key_lines(k: dict, exe: str, python: str | None = None) -> list[str]:
+    """A key's authorized_keys lines: one, or two for a start key (the start key, then its plan key)."""
+    if k["mode"] in ("start", "start-skip") and k.get("plan_pubkey"):
+        return [key_line(k, exe, python), key_line(k, exe, python, plan=True)]
+    return [key_line(k, exe, python)]
+
+
+def key_line(k: dict, exe: str, python: str | None = None, plan: bool = False) -> str:
+    comment = "tailshare:" + k["id"] + (" plan" if plan else "") + " " + k["device"].replace(" ", "-")
     if k["mode"] == "shell":
         return f"{k['pubkey']} {comment}"
     if k["mode"] in ("start", "start-skip"):  # no pty: it only takes `tailshare-start` (tailshare/start.py)
         grant = "skip" if k["mode"] == "start-skip" else "safe"
-        return f'restrict,command="{exe} ssh-gate --start={grant} --key={k["id"]}" {k["pubkey"]} {comment}'
+        # the interpreter itself with -I: PYTHONPATH, PYTHONSTARTUP and friends act before any of tailshare's code
+        # runs, so the console script's shebang (no -I) would let an AcceptEnv'd variable load code
+        py = gate_python() if python is None else python
+        # the plan key (no Face ID) shares the start key's id, so its plans are the pair's, but it only dry-runs
+        flags = f"--start={grant} --key={k['id']}" + (" --plan" if plan else "")
+        cmd = f"{py} -I -m tailshare ssh-gate {flags}" if py else "/usr/bin/false"
+        return f'restrict,command="{cmd}" {k["plan_pubkey"] if plan else k["pubkey"]} {comment}'
     return f'restrict,pty,command="{exe} ssh-gate" {k["pubkey"]} {comment}'
 
 
@@ -472,7 +491,7 @@ def cmd_gate(args) -> None:
             sys.exit("tailshare ssh-gate: this key may only run `tailshare-start`, with the request on stdin")
         # never from the environment: only the authorized_keys line itself may move these (tests do)
         start.settle(args.state, args.bus_port, args.tmux_socket)
-        sys.exit(start.gate(args.start, getattr(args, "key", "")))
+        sys.exit(start.gate(args.start, getattr(args, "key", ""), plan_only=args.plan))
     try:
         panes = registered_panes(bus.STATE_DIR / "bus.db")
     except Exception as e:  # noqa: BLE001
@@ -519,6 +538,8 @@ def approval_doc(signer: str, origin: str, r: dict, key_id: str, mode: str, host
         "v": 1, "action": "ssh-key", "signer": signer, "origin": origin, "request": r["id"], "key_id": key_id,
         "pubkey": r["pubkey"], "fingerprint": r["fingerprint"], "device": r["device"], "node": r["node"],
         "user": r["user"], "mode": mode, "hosts": hosts, "nonce": secrets.token_hex(16),
+        **({"plan_pubkey": r["plan_pubkey"], "plan_fingerprint": fingerprint(r["plan_pubkey"])}
+           if mode in ("start", "start-skip") else {}),
         "issued": round(now, 3), "expires": round(now + ttl, 3),
     })
 
@@ -535,9 +556,12 @@ class Keys:
         with self.store.lock:
             self.store.db.executescript(SCHEMA)
             cols = {r[1] for r in self.store.db.execute("PRAGMA table_info(key_requests)")}
-            for col, decl in (("purpose", "TEXT NOT NULL DEFAULT 'pane'"), ("want", "TEXT NOT NULL DEFAULT '[]'")):
+            for col, decl in (("purpose", "TEXT NOT NULL DEFAULT 'pane'"), ("want", "TEXT NOT NULL DEFAULT '[]'"),
+                              ("plan_pubkey", "TEXT NOT NULL DEFAULT ''")):
                 if col not in cols:
                     self.store.db.execute(f"ALTER TABLE key_requests ADD COLUMN {col} {decl}")
+            if "plan_pubkey" not in {r[1] for r in self.store.db.execute("PRAGMA table_info(ssh_keys)")}:
+                self.store.db.execute("ALTER TABLE ssh_keys ADD COLUMN plan_pubkey TEXT NOT NULL DEFAULT ''")
 
     def start(self) -> None:
         threading.Thread(target=self._loop, daemon=True, name="keys-loop").start()
@@ -602,6 +626,11 @@ class Keys:
         pubkey = parse_pubkey(body.get("pubkey"))
         device = clean_device(body.get("device_name"))
         purpose, want = request_purpose(body)
+        plan = ""
+        if purpose == "start":  # a start key comes with its plan key: dry runs without Face ID, confirms with it
+            plan = parse_pubkey(body.get("plan_pubkey"))
+            if plan == pubkey:
+                raise bus.BusError("plan_pubkey must be a different key from pubkey")
         now = time.time()
         with self.store.lock:
             self._expire()
@@ -609,8 +638,9 @@ class Keys:
                                   " ORDER BY created DESC", ip, pubkey)
             if same:
                 return self._view(same)
-            if self.store.one("SELECT 1 FROM ssh_keys WHERE pubkey=?", pubkey):
-                raise bus.BusError("this key is already installed here", 409)
+            for k in filter(None, (pubkey, plan)):
+                if self.store.one("SELECT 1 FROM ssh_keys WHERE pubkey=? OR plan_pubkey=?", k, k):
+                    raise bus.BusError("this key is already installed here", 409)
             pending = self.store.q("SELECT 1 FROM key_requests WHERE ip=? AND status='pending'", ip)
             today = self.store.q("SELECT 1 FROM key_requests WHERE ip=? AND created>?", ip, now - 86400)
             if len(pending) >= MAX_PENDING or len(today) >= MAX_PER_DAY:
@@ -619,8 +649,8 @@ class Keys:
                 raise bus.BusError("too many pending key requests on this machine", 429)
             rid = secrets.token_hex(16)
             self.store.x("INSERT INTO key_requests(id, ip, node, user, device, pubkey, fingerprint, created, expires, status,"
-                         " purpose, want) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?)", rid, ip, node, user or "", device,
-                         pubkey, fingerprint(pubkey), now, now + PENDING_TTL, purpose, json.dumps(want))
+                         " purpose, want, plan_pubkey) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)", rid, ip, node, user or "",
+                         device, pubkey, fingerprint(pubkey), now, now + PENDING_TTL, purpose, json.dumps(want), plan)
             r = self.store.one("SELECT * FROM key_requests WHERE id=?", rid)
         log(f"request {rid[:8]} from {node} ({user}), device {device!r}, {r['fingerprint']}, {purpose} {want}")
         self._notify(device, node, user or "")
@@ -676,7 +706,8 @@ class Keys:
         return {"host": self.host, "owner": self.bus.net.user, "login": bus.LOGIN, "problem": install_problem(),
                 "targets": self.targets(), "pending": [
                     {**{k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires",
-                                          "purpose")}, "want": json.loads(r["want"])}
+                                          "purpose", "plan_pubkey")}, "want": json.loads(r["want"]),
+                     "plan_fingerprint": fingerprint(r["plan_pubkey"]) if r["plan_pubkey"] else ""}
                     for r in rows]}
 
     def ls(self) -> dict:
@@ -689,7 +720,7 @@ class Keys:
     def _rewrite(self) -> None:
         exe = gate_exe()
         rows = self.store.q("SELECT * FROM ssh_keys ORDER BY installed")
-        write_authorized_keys([key_line(dict(r), exe) for r in rows], self.keys_file)
+        write_authorized_keys([x for r in rows for x in key_lines(dict(r), exe)], self.keys_file)
 
     def install_here(self, key_id: str, r: dict, mode: str, by: str) -> dict:
         problem = install_problem()
@@ -698,9 +729,15 @@ class Keys:
         with self.store.lock:
             if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
                 raise bus.BusError(f"key {key_id} was revoked; enroll again", 409)
+            plan = (r.get("plan_pubkey") or "") if mode in ("start", "start-skip") else ""
+            if mode in ("start", "start-skip") and not plan:
+                raise bus.BusError("a start key needs its plan key", 409)
+            for k in filter(None, (r["pubkey"], plan)):  # sshd takes the first line that matches a key: one line each
+                if self.store.one("SELECT 1 FROM ssh_keys WHERE id!=? AND (pubkey=? OR plan_pubkey=?)", key_id, k, k):
+                    raise bus.BusError("this key is already installed here under another id", 409)
             self.store.x("INSERT OR REPLACE INTO ssh_keys(id, pubkey, fingerprint, device, node, user, mode, approved_by,"
-                         " installed) VALUES(?,?,?,?,?,?,?,?,?)", key_id, r["pubkey"], r["fingerprint"], r["device"],
-                         r["node"], r["user"], mode, by, time.time())
+                         " installed, plan_pubkey) VALUES(?,?,?,?,?,?,?,?,?,?)", key_id, r["pubkey"], r["fingerprint"],
+                         r["device"], r["node"], r["user"], mode, by, time.time(), plan)
             try:
                 self._rewrite()
             except BaseException:
@@ -742,6 +779,13 @@ class Keys:
                 problems.append("key and fingerprint do not match")
         except bus.BusError:
             problems.append("bad key")
+        if d.get("mode") in ("start", "start-skip"):
+            try:
+                plan = parse_pubkey(d.get("plan_pubkey"))
+                if plan != d.get("plan_pubkey") or fingerprint(plan) != d.get("plan_fingerprint") or plan == d.get("pubkey"):
+                    problems.append("plan key and fingerprint do not match")
+            except bus.BusError:
+                problems.append("bad plan key")
         if problems:
             raise bus.BusError("approval refused: " + "; ".join(problems), 403)
         nonce = str(d.get("nonce"))
@@ -787,7 +831,8 @@ class Keys:
         payload, signature = str(body.get("payload") or ""), str(body.get("signature") or "")
         if payload:
             d = self.check_approval(payload, signature)
-            if d.get("request") != rid or d["pubkey"] != r["pubkey"] or d["mode"] != mode:
+            if (d.get("request") != rid or d["pubkey"] != r["pubkey"] or d["mode"] != mode
+                    or d.get("plan_pubkey", "") != (r["plan_pubkey"] if mode in ("start", "start-skip") else "")):
                 raise bus.BusError("approval refused: signed for another request", 403)
             key_id, hosts, by = d["key_id"], [h for h in d["hosts"] if isinstance(h, str)], f"signed by {d['signer']}"
         else:
@@ -814,7 +859,7 @@ class Keys:
             raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
         d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""))
-        r = {k: d[k] for k in ("pubkey", "fingerprint", "device", "node", "user")}
+        r = {k: d.get(k, "") for k in ("pubkey", "fingerprint", "device", "node", "user", "plan_pubkey")}
         return self.install_here(d["key_id"], r, d["mode"], f"signed by {d['signer']} (from {d.get('origin')})")
 
     def deny(self, body: dict) -> dict:
@@ -1047,6 +1092,8 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     print(f"  device       {p['device']!r} (the name the device gave itself)")
     print(f"  tailnet      {p['node']}, owned by {p['user'] or 'unknown'}" + ("" if mine else "   ⚠ NOT one of your devices"))
     print(f"  fingerprint  {p['fingerprint']}")
+    if p.get("plan_fingerprint"):
+        print(f"  plan key     {p['plan_fingerprint']} (dry runs only, without Face ID; installed with it)")
     if mode == "pane":
         print(f"  access       attach to tmux panes of agents, as {d['login']}. Typing into a pane is as good as a shell.")
     elif mode in ("start", "start-skip"):
@@ -1146,6 +1193,7 @@ def add_parser(sub) -> None:
     p = sub.add_parser("ssh-gate", help="forced command of tailshare's SSH keys (run by sshd, not by hand)")
     p.add_argument("--start", choices=("safe", "skip"), default="", help="set by a start key's line")
     p.add_argument("--key", default="", help="set by a start key's line")
+    p.add_argument("--plan", action="store_true", help="set by a plan key's line: dry runs only")
     p.add_argument("--tmux-socket", default="", help="tests only: a private tmux server, set on the key's line")
     p.add_argument("--state", default="", help="tests only: a state dir instead of ~/.tailshare, set on the key's line")
     p.add_argument("--bus-port", type=int, default=0, help="tests only: the local bus port, set on the key's line")

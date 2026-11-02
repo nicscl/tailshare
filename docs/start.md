@@ -45,20 +45,33 @@ tailshare keys approve 3f2a91c0                # grants what it asked for
 tailshare keys approve 3f2a91c0 --start=safe   # grants less: start, never skip permissions
 ```
 
+A start request carries two keys: the start key (`pubkey`) and its **plan key** (`plan_pubkey`, a different
+key). `keys approve` shows both fingerprints and installs both, as a pair. The plan key can only dry-run:
+the gate never confirms a plan or attaches to anything for it. Both lines share the key id, so a plan made with
+the plan key belongs to the pair and the start key can confirm it. Removing the key (`tailshare keys rm`, or
+the device revoking it) removes both lines.
+
 You can grant less than the device asked for, never more. An attach request cannot be approved as a start
-key, nor a start request as an attach key or a shell. The installed line is:
+key, nor a start request as an attach key or a shell. The installed lines are:
 
 ```
-restrict,command="<tailshare> ssh-gate --start=safe --key=k3f2a91c0d1e2" ecdsa-sha2-nistp256 AAAA... tailshare:k3f2a91c0d1e2 iPhone
+restrict,command="<python> -I -m tailshare ssh-gate --start=safe --key=k3f2a91c0d1e2" ecdsa-sha2-nistp256 AAAA... tailshare:k3f2a91c0d1e2 iPhone
+restrict,command="<python> -I -m tailshare ssh-gate --start=safe --key=k3f2a91c0d1e2 --plan" ecdsa-sha2-nistp256 BBBB... tailshare:k3f2a91c0d1e2 plan iPhone
 ```
+
+`<python>` is the interpreter tailshare runs with, and `-I` keeps `PYTHONPATH`, `PYTHONSTARTUP` and the current
+folder from loading code before the gate starts. With no plain interpreter path to write, the line runs
+`/usr/bin/false`.
 
 `restrict` means no pty, no forwarding and no `~/.ssh/rc`. The gate runs `tailshare-start` and nothing else. Nothing the
 client sends in its environment changes where or how a session starts: the gate takes HOME from the
 password database, uses a fixed PATH and drops `TAILSHARE_*`/`TMUX*` variables, whatever the host's sshd
 `AcceptEnv` or `PermitUserEnvironment` say.
 
-In the Hive app the start key lives in the Secure Enclave and needs Face ID on each use, so each SSH call to a
-host takes one Face ID. That protects against someone using your unlocked phone, or a copy of the app's iSH
+In the Hive app both keys live in the Secure Enclave. The start key needs Face ID on each use; the plan key
+does not, so dry runs cost no Face ID and a start costs one per host's confirm (the app confirms a multi-host
+launch back to back under one Face ID). A copy of the plan key can only make plans, and at most
+128 open plans per key (`rate` past that). That protects against someone using your unlocked phone, or a copy of the app's iSH
 files. It does not protect against a compromised phone or app, and the machine cannot check that a person was
 present: it only sees a valid signature.
 
@@ -121,14 +134,15 @@ This is the one place tailshare starts sessions that may skip permissions. Relau
 
 ## Limits and errors
 
-- 32 items per request; 6 confirms a minute per key (`rate`, with `retry_after` in seconds).
+- 32 items per request; 6 confirms a minute per key; 128 open (unconfirmed) plans per key (`rate`, with
+  `retry_after` in seconds).
 - `max_running` windows across tailshare's sessions (`limit`).
 
 | error | meaning |
 |---|---|
 | `bad_request` | malformed request or field (`field` says which) |
 | `not_allowed` | the config does not allow this kind, option or folder |
-| `no_grant` / `no_skip_grant` | the key cannot start / cannot skip permissions |
+| `no_grant` / `no_skip_grant` | the key cannot start (or is the plan key, confirming) / cannot skip permissions |
 | `off` | starting is off on this machine |
 | `not_installed` / `no_tmux` | the agent / tmux is not installed |
 | `running` | a session with this name is already running |

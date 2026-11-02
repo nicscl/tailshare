@@ -40,6 +40,8 @@ MAX_INPUT = 256 * 1024
 MAX_OUTPUT = 512 * 1024  # 32 plans, each with its instructions once
 MAX_ITEMS = 32  # a whole squad on one host
 CONFIRMS_PER_MIN = 6  # per key; counts confirm calls, not sessions
+# the plan key dry-runs without Face ID, so a copy of it could fill start.db: cap the open plans per key pair
+MAX_OPEN_PLANS = 4 * MAX_ITEMS
 PROMPT_MAX = 8 * 1024
 INSTRUCTIONS_MAX = 4 * 1024
 NAME_MAX = 64
@@ -416,6 +418,18 @@ def _canon(d: dict) -> str:
 def dry_run(con: sqlite3.Connection, starts: object, cfg: dict, grant: str, key: str, host: str) -> list[dict]:
     if not isinstance(starts, list) or not 0 < len(starts) <= MAX_ITEMS:
         raise Refused("bad_request", "starts", f"1 to {MAX_ITEMS} starts")
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        n = con.execute("SELECT COUNT(*) FROM plans WHERE key=? AND used IS NULL", (key,)).fetchone()[0]
+        return _dry_run(con, starts, cfg, grant, key, host, MAX_OPEN_PLANS - n)
+    finally:
+        con.execute("COMMIT")
+
+
+def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: str, host: str, room: int) -> list[dict]:
+    if len(starts) > room:
+        oldest = con.execute("SELECT MIN(expires) FROM plans WHERE key=? AND used IS NULL", (key,)).fetchone()[0]
+        raise Refused("rate", retry_after=max(1, int((oldest or time.time()) + 1 - time.time())))
     out = []
     for item in starts:
         try:
@@ -482,8 +496,9 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
 
 
 def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None = None,
-           db: Path | None = None) -> dict:
-    """One `tailshare-start` call: {"v":1, "results":[…]} or {"v":1, "error":…}."""
+           db: Path | None = None, plan_only: bool = False) -> dict:
+    """One `tailshare-start` call: {"v":1, "results":[…]} or {"v":1, "error":…}. `plan_only`: the call came in on
+    the pair's plan key, which needs no Face ID, so it may dry-run but never confirm."""
     try:
         if grant not in ("safe", "skip") or not _KEY_ID.fullmatch(key):
             raise Refused("no_grant", reason="this key may not start sessions")
@@ -499,6 +514,8 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             if doc.get("dry_run") is True and "confirm" not in doc:
                 return {"v": 1, "results": dry_run(con, doc.get("starts"), cfg, grant, key, host)}
             if "confirm" in doc and "starts" not in doc:
+                if plan_only:
+                    raise Refused("no_grant", reason="the plan key only makes plans: confirm with the start key")
                 return {"v": 1, "results": confirm(con, doc.get("confirm"), cfg, grant, key, host)}
             raise Refused("bad_request", reason="send either dry_run with starts, or confirm")
         finally:
@@ -526,7 +543,7 @@ def settle(state: str = "", bus_port: int = 0, tmux_socket: str = "") -> None:
     TMUX_SOCKET = tmux_socket
 
 
-def gate(grant: str, key: str) -> int:
+def gate(grant: str, key: str, plan_only: bool = False) -> int:
     """`ssh-gate --start=…`: read the request from stdin, print one JSON line, exit 0 only if everything worked."""
     raw = sys.stdin.buffer.read(MAX_INPUT + 1)
     if len(raw) > MAX_INPUT:
@@ -536,7 +553,7 @@ def gate(grant: str, key: str) -> int:
             doc = json.loads(raw.decode())
         except (ValueError, UnicodeDecodeError):
             doc = None
-        out = handle(doc, grant, key, host_name())
+        out = handle(doc, grant, key, host_name(), plan_only=plan_only)
     line = json.dumps(out, separators=(",", ":"))
     if len(line) > MAX_OUTPUT:
         line = json.dumps({"v": 1, "error": "too_large", "reason": "the reply is too large; send fewer starts"})

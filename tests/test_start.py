@@ -265,6 +265,22 @@ class Confirm(Base):
         self.assertEqual(self.confirm("../x")["results"][0]["error"], "unknown_plan")
         self.assertNotIn("error", self.confirm(pid)["results"][0])
 
+    def test_plan_key_plans_and_the_start_key_confirms(self):
+        pid = start.handle({"v": 1, "dry_run": True, "starts": [self.item()]}, "safe", KEY, "air", plan_only=True)
+        pid = pid["results"][0]["plan_id"]
+        r = start.handle({"v": 1, "confirm": [pid]}, "safe", KEY, "air", plan_only=True)
+        self.assertEqual(r["error"], "no_grant")  # the plan key never starts anything
+        self.assertEqual(self.argvs(wait=0.3), [])
+        self.assertNotIn("error", self.confirm(pid)["results"][0])  # the pair's start key does
+
+    def test_open_plans_are_capped(self):
+        for _ in range(start.MAX_OPEN_PLANS // start.MAX_ITEMS):
+            self.assertNotIn("error", self.dry(*[self.item()] * start.MAX_ITEMS)[-1])
+        r = self.call({"v": 1, "dry_run": True, "starts": [self.item()]})
+        self.assertEqual(r["error"], "rate")
+        self.assertGreater(r["retry_after"], 0)
+        self.assertNotIn("error", self.dry(self.item(), key=OTHER)[0])  # per key
+
     def test_expired(self):
         pid = self.dry(self.item())[0]["plan_id"]
         with mock.patch.object(start.time, "time", return_value=time.time() + start.PLAN_TTL + 1):
@@ -328,6 +344,23 @@ class Gate(Base):
             start.settle(str(self.state), 4321, "/x/sock")  # only these, from the key's line
             self.assertEqual((bus.STATE_DIR, bus.BUS_PORT, start.TMUX_SOCKET), (self.state, 4321, "/x/sock"))
 
+    def test_interpreter_is_isolated(self):
+        """What the start key's line runs ignores PYTHON* variables and the current folder: no code loads early."""
+        evil = self.tmp / "evil"
+        (evil / "tailshare").mkdir(parents=True)
+        marker = self.tmp / "loaded"
+        for f in ("sitecustomize.py", "usercustomize.py", "startup.py", "tailshare/__init__.py", "json.py"):
+            (evil / f).write_text(f"open({str(marker)!r}, 'a').write({f!r})\n")
+        line = keys.key_line({"id": KEY, "mode": "start", "pubkey": "x", "device": "d"}, "/x")
+        argv = line.split('command="', 1)[1].split('"', 1)[0].split()
+        self.assertEqual(argv[:4], [sys.executable, "-I", "-m", "tailshare"])
+        env = {**os.environ, "PYTHONPATH": str(evil), "PYTHONSTARTUP": str(evil / "startup.py"), "PYTHONHOME": "",
+               "PYTHONUSERBASE": str(evil), "SSH_ORIGINAL_COMMAND": "nope"}
+        env.pop("PYTHONHOME")
+        subprocess.run([*argv[:2], "-c", "import json, sitecustomize"], env=env, cwd=str(evil), capture_output=True)
+        subprocess.run([*argv[:2], "-c", "import json"], env=env, cwd=str(evil), capture_output=True)
+        self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+
     def test_socket_never_from_the_environment(self):
         code = "from tailshare import start; print(repr(start.TMUX_SOCKET))"
         for var in ("TAILSHARE_TMUX_SOCKET", "TMUX_SOCKET", "TMUX"):
@@ -361,13 +394,23 @@ class OverSSH(Base):
         super().setUp()
         d = self.tmp / "ssh"
         d.mkdir(mode=0o700)
-        for name in ("host", "client"):
+        for name in ("host", "client", "plan"):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / name)], check=True)
-        exe = f"env FAKE_AGENT_TMUX={self.tmp / 'sock'} PYTHONPATH={Path(__file__).parents[1]}" \
-              f" {sys.executable} -m tailshare"
-        line = keys.key_line({"id": KEY, "mode": "start", "pubkey": " ".join((d / "client.pub").read_text().split()[:2]),
-                              "device": "test"}, exe).replace(f'--key={KEY}"', f'--key={KEY} --tmux-socket={self.tmp / "sock"} --state={self.state} --bus-port={free_port()}"')
-        (d / "authorized_keys").write_text(line + "\n")
+        # stands in for the interpreter: takes the line's `-I -m tailshare` and runs this checkout's tailshare, isolated
+        py = d / "python"
+        py.write_text(f"""#!/bin/sh
+[ "$1 $2 $3" = "-I -m tailshare" ] || exit 9
+shift 3
+exec env FAKE_AGENT_TMUX={self.tmp / 'sock'} {sys.executable} -I -c 'import runpy, sys; sys.path.insert(0, "{Path(__file__).parents[1]}"); \\
+runpy.run_module("tailshare", run_name="__main__", alter_sys=True)' "$@"
+""")
+        py.chmod(0o755)
+        pub = {n: " ".join((d / f"{n}.pub").read_text().split()[:2]) for n in ("client", "plan")}
+        rest = f' --tmux-socket={self.tmp / "sock"} --state={self.state} --bus-port={free_port()}'
+        lines = [x.replace(f'--key={KEY}"', f'--key={KEY}{rest}"').replace(" --plan\"", f'{rest} --plan"')
+                 for x in keys.key_lines({"id": KEY, "mode": "start", "pubkey": pub["client"], "plan_pubkey": pub["plan"],
+                                          "device": "test"}, "/unused", str(py))]
+        (d / "authorized_keys").write_text("\n".join(lines) + "\n")
         (d / "authorized_keys").chmod(0o600)
         self.port = free_port()
         (d / "sshd_config").write_text(
@@ -389,9 +432,20 @@ class OverSSH(Base):
         self.sshd.terminate()
         self.sshd.wait(5)
 
-    def send(self, cmd, doc):
-        r = subprocess.run([*self.ssh, cmd], input=json.dumps(doc).encode(), capture_output=True, timeout=60)
+    def send(self, cmd, doc, ident="client"):
+        ssh = [x.replace(f"{os.sep}client", f"{os.sep}{ident}") if x.endswith(f"{os.sep}client") else x for x in self.ssh]
+        r = subprocess.run([*ssh, cmd], input=json.dumps(doc).encode(), capture_output=True, timeout=60)
         return r.returncode, r.stdout, r.stderr
+
+    def test_plan_key_over_ssh(self):
+        code, out, err = self.send("tailshare-start", {"v": 1, "dry_run": True, "starts": [self.item()]}, ident="plan")
+        self.assertEqual(code, 0, err)
+        pid = json.loads(out)["results"][0]["plan_id"]
+        code, out, _ = self.send("tailshare-start", {"v": 1, "confirm": [pid]}, ident="plan")
+        self.assertEqual((code, json.loads(out)["error"]), (1, "no_grant"))
+        code, out, err = self.send("tailshare-start", {"v": 1, "confirm": [pid]})
+        self.assertEqual(code, 0, (out, err))
+        self.assertRegex(json.loads(out)["results"][0]["tmux"]["pane"], r"^%[0-9]+$")
 
     def test_dry_run_then_confirm(self):
         rc, out, err = self.send("tailshare-start", {"v": 1, "dry_run": True, "starts": [self.item(prompt="hi")]})
@@ -422,12 +476,18 @@ def free_port() -> int:
 class Keys(unittest.TestCase):
     def test_lines(self):
         k = {"id": KEY, "pubkey": "ecdsa-sha2-nistp256 AAAA", "device": "Nick iPhone"}
-        self.assertEqual(keys.key_line({**k, "mode": "start"}, "/x/tailshare"),
-                         f'restrict,command="/x/tailshare ssh-gate --start=safe --key={KEY}" ecdsa-sha2-nistp256 AAAA '
-                         f"tailshare:{KEY} Nick-iPhone")
+        self.assertEqual(keys.key_line({**k, "mode": "start"}, "/x/tailshare", "/x/python"),
+                         f'restrict,command="/x/python -I -m tailshare ssh-gate --start=safe --key={KEY}" '
+                         f"ecdsa-sha2-nistp256 AAAA tailshare:{KEY} Nick-iPhone")
+        self.assertIn(f'command="{sys.executable} -I -m tailshare ', keys.key_line({**k, "mode": "start"}, "/x/tailshare"))
+        self.assertIn('command="/usr/bin/false"', keys.key_line({**k, "mode": "start"}, "/x/tailshare", ""))
         self.assertIn("--start=skip", keys.key_line({**k, "mode": "start-skip"}, "/x/tailshare"))
         self.assertNotIn("pty", keys.key_line({**k, "mode": "start-skip"}, "/x/tailshare"))
         self.assertNotIn("--start", keys.key_line({**k, "mode": "pane"}, "/x/tailshare"))
+        pair = keys.key_lines({**k, "mode": "start", "plan_pubkey": "ecdsa-sha2-nistp256 BBBB"}, "/x/tailshare", "/x/python")
+        self.assertEqual(pair[1], f'restrict,command="/x/python -I -m tailshare ssh-gate --start=safe --key={KEY} --plan" '
+                                  f"ecdsa-sha2-nistp256 BBBB tailshare:{KEY} plan Nick-iPhone")
+        self.assertEqual(len(keys.key_lines({**k, "mode": "pane", "plan_pubkey": "x"}, "/x/tailshare")), 1)
 
     def test_purposes(self):
         self.assertEqual(keys.request_purpose({}), ("pane", []))
@@ -465,22 +525,56 @@ class Enroll(unittest.TestCase):
             x.start()
             self.addCleanup(x.stop)
         self.k = keys.Keys(self.b, keys_file=self.tmp / "authorized_keys", token_file=self.tmp / "token")
-        self.pub = subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-N", "", "-f", str(self.tmp / "id")],
-                                  capture_output=True) and (self.tmp / "id.pub").read_text().strip()
+        self.pub, self.plan = (subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-N", "", "-f", str(self.tmp / n)],
+                                              capture_output=True) and (self.tmp / f"{n}.pub").read_text().strip()
+                               for n in ("id", "plan"))
+
+    def start_request(self, **kw):
+        return self.k.enroll("100.1.1.1", {"pubkey": self.pub, "plan_pubkey": self.plan, "device_name": "iPhone",
+                                           "purpose": "start", "want": ["start", "skip"], **kw})
 
     def test_start_key_installs_with_its_grant(self):
-        r = self.k.enroll("100.1.1.1", {"pubkey": self.pub, "device_name": "iPhone", "purpose": "start",
-                                        "want": ["start", "skip"]})
+        r = self.start_request()
         self.assertEqual((r["purpose"], r["want"]), ("start", ["start", "skip"]))
         p = self.k.pending()["pending"][0]
         self.assertEqual((p["purpose"], p["want"]), ("start", ["start", "skip"]))
+        self.assertEqual(p["plan_fingerprint"], keys.fingerprint(keys.parse_pubkey(self.plan)))
         tail = p["fingerprint"][-keys.CONFIRM_CHARS:]
         with self.assertRaises(bus.BusError):
             self.k.approve({"id": r["request_id"], "mode": "pane", "confirm": tail})
         out = self.k.approve({"id": r["request_id"], "mode": "start", "confirm": tail})  # grant less than asked
         self.assertEqual(out["installed"][0]["mode"], "start")
-        line = [x for x in (self.tmp / "authorized_keys").read_text().splitlines() if "ecdsa" in x][0]
-        self.assertTrue(line.startswith('restrict,command="/x/tailshare ssh-gate --start=safe --key=k'), line)
+        lines = [x for x in (self.tmp / "authorized_keys").read_text().splitlines() if "ecdsa" in x]
+        kid = out["key_id"]
+        self.assertEqual(lines, [  # both keys, with the same id: the plan key's plans are the pair's
+            f'restrict,command="{sys.executable} -I -m tailshare ssh-gate --start=safe --key={kid}" '
+            f"{keys.parse_pubkey(self.pub)} tailshare:{kid} iPhone",
+            f'restrict,command="{sys.executable} -I -m tailshare ssh-gate --start=safe --key={kid} --plan" '
+            f"{keys.parse_pubkey(self.plan)} tailshare:{kid} plan iPhone"])
+        self.k.rm({"key_id": kid})  # removing the start key removes its plan key
+        self.assertFalse([x for x in (self.tmp / "authorized_keys").read_text().splitlines() if "ecdsa" in x])
+
+    def test_start_key_needs_its_plan_key(self):
+        for bad in ({"plan_pubkey": None}, {"plan_pubkey": "nonsense"}):
+            with self.assertRaises(bus.BusError):
+                self.start_request(**bad)
+        with self.assertRaises(bus.BusError):
+            self.start_request(plan_pubkey=self.pub)  # one key cannot be both
+
+    def test_plan_key_already_installed(self):
+        r = self.k.enroll("100.1.1.1", {"pubkey": self.plan, "device_name": "iPhone"})
+        self.k.approve({"id": r["request_id"], "confirm": r["fingerprint"][-keys.CONFIRM_CHARS:]})
+        with self.assertRaises(bus.BusError) as e:  # else sshd would take the attach line for the plan key
+            self.start_request()
+        self.assertEqual(e.exception.code, 409)
+
+    def test_signed_approval_carries_the_plan_key(self):
+        r = self.start_request()
+        p = self.k.pending()["pending"][0]
+        d = json.loads(keys.approval_doc("me", "air", p, "k" + "1" * 12, "start", ["air"]))
+        self.assertEqual((d["plan_pubkey"], d["plan_fingerprint"]), (p["plan_pubkey"], p["plan_fingerprint"]))
+        self.assertNotIn("plan_pubkey", json.loads(keys.approval_doc("me", "air", p, "k" + "1" * 12, "pane", ["air"])))
+        self.assertTrue(r["request_id"])
 
     def test_attach_key_cannot_get_start(self):
         r = self.k.enroll("100.1.1.1", {"pubkey": self.pub, "device_name": "iPhone"})

@@ -217,7 +217,8 @@ plain `attach`, which is a full tmux client.
   access there follows the tailnet's SSH policy instead.
 
 `POST /bus/v1/keys/enroll` takes `{"pubkey": "ssh-ed25519 AAAA...", "device_name": "Nick's iPhone"}`, plus
-`"purpose": "start"` and `"want": ["start"]` or `["start", "skip"]` for a start key ([start.md](start.md)), and
+`"purpose": "start"`, `"want": ["start"]` or `["start", "skip"]` and `"plan_pubkey"` (its plan key, a different key)
+for a start key ([start.md](start.md)), and
 answers:
 
 ```json
