@@ -52,7 +52,8 @@ key, nor a start request as an attach key or a shell. The installed line is:
 restrict,command="<tailshare> ssh-gate --start=safe --key=k3f2a91c0d1e2" ecdsa-sha2-nistp256 AAAA... tailshare:k3f2a91c0d1e2 iPhone
 ```
 
-`restrict` means no pty, no forwarding and no `~/.ssh/rc`. The gate runs `tailshare-start` and nothing else.
+`restrict` means no pty, no forwarding and no `~/.ssh/rc`. The gate runs `tailshare-start` and nothing else. Nothing the
+client sends in its environment changes where or how a session starts.
 
 In the Hive app the start key lives in the Secure Enclave and needs Face ID on each use, so each SSH call to a
 host takes one Face ID. That protects against someone using your unlocked phone, or a copy of the app's iSH

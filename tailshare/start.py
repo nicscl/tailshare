@@ -44,9 +44,9 @@ PROMPT_MAX = 8 * 1024
 INSTRUCTIONS_MAX = 4 * 1024
 NAME_MAX = 64
 MAX_DIRS = 8
-# "": the user's default tmux server, the one /hello's panes are on. Tests use a private one; sshd never passes the
-# environment to a forced command (PermitUserEnvironment), so a start key cannot pick it
-TMUX_SOCKET = os.environ.get("TAILSHARE_TMUX_SOCKET", "")
+# "": the user's default tmux server, the one /hello's panes are on. Tests use a private one, set in-process or by
+# `ssh-gate --tmux-socket` on the key's command= line: never from the environment, which an ssh client may send
+TMUX_SOCKET = ""
 SESSION = "tailshare-start"
 INSTRUCTIONS = "<instructions>"  # stands for the instructions in a plan's argv
 

@@ -470,6 +470,8 @@ def cmd_gate(args) -> None:
 
         if cmd.strip() != "tailshare-start":
             sys.exit("tailshare ssh-gate: this key may only run `tailshare-start`, with the request on stdin")
+        if getattr(args, "tmux_socket", ""):  # only from the authorized_keys line itself (tests)
+            start.TMUX_SOCKET = args.tmux_socket
         sys.exit(start.gate(args.start, getattr(args, "key", "")))
     try:
         panes = registered_panes(bus.STATE_DIR / "bus.db")
@@ -1144,4 +1146,5 @@ def add_parser(sub) -> None:
     p = sub.add_parser("ssh-gate", help="forced command of tailshare's SSH keys (run by sshd, not by hand)")
     p.add_argument("--start", choices=("safe", "skip"), default="", help="set by a start key's line")
     p.add_argument("--key", default="", help="set by a start key's line")
+    p.add_argument("--tmux-socket", default="", help="tests only: a private tmux server, set on the key's line")
     p.set_defaults(fn=cmd_gate)

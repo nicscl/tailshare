@@ -24,7 +24,7 @@ KEY = "k0123456789ab"
 OTHER = "kba9876543210"
 TMUX = shutil.which("tmux")
 FAKE = """#!/bin/sh
-case "$TMUX" in "$TAILSHARE_TMUX_SOCKET",*) ;; *) echo "not on the test's tmux socket" >&2; exit 1 ;; esac
+case "$TMUX" in "$TAILSHARE_TEST_TMUX",*) ;; *) echo "not on the test's tmux socket" >&2; exit 1 ;; esac
 env > "$(dirname "$0")/env.$$"
 printf '%s\\0' "$@" > "$(dirname "$0")/argv.$$"
 sleep 30
@@ -47,7 +47,8 @@ class Base(unittest.TestCase):
         patches = [mock.patch.object(bus, "STATE_DIR", self.state),
                    mock.patch.object(start, "TMUX_SOCKET", str(self.tmp / "sock")),
                    # and in every gate this test runs as a subprocess: never the user's own tmux server
-                   mock.patch.dict(os.environ, {"TAILSHARE_TMUX_SOCKET": str(self.tmp / "sock")})]
+                   # read by the fake agent only: it refuses to run anywhere but the test's tmux server
+                   mock.patch.dict(os.environ, {"TAILSHARE_TEST_TMUX": str(self.tmp / "sock")})]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -302,7 +303,8 @@ class Gate(Base):
     def run_gate(self, cmd, stdin=b"", grant="safe"):
         env = {**os.environ, "SSH_ORIGINAL_COMMAND": cmd, "TAILSHARE_STATE": str(self.state),
                "TAILSHARE_BUS_PORT": str(free_port())}  # never the real bus
-        return subprocess.run([sys.executable, "-m", "tailshare", "ssh-gate", f"--start={grant}", f"--key={KEY}"],
+        return subprocess.run([sys.executable, "-m", "tailshare", "ssh-gate", f"--start={grant}", f"--key={KEY}",
+                               f"--tmux-socket={self.tmp / 'sock'}"],
                               input=stdin, capture_output=True, env=env, cwd=str(Path(__file__).parents[1]), timeout=30)
 
     def test_only_tailshare_start(self):
@@ -310,6 +312,13 @@ class Gate(Base):
             r = self.run_gate(cmd)
             self.assertEqual(r.returncode, 1, cmd)
             self.assertEqual(r.stdout, b"")
+
+    def test_socket_never_from_the_environment(self):
+        code = "from tailshare import start; print(repr(start.TMUX_SOCKET))"
+        for var in ("TAILSHARE_TMUX_SOCKET", "TMUX_SOCKET", "TMUX"):
+            r = subprocess.run([sys.executable, "-c", code], env={**os.environ, var: "/tmp/evil"}, capture_output=True,
+                               text=True, cwd=str(Path(__file__).parents[1]), check=True)
+            self.assertEqual(r.stdout.strip(), "''", var)
 
     def test_one_json_line(self):
         doc = json.dumps({"v": 1, "dry_run": True, "starts": [self.item(), self.item(cwd="/")]}).encode()
@@ -339,11 +348,11 @@ class OverSSH(Base):
         d.mkdir(mode=0o700)
         for name in ("host", "client"):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / name)], check=True)
-        exe = f"env TAILSHARE_STATE={self.state} TAILSHARE_TMUX_SOCKET={self.tmp / 'sock'} TAILSHARE_BUS_PORT={free_port()}" \
+        exe = f"env TAILSHARE_STATE={self.state} TAILSHARE_TEST_TMUX={self.tmp / 'sock'} TAILSHARE_BUS_PORT={free_port()}" \
               f" PYTHONPATH={Path(__file__).parents[1]}" \
               f" {sys.executable} -m tailshare"
         line = keys.key_line({"id": KEY, "mode": "start", "pubkey": " ".join((d / "client.pub").read_text().split()[:2]),
-                              "device": "test"}, exe)
+                              "device": "test"}, exe).replace(f'--key={KEY}"', f'--key={KEY} --tmux-socket={self.tmp / "sock"}"')
         (d / "authorized_keys").write_text(line + "\n")
         (d / "authorized_keys").chmod(0o600)
         self.port = free_port()
