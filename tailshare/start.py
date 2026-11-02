@@ -507,6 +507,25 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
         return {"v": 1, **e.out}
 
 
+SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+def settle(state: str = "", bus_port: int = 0, tmux_socket: str = "") -> None:
+    """Before the start gate does anything: nothing an ssh client may have put in the environment (AcceptEnv,
+    PermitUserEnvironment) decides where state lives, which bus or tmux server is used, or where binaries come
+    from. HOME comes from the password database, the rest from the key's command= line or the defaults."""
+    import pwd
+
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    for k in [k for k in os.environ if k.startswith(("TAILSHARE_", "TMUX", "PYTHON"))]:
+        del os.environ[k]
+    os.environ.update(HOME=home, PATH=SAFE_PATH)
+    global TMUX_SOCKET
+    bus.STATE_DIR = Path(state) if state else Path(home) / ".tailshare"
+    bus.BUS_PORT = bus_port or 8789
+    TMUX_SOCKET = tmux_socket
+
+
 def gate(grant: str, key: str) -> int:
     """`ssh-gate --start=…`: read the request from stdin, print one JSON line, exit 0 only if everything worked."""
     raw = sys.stdin.buffer.read(MAX_INPUT + 1)

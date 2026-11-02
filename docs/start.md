@@ -53,7 +53,9 @@ restrict,command="<tailshare> ssh-gate --start=safe --key=k3f2a91c0d1e2" ecdsa-s
 ```
 
 `restrict` means no pty, no forwarding and no `~/.ssh/rc`. The gate runs `tailshare-start` and nothing else. Nothing the
-client sends in its environment changes where or how a session starts.
+client sends in its environment changes where or how a session starts: the gate takes HOME from the
+password database, uses a fixed PATH and drops `TAILSHARE_*`/`TMUX*` variables, whatever the host's sshd
+`AcceptEnv` or `PermitUserEnvironment` say.
 
 In the Hive app the start key lives in the Secure Enclave and needs Face ID on each use, so each SSH call to a
 host takes one Face ID. That protects against someone using your unlocked phone, or a copy of the app's iSH
