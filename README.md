@@ -213,6 +213,11 @@ your own screen and its code.
 machine and confirms the fingerprint. The key can then only attach to agents' tmux panes, which still means
 typing into a shell or an agent: treat it as shell access. See [docs/ssh-keys.md](docs/ssh-keys.md).
 
+**Starting sessions from a device.** Off unless a machine has `~/.tailshare/start.json`. A device of yours then
+enrolls a separate start key; once approved (`tailshare keys approve <id> [--start=safe]`), it can start a
+Claude Code or Codex session there in a new tmux window, in the folders and with the options that file
+allows: a dry run shows the exact plan, then a confirm starts it. See [docs/start.md](docs/start.md).
+
 How messages reach an agent:
 
 - **Claude Code**: a SessionStart hook registers the session and tells it to run `tailshare agent watch --once`

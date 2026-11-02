@@ -38,7 +38,8 @@ from . import bus
 
 ENROLL = os.environ.get("TAILSHARE_SSH_ENROLL", "1") != "0"
 KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256")
-MODES = ("pane", "shell")
+MODES = ("pane", "shell", "start", "start-skip")
+PURPOSES = {"pane": ("pane", "shell"), "start": ("start", "start-skip")}  # what each kind of request may become
 REQUIRE_SK = True  # signed approvals must come from a security key (tests turn this off)
 CONFIRM_CHARS = 6  # of the fingerprint the person types: 36 bits, too many to grind a look-alike key
 PENDING_TTL = 900  # a request waits this long for a person
@@ -262,6 +263,9 @@ def key_line(k: dict, exe: str) -> str:
     comment = "tailshare:" + k["id"] + " " + k["device"].replace(" ", "-")
     if k["mode"] == "shell":
         return f"{k['pubkey']} {comment}"
+    if k["mode"] in ("start", "start-skip"):  # no pty: it only takes `tailshare-start` (tailshare/start.py)
+        grant = "skip" if k["mode"] == "start-skip" else "safe"
+        return f'restrict,command="{exe} ssh-gate --start={grant} --key={k["id"]}" {k["pubkey"]} {comment}'
     return f'restrict,pty,command="{exe} ssh-gate" {k["pubkey"]} {comment}'
 
 
@@ -312,6 +316,35 @@ def write_authorized_keys(lines: list[str], path: Path | None = None) -> bool:
         Path(tmp).unlink(missing_ok=True)
         raise
     return True
+
+
+def request_purpose(body: dict) -> tuple[str, list[str]]:
+    """What a device asks a key for: `pane` (attach, the default) or `start` with want ["start"] or ["start","skip"]."""
+    purpose = body.get("purpose", "pane")
+    if purpose not in PURPOSES:
+        raise bus.BusError("purpose must be pane or start")
+    if purpose == "pane":
+        return "pane", []
+    want = body.get("want", ["start"])
+    if not isinstance(want, list) or "start" not in want or not set(want) <= {"start", "skip"}:
+        raise bus.BusError('want must be ["start"] or ["start","skip"]')
+    return "start", sorted(set(want), key=["start", "skip"].index)
+
+
+def default_mode(purpose: str, want: list[str]) -> str:
+    return ("start-skip" if "skip" in want else "start") if purpose == "start" else "pane"
+
+
+def mode_problem(mode: str, purpose: str, want: list[str]) -> str:
+    """Why a request of `purpose` cannot be installed as `mode`, or "". An attach key never gets a start grant,
+    a start key never attaches, and a person can grant less than asked, never more."""
+    if mode not in MODES:
+        return f"mode must be one of {', '.join(MODES)}"
+    if mode not in PURPOSES.get(purpose, ()):
+        return f"a {purpose} key cannot be installed as {mode}"
+    if mode == "start-skip" and "skip" not in want:
+        return "the device did not ask to skip permissions"
+    return ""
 
 
 # --------------------------------------------------------------------------- the gate
@@ -429,9 +462,15 @@ def tmux_binary(registered: str) -> str:
     return ""
 
 
-def cmd_gate(_args) -> None:
-    """Forced command of pane keys: attach to a registered agent pane, or refuse."""
+def cmd_gate(args) -> None:
+    """Forced command of pane keys: attach to a registered agent pane, or refuse. Of start keys: start sessions."""
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    if getattr(args, "start", ""):
+        from . import start
+
+        if cmd.strip() != "tailshare-start":
+            sys.exit("tailshare ssh-gate: this key may only run `tailshare-start`, with the request on stdin")
+        sys.exit(start.gate(args.start, getattr(args, "key", "")))
     try:
         panes = registered_panes(bus.STATE_DIR / "bus.db")
     except Exception as e:  # noqa: BLE001
@@ -493,6 +532,10 @@ class Keys:
         self.token = load_token(token_file or token_path(), create=True)
         with self.store.lock:
             self.store.db.executescript(SCHEMA)
+            cols = {r[1] for r in self.store.db.execute("PRAGMA table_info(key_requests)")}
+            for col, decl in (("purpose", "TEXT NOT NULL DEFAULT 'pane'"), ("want", "TEXT NOT NULL DEFAULT '[]'")):
+                if col not in cols:
+                    self.store.db.execute(f"ALTER TABLE key_requests ADD COLUMN {col} {decl}")
 
     def start(self) -> None:
         threading.Thread(target=self._loop, daemon=True, name="keys-loop").start()
@@ -538,7 +581,7 @@ class Keys:
     def _view(self, r) -> dict:
         return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN,
                 "owner": self.bus.net.user, "status": "pending" if r["status"] == "approving" else r["status"],
-                "expires": r["expires"],
+                "expires": r["expires"], "purpose": r["purpose"], "want": json.loads(r["want"]),
                 "key_id": r["key_id"], "installed": json.loads(r["installed"])}
 
     def _expire(self) -> None:
@@ -556,6 +599,7 @@ class Keys:
             raise bus.BusError(f"{ip} is not a device on this tailnet", 403)
         pubkey = parse_pubkey(body.get("pubkey"))
         device = clean_device(body.get("device_name"))
+        purpose, want = request_purpose(body)
         now = time.time()
         with self.store.lock:
             self._expire()
@@ -572,11 +616,11 @@ class Keys:
             if len(self.store.q("SELECT 1 FROM key_requests WHERE status='pending'")) >= 20:
                 raise bus.BusError("too many pending key requests on this machine", 429)
             rid = secrets.token_hex(16)
-            self.store.x("INSERT INTO key_requests(id, ip, node, user, device, pubkey, fingerprint, created, expires, status)"
-                         " VALUES(?,?,?,?,?,?,?,?,?,'pending')", rid, ip, node, user or "", device, pubkey,
-                         fingerprint(pubkey), now, now + PENDING_TTL)
+            self.store.x("INSERT INTO key_requests(id, ip, node, user, device, pubkey, fingerprint, created, expires, status,"
+                         " purpose, want) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?)", rid, ip, node, user or "", device,
+                         pubkey, fingerprint(pubkey), now, now + PENDING_TTL, purpose, json.dumps(want))
             r = self.store.one("SELECT * FROM key_requests WHERE id=?", rid)
-        log(f"request {rid[:8]} from {node} ({user}), device {device!r}, {r['fingerprint']}")
+        log(f"request {rid[:8]} from {node} ({user}), device {device!r}, {r['fingerprint']}, {purpose} {want}")
         self._notify(device, node, user or "")
         return self._view(r)
 
@@ -629,7 +673,8 @@ class Keys:
         rows = self.store.q("SELECT * FROM key_requests WHERE status='pending' ORDER BY created")
         return {"host": self.host, "owner": self.bus.net.user, "login": bus.LOGIN, "problem": install_problem(),
                 "targets": self.targets(), "pending": [
-                    {k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires")}
+                    {**{k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires",
+                                          "purpose")}, "want": json.loads(r["want"])}
                     for r in rows]}
 
     def ls(self) -> dict:
@@ -710,13 +755,15 @@ class Keys:
 
     def approve(self, body: dict) -> dict:
         """Called by `tailshare keys approve` on this machine (the local API)."""
-        rid, mode = str(body.get("id") or ""), str(body.get("mode") or "pane")
-        if mode not in MODES:
-            raise bus.BusError(f"mode must be one of {', '.join(MODES)}")
+        rid = str(body.get("id") or "")
         self._expire()
         r = self.store.one("SELECT * FROM key_requests WHERE id=? AND status='pending'", rid)
         if r is None:
             raise bus.BusError("no such pending request (it may have expired, or is being approved)", 404)
+        mode = str(body.get("mode") or default_mode(r["purpose"], json.loads(r["want"])))
+        problem = mode_problem(mode, r["purpose"], json.loads(r["want"]))
+        if problem:
+            raise bus.BusError(problem)
         tail = r["fingerprint"][-CONFIRM_CHARS:]
         if str(body.get("confirm") or "") != tail:
             raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the fingerprint", 403)
@@ -947,18 +994,19 @@ def cmd_pending(args):
     for p in d["pending"]:
         who = p["user"] or "unknown user"
         other = "" if p["user"] == d["owner"] else "   ⚠ not your device"
-        print(f"{p['id'][:8]}  {p['device']!r} on {p['node']} ({who}){other}")
+        kind = "" if p.get("purpose", "pane") == "pane" else "   start key" + (", wants skip" if "skip" in p.get("want", []) else "")
+        print(f"{p['id'][:8]}  {p['device']!r} on {p['node']} ({who}){other}{kind}")
         print(f"          {p['fingerprint']}  expires in {max(0, int(p['expires'] - time.time())) // 60} min")
     print("\napprove: tailshare keys approve <id>     deny: tailshare keys deny <id>")
 
 
 @_run
 def cmd_approve(args):
-    approve_interactive(args.id, args.shell, args.here, args.key, args.signer)
+    approve_interactive(args.id, args.shell, args.here, args.key, args.signer, start=args.start)
 
 
 def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_arg: str = "", signer_arg: str = "",
-                        tries: int = 1, skip_ok: bool = False) -> bool:
+                        tries: int = 1, skip_ok: bool = False, start: str = "") -> bool:
     """Show a pending request and install it if the person types the fingerprint's end. Returns whether a key
     was installed (False only when skip_ok and the person pressed Enter)."""
     from . import sessions, sessions_cli
@@ -968,7 +1016,19 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     if d.get("problem"):
         raise ValueError(d["problem"])
     p = _find(d["pending"], rid)
-    mode = "shell" if shell else "pane"
+    purpose, want = p.get("purpose", "pane"), p.get("want", [])
+    if purpose == "start":
+        if shell:
+            raise ValueError("this device asked for a start key; --shell is for attach keys")
+        mode = {"safe": "start", "skip": "start-skip"}.get(start) or default_mode(purpose, want)
+    elif start:
+        raise ValueError("this device asked for an attach key; it cannot get a start grant (the device enrolls a "
+                         "separate start key for that)")
+    else:
+        mode = "shell" if shell else "pane"
+    problem = mode_problem(mode, purpose, want)
+    if problem:
+        raise ValueError(problem)
     key = None
     if not here:
         try:
@@ -987,6 +1047,13 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     print(f"  fingerprint  {p['fingerprint']}")
     if mode == "pane":
         print(f"  access       attach to tmux panes of agents, as {d['login']}. Typing into a pane is as good as a shell.")
+    elif mode in ("start", "start-skip"):
+        print(f"  access       START agent sessions as {d['login']}, in the folders and kinds ~/.tailshare/start.json "
+              "allows (starting stays off where it has none)")
+        if mode == "start-skip":
+            print("               and may SKIP PERMISSIONS: the agent then runs any code without asking")
+        elif "skip" in want:
+            print("               (the device also asked to skip permissions; not granted: add --start=skip for that)")
     else:
         print(f"  access       a full shell as {d['login']}")
     print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (no signing key found: this machine only)"))
@@ -1036,7 +1103,7 @@ def cmd_ls(args):
         print(f"no tailshare-managed SSH keys for {d['login']} on {d['host']}")
     for k in d["keys"]:
         when = time.strftime("%Y-%m-%d", time.localtime(k["installed"]))
-        print(f"{k['id']}  {k['mode']:<5}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
+        print(f"{k['id']}  {k['mode']:<10}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
     for r in d.get("revoking", []):
         print(f"⚠ {r['key_id']} is still installed on {r['host']}: removal pending since "
               f"{time.strftime('%Y-%m-%d', time.localtime(r['created']))}" + (f" ({r['error']})" if r["error"] else ""))
@@ -1059,6 +1126,8 @@ def add_parser(sub) -> None:
     p = s.add_parser("approve", help="install a requested key (asks you to confirm its fingerprint)")
     p.add_argument("id")
     p.add_argument("--shell", action="store_true", help="full shell access, not only attaching to agent panes")
+    p.add_argument("--start", choices=("safe", "skip"), default="",
+                   help="for a start key: grant starting sessions (safe), or also skipping permissions (skip)")
     p.add_argument("--here", action="store_true", help="only this machine, even with a signing key")
     p.add_argument("--key", default="", help="signing key (default: TAILSHARE_SIGN_KEY or ~/.ssh/id_*_sk)")
     p.add_argument("--as", dest="signer", default="", help="signer name (default: your tailnet user)")
@@ -1072,4 +1141,7 @@ def add_parser(sub) -> None:
     p = s.add_parser("rm", help="remove a key here and on your other machines")
     p.add_argument("key_id")
     p.set_defaults(fn=cmd_rm)
-    sub.add_parser("ssh-gate", help="forced command of pane keys (run by sshd, not by hand)").set_defaults(fn=cmd_gate)
+    p = sub.add_parser("ssh-gate", help="forced command of tailshare's SSH keys (run by sshd, not by hand)")
+    p.add_argument("--start", choices=("safe", "skip"), default="", help="set by a start key's line")
+    p.add_argument("--key", default="", help="set by a start key's line")
+    p.set_defaults(fn=cmd_gate)
