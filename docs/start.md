@@ -169,6 +169,8 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 
 ## What a device can see
 
-`/hello` carries a `start` block (`kinds`, the options per kind, and whether `skip` and `auto` are possible) only to devices
+`/hello` carries a `start` block (`kinds`, the options per kind, whether `skip` is possible and, when claude's options include
+`permission_mode`, `permission_modes: {"claude": [...]}`, the modes a device may pick: `auto` only with `auto:
+true`, `bypassPermissions` only with `skip_permissions: true`) only to devices
 of the machine's own tailnet user, and only when starting is on. `GET /bus/v1/sessions/start/folders` lists the
 folders under the roots (two levels deep, at most 200, no hidden folders or symlinks) to the same devices only.

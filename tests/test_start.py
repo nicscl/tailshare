@@ -124,8 +124,7 @@ class Config(Base):
 
     def test_capabilities_and_folders(self):
         self.config(kinds={"claude": {"options": ["model", "nonsense"]}, "grok": {"options": []}})
-        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True,
-                                                       "auto": False})
+        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True})
         (self.root / ".hidden").mkdir()
         (self.root / "app" / "src").mkdir()
         self.assertEqual(start.folders(), [str(self.root / "app"), str(self.root / "lib"), str(self.root / "app" / "src")])
@@ -184,15 +183,19 @@ class Plans(Base):
         self.assertEqual((p["auto"], p["skip"]), (True, False))
         self.assertIn("--permission-mode=auto", p["argv"])
         self.assertNotIn("--dangerously-skip-permissions", p["argv"])
-        self.assertEqual((start.capabilities()["auto"], start.capabilities()["skip"]), (True, False))
+        self.assertEqual(start.capabilities()["permission_modes"],
+                         {"claude": ["default", "acceptEdits", "plan", "dontAsk", "auto"]})  # no skip: no bypass
+        self.assertIs(start.capabilities()["skip"], False)
         self.config()  # auto not in the config: off, whatever the grant
         for grant in ("safe", "skip"):
             self.assertEqual(self.refused(it, grant=grant), ("not_allowed", "options.permission_mode"))
-        self.assertIs(start.capabilities()["auto"], False)
+        self.assertEqual(start.capabilities()["permission_modes"],
+                         {"claude": ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]})
         self.config(auto="yes")  # only true turns it on
         self.assertEqual(self.refused(it)[0], "not_allowed")
         self.config(auto=True, kinds={"claude": {"bin": str(self.bin / "claude"), "options": ["model"]}})
         self.assertEqual(self.refused(it), ("not_allowed", "options.permission_mode"))  # nor without the option
+        self.assertNotIn("permission_modes", start.capabilities())
         self.config(auto=True)
         others = self.dry(self.item(options={"permission_mode": "acceptEdits"}),
                           self.item(kind="codex", options={"approval": "never"}))

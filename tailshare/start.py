@@ -153,8 +153,14 @@ def capabilities(path: Path | None = None) -> dict | None:
         return None
     if not cfg or not cfg["roots"] or not cfg["kinds"]:
         return None
-    return {"kinds": sorted(cfg["kinds"]), "options": {k: v["options"] for k, v in sorted(cfg["kinds"].items())},
-            "skip": cfg["skip_permissions"], "auto": cfg["auto"]}
+    out = {"kinds": sorted(cfg["kinds"]), "options": {k: v["options"] for k, v in sorted(cfg["kinds"].items())},
+           "skip": cfg["skip_permissions"]}
+    if "permission_mode" in cfg["kinds"].get("claude", {}).get("options", []):
+        # the values a device may pick: auto only where this host allows it, bypassPermissions only with skip
+        out["permission_modes"] = {"claude": [m for m in KINDS["claude"]["permission_mode"][1]
+                                              if (m != "auto" or cfg["auto"])
+                                              and (m != "bypassPermissions" or cfg["skip_permissions"])]}
+    return out
 
 
 def folders(path: Path | None = None, depth: int = 2, limit: int = 200) -> list[str]:
