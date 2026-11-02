@@ -833,15 +833,19 @@ class Keys:
         problem = mode_problem(mode, r["purpose"], json.loads(r["want"]))
         if problem:
             raise bus.BusError(problem)
+        if r["purpose"] == "start" and not r["plan_pubkey"]:  # enroll never stores one; never fall back to the start key's code
+            raise bus.BusError("this start request has no plan key; ask the device to enroll again", 409)
         tail = confirm_code(r)
         if str(body.get("confirm") or "") != tail:
             raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the "
                                f"{'pair ' if r['plan_pubkey'] else ''}fingerprint", 403)
         # the same code, or the same start key with another plan key: one of them is not the device
-        twins = [x for x in self.store.q("SELECT fingerprint, pubkey, plan_pubkey FROM key_requests"
-                                         " WHERE status='pending' AND id!=?", rid)
-                 if confirm_code(x) == tail or (x["pubkey"] == r["pubkey"] and x["plan_pubkey"] != r["plan_pubkey"])]
-        if twins:
+        others = self.store.q("SELECT fingerprint, pubkey, plan_pubkey FROM key_requests WHERE status='pending' AND id!=?", rid)
+        if any(x["pubkey"] == r["pubkey"] and x["plan_pubkey"] != r["plan_pubkey"] for x in others):
+            raise bus.BusError("another pending request has the same start key with a different plan key: someone may be "
+                               "imitating this device. Deny the requests you do not recognize, then ask the device to "
+                               "enroll again", 409)
+        if any(confirm_code(x) == tail for x in others):
             raise bus.BusError("another pending request ends in the same characters: someone may be imitating this "
                                "device. Deny the requests you do not recognize, then ask the device to enroll again", 409)
         if not self.store.x("UPDATE key_requests SET status='approving' WHERE id=? AND status='pending'", rid):

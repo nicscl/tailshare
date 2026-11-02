@@ -594,11 +594,23 @@ class Enroll(unittest.TestCase):
             with self.assertRaises(bus.BusError) as e:  # same start key, another plan key: neither, until one is denied
                 self.k.approve({"id": rid, "mode": "start", "confirm": code})
             self.assertEqual(e.exception.code, 409)
+        with self.assertRaises(bus.BusError) as e:
+            self.k.approve({"id": mine["request_id"], "mode": "start", "confirm": mine["pair_fingerprint"][-6:]})
+        self.assertIn("same start key with a different plan key", str(e.exception))
         self.k.deny({"id": theirs["request_id"]})
         out = self.k.approve({"id": mine["request_id"], "mode": "start", "confirm": mine["pair_fingerprint"][-6:]})
         self.assertIn(keys.parse_pubkey(self.plan), (self.tmp / "authorized_keys").read_text())
         self.assertNotIn(keys.parse_pubkey(evil), (self.tmp / "authorized_keys").read_text())
         self.assertTrue(out["key_id"])
+
+    def test_a_start_request_without_its_plan_key_is_never_approved(self):
+        r = self.start_request()
+        self.k.store.x("UPDATE key_requests SET plan_pubkey='' WHERE id=?", r["request_id"])  # never from enroll
+        for code in (r["fingerprint"][-6:], r["pair_fingerprint"][-6:]):
+            with self.assertRaises(bus.BusError) as e:
+                self.k.approve({"id": r["request_id"], "mode": "start", "confirm": code})
+            self.assertEqual(e.exception.code, 409)
+        self.assertFalse(self.k.ls()["keys"])
 
     def test_a_new_plan_key_is_a_new_request(self):
         first = self.start_request()
