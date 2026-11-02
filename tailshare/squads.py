@@ -552,7 +552,8 @@ class Squads:
                      "WHERE m.owner=squads.owner AND m.squad=squads.id)", cutoff)
 
     # -- HTTP ----------------------------------------------------------------------------
-    def route(self, method: str, path: str, body: dict, local: bool, ip: str, qs: dict, token: str = "") -> dict:
+    def route(self, method: str, path: str, body: dict, local: bool, ip: str, qs: dict, token: str = "",
+              signed: tuple[bytes, dict] = (b"", {})) -> dict:
         parts = path.strip("/").split("/")  # squads[/<id>[/members/<member>]]
         if local:
             user, own = self.owner, True
@@ -573,10 +574,14 @@ class Squads:
             raise bus.BusError("not found", 404)
         if not own:  # a sharee's writes, or anyone else's, never land
             raise bus.BusError("only the squad's owner can change it", 403)
-        if not local and self._machine(ip):
+        if not local and not any(signed[1].values()) and self._machine(ip):
             # a program on one of the owner's machines (this one included, by its tailnet IP) would skip the token
             # the local API asks for: machines write through their own local API; the peer API is for devices
             raise bus.BusError("squad edits from a machine go through its own local API: `tailshare squad edit`", 403)
+        if not local:  # a device signs each write with one of its keys installed here (the iPad's comes from a machine)
+            if self.bus.keys is None:
+                raise bus.BusError("signature", 403, {"reason": "unknown_key", "detail": "SSH keys are off on this machine"})
+            self.bus.keys.check_signed(method, "/bus/v1" + path, signed[0], signed[1], self.owner)
         if local and (self.bus.keys is None or len(self.bus.keys.token) < 64
                       or not secrets.compare_digest(token.encode(), self.bus.keys.token.encode())):
             raise bus.BusError("local squad edits need ~/.tailshare/keys.token: use `tailshare squad edit`", 403)

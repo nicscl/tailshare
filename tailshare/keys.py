@@ -55,6 +55,9 @@ END = "# <<< tailshare managed keys <<<"
 _ID_RE = re.compile(r"[0-9a-f]{32}")
 _KEY_ID_RE = re.compile(r"k[0-9a-f]{12}")
 _EXE_RE = re.compile(r"/[A-Za-z0-9._/+-]+")
+SQUADS_NAMESPACE = "tailshare-squads"  # a device's signed squad write; never valid as a launch or a key approval
+SIGNED_WINDOW = 60  # how far a signed write's time may be from this machine's clock
+SIGNED_HEADERS = ("X-Tailshare-Key", "X-Tailshare-Time", "X-Tailshare-Nonce", "X-Tailshare-Signature")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS key_requests(
@@ -874,6 +877,50 @@ class Keys:
         if not n:
             raise bus.BusError("no such pending request", 404)
         return {"denied": True}
+
+    # -- signed writes from devices ------------------------------------------------------
+    def check_signed(self, method: str, path: str, raw: bytes, headers: dict, owner: str) -> dict:
+        """A device's signed write (docs/squads.md): signed with one of `owner`'s keys installed here, for this
+        machine, this method, path and body, recently and once. Returns the key's row; refuses with 403."""
+        from .sessions import ssh_keygen
+
+        def no(reason: str, why: str, **more) -> bus.BusError:
+            return bus.BusError("signature", 403, {"reason": reason, "detail": why, **more})
+
+        key_id, ts, nonce, sig = (str(headers.get(h) or "") for h in SIGNED_HEADERS)
+        if not (key_id or ts or nonce or sig):
+            raise no("unsigned", "squad writes from a device must be signed with one of its keys")
+        if not (_KEY_ID_RE.fullmatch(key_id) and re.fullmatch(r"[0-9]{1,12}", ts) and re.fullmatch(r"[0-9a-f]{32}", nonce)
+                and re.fullmatch(r"[A-Za-z0-9+/]{20,4096}={0,2}", sig)):
+            raise no("bad_signature", "malformed signature headers")
+        now = time.time()
+        if abs(now - int(ts)) > SIGNED_WINDOW:
+            raise no("expired", f"the request's time is more than {SIGNED_WINDOW} s from this machine's clock",
+                     now=int(now))  # so a device with a wrong clock can correct once
+        if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
+            raise no("revoked", f"key {key_id} was removed from {self.host}")
+        row = self.store.one("SELECT * FROM ssh_keys WHERE id=?", key_id)
+        if row is None or not owner or row["user"] != owner:
+            raise no("unknown_key", f"no key {key_id} of {owner or 'the owner'} is installed on {self.host}")
+        message = "\n".join(["tailshare-squad-write/1", self.host, method, path, ts, nonce,
+                              hashlib.sha256(raw).hexdigest()])
+        armored = "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(sig[i : i + 70] for i in range(0, len(sig), 70)) \
+            + "\n-----END SSH SIGNATURE-----\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            signers, sigfile = Path(tmp) / "signers", Path(tmp) / "sig"
+            signers.write_text("".join(f'{key_id} namespaces="{SQUADS_NAMESPACE}" {k}\n'
+                                       for k in (row["pubkey"], row["plan_pubkey"]) if k))
+            sigfile.write_text(armored)
+            cp = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", key_id, "-n", SQUADS_NAMESPACE,
+                                 "-s", str(sigfile)], input=message.encode(), capture_output=True, timeout=30)
+        if cp.returncode != 0:
+            raise no("bad_signature", "the signature does not match this request on this machine with that key")
+        with self.store.lock:
+            self.store.x("DELETE FROM key_nonces WHERE expires<?", now)
+            if self.store.one("SELECT 1 FROM key_nonces WHERE nonce=?", "sq:" + nonce):
+                raise no("replayed", "this nonce was already used: sign the write again")
+            self.store.x("INSERT INTO key_nonces(nonce, expires) VALUES(?,?)", "sq:" + nonce, int(ts) + 2 * SIGNED_WINDOW)
+        return dict(row)
 
     # -- revoking ------------------------------------------------------------------------
     def remove_here(self, key_id: str) -> bool:

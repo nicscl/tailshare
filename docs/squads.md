@@ -109,9 +109,40 @@ for the owner only; any other write, a sharee's for one, gets 403. The owner wri
 - on the local API, a caller that sends `~/.tailshare/keys.token` as `X-Tailshare-Keys`, as `tailshare squad
   edit` does. Every process of that account can read the file, an agent's included: the check keeps agents
   from editing squads by accident or through the plain API, not one set on reading the token.
-- on the peer API, a device of the same tailnet user (the Hive app). Not a machine: neither this one, by its
-  tailnet address, nor one that runs tailshare (it has answered `/hello`). Those write through their own local
-  API, so the token cannot be stepped around through the peer API.
+- on the peer API, a device of the same tailnet user (the Hive app), with each write signed by one of its keys
+  installed on this machine (below). Unsigned, a machine never writes there: neither this one, by its tailnet
+  address, nor one that runs tailshare (it has answered `/hello`). Those write through their own local API, so
+  the token cannot be stepped around through the peer API.
+
+### Signed writes
+
+A device signs each squad write with one of its SSH keys installed on the machine it writes to: a start key's
+plan key (no Face ID), or the pane key. The key must be the owner's (enrolled from the owner's device) and not
+removed. Any of the owner's addresses may send a signed write, so the iPad, whose iSH runs tailshare, writes
+the same way as the iPhone. The signed message is UTF-8, seven lines joined by `\n` with no newline at the end:
+
+```
+tailshare-squad-write/1
+<host>          the machine's name, as its /hello "host"
+<METHOD>        PUT or PATCH
+<path>          /bus/v1/squads/<id>[/members/<member>], without the query
+<time>          unix seconds
+<nonce>         32 lowercase hex characters, new for each write
+<body sha256>   lowercase hex, of the exact body bytes sent
+```
+
+It is signed as `ssh-keygen -Y sign -n tailshare-squads` signs (SSHSIG, sha256). It is sent in headers:
+`X-Tailshare-Key` (the key id, `k` and 12 hex), `X-Tailshare-Time`, `X-Tailshare-Nonce` and
+`X-Tailshare-Signature` (the SSHSIG blob in base64, without the armor lines). The time may be at most 60 s from
+the machine's clock, and a nonce is used once. A refusal is `403 {"error": "signature", "reason": …}`, where
+the reason is one of these:
+
+- `unsigned`
+- `bad_signature`, which also covers another machine, path, method or body
+- `expired`, which carries the machine's `now`
+- `replayed`
+- `revoked`
+- `unknown_key`, when no key by that id of the owner is installed here
 
 Each agent in `/hello` carries `squad: {id, member}` when it is a squad member, for the owner's machines and
 devices only.
