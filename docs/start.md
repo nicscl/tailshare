@@ -63,10 +63,11 @@ restrict,command="<python> -I -m tailshare ssh-gate --start=safe --key=k3f2a91c0
 folder from loading code before the gate starts. With no plain interpreter path to write, the line runs
 `/usr/bin/false`.
 
-`restrict` means no pty, no forwarding and no `~/.ssh/rc`. The gate runs `tailshare-start` and nothing else. Nothing the
-client sends in its environment changes where or how a session starts: the gate takes HOME from the
-password database, uses a fixed PATH and drops `TAILSHARE_*`/`TMUX*` variables, whatever the host's sshd
-`AcceptEnv` or `PermitUserEnvironment` say.
+`restrict` means no pty, no forwarding and no `~/.ssh/rc`. The gate runs `tailshare-start` and nothing else. Once
+the gate runs, nothing the client sent in its environment changes where or how a session starts: it takes HOME
+from the password database, uses a fixed PATH and drops `TAILSHARE_*`/`TMUX*`/`PYTHON*` variables. sshd still
+runs the line through your login shell, so that shell's startup files (`~/.zshenv`, say) run first and see any
+variables sshd accepted: keep `AcceptEnv` to what you need and `PermitUserEnvironment` off.
 
 In the Hive app both keys live in the Secure Enclave. The start key needs Face ID on each use; the plan key
 does not, so dry runs cost no Face ID and a start costs one per host's confirm (the app confirms a multi-host
@@ -90,8 +91,8 @@ reads one JSON line back (at most 512 KB). The exit status is 0 only if every it
 ```
 
 Each result is either `{"plan_id", "expires", "plan"}` or `{"error", "field"?, "reason"?}`. The plan is what
-would run: the host, kind, folder, name, `skip`, the exact argv (the instructions appear once, as the plan's
-`instructions`, with `<instructions>` standing for them in the argv), the environment and the tmux window.
+would run: the host, kind, folder, name, `skip`, the exact argv (the instructions and the prompt appear once, as the
+plan's `instructions` and `prompt`, with `<instructions>` and `<prompt>` standing for them in the argv), the environment and the tmux window.
 Nothing has started yet. Plans are stored in `~/.tailshare/start.db` (owner-only).
 
 **Confirm.** `{"v": 1, "confirm": ["<plan_id>", ...]}`. For each plan the machine checks again, from scratch:

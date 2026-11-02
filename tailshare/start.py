@@ -51,6 +51,7 @@ MAX_DIRS = 8
 TMUX_SOCKET = ""
 SESSION = "tailshare-start"
 INSTRUCTIONS = "<instructions>"  # stands for the instructions in a plan's argv
+PROMPT = "<prompt>"  # and the prompt
 
 _WORD = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -334,7 +335,7 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
            "PATH": os.pathsep.join(dict.fromkeys([os.path.dirname(exe), os.path.expanduser("~/.local/bin"),
                                                   "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))}
     return {"host": host, "kind": kind, "cwd": cwd, "name": name, "options": opts, "skip": skip,
-            "argv": argv_for(kind, exe, cwd, name, opts, instructions and INSTRUCTIONS, prompt, session), "env": env,
+            "argv": argv_for(kind, exe, cwd, name, opts, instructions and INSTRUCTIONS, prompt and PROMPT, session), "env": env,
             "prompt": prompt,
             "tmux": {"session": SESSION, "window": slug(name)}, "session": session,
             "instructions": instructions,
@@ -400,10 +401,13 @@ CREATE TABLE IF NOT EXISTS confirms(key TEXT NOT NULL, at REAL NOT NULL);
 def _db(path: Path | None = None) -> sqlite3.Connection:
     path = path or db_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path), timeout=10, isolation_level=None)
-    os.chmod(path, 0o600)
-    con.row_factory = sqlite3.Row
-    con.executescript(SCHEMA)
+    old = os.umask(0o077)  # the database and its -wal/-journal files are owner-only from the start
+    try:
+        con = sqlite3.connect(str(path), timeout=10, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        con.executescript(SCHEMA)
+    finally:
+        os.umask(old)
     now = time.time()
     con.execute("DELETE FROM plans WHERE (used IS NULL AND expires<?) OR (used IS NOT NULL AND used<?)",
                 (now, now - KEEP))

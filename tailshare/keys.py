@@ -38,6 +38,7 @@ from . import bus
 
 ENROLL = os.environ.get("TAILSHARE_SSH_ENROLL", "1") != "0"
 KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256")
+START_KEY_TYPE = "ecdsa-sha2-nistp256"  # start and plan keys: what the Secure Enclave makes, and nothing else
 MODES = ("pane", "shell", "start", "start-skip")
 PURPOSES = {"pane": ("pane", "shell"), "start": ("start", "start-skip")}  # what each kind of request may become
 REQUIRE_SK = True  # signed approvals must come from a security key (tests turn this off)
@@ -631,6 +632,8 @@ class Keys:
             plan = parse_pubkey(body.get("plan_pubkey"))
             if plan == pubkey:
                 raise bus.BusError("plan_pubkey must be a different key from pubkey")
+            if not all(k.startswith(START_KEY_TYPE + " ") for k in (pubkey, plan)):
+                raise bus.BusError(f"start and plan keys must be {START_KEY_TYPE}")
         now = time.time()
         with self.store.lock:
             self._expire()
@@ -732,6 +735,8 @@ class Keys:
             plan = (r.get("plan_pubkey") or "") if mode in ("start", "start-skip") else ""
             if mode in ("start", "start-skip") and not plan:
                 raise bus.BusError("a start key needs its plan key", 409)
+            if mode in ("start", "start-skip") and not all(x.startswith(START_KEY_TYPE + " ") for x in (r["pubkey"], plan)):
+                raise bus.BusError(f"start keys must be {START_KEY_TYPE}", 409)
             for k in filter(None, (r["pubkey"], plan)):  # sshd takes the first line that matches a key: one line each
                 if self.store.one("SELECT 1 FROM ssh_keys WHERE id!=? AND (pubkey=? OR plan_pubkey=?)", key_id, k, k):
                     raise bus.BusError("this key is already installed here under another id", 409)
@@ -784,6 +789,8 @@ class Keys:
                 plan = parse_pubkey(d.get("plan_pubkey"))
                 if plan != d.get("plan_pubkey") or fingerprint(plan) != d.get("plan_fingerprint") or plan == d.get("pubkey"):
                     problems.append("plan key and fingerprint do not match")
+                if not all(str(x).startswith(START_KEY_TYPE + " ") for x in (plan, d.get("pubkey"))):
+                    problems.append(f"start keys must be {START_KEY_TYPE}")
             except bus.BusError:
                 problems.append("bad plan key")
         if problems:

@@ -52,8 +52,9 @@ class Base(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        self.addCleanup(self._kill_tmux)
+        # cleanups run last-added first: the tmux server goes before its socket's folder does
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(self._kill_tmux)
         self.config()
 
     def _kill_tmux(self):
@@ -188,7 +189,8 @@ class Plans(Base):
         self.assertIn("--permission-mode=plan", a)
         self.assertIn("--model=opus", a)
         self.assertIn(f"--add-dir={self.root / 'lib'}", a)
-        self.assertEqual(a[-2:], ["--", "--help"])
+        self.assertEqual(a[-2:], ["--", "<prompt>"])  # the prompt too: once, as the plan's prompt
+        self.assertEqual(p["prompt"], "--help")
         self.assertTrue(all(x.startswith("--") for x in a[1:-1]), a)
         self.assertEqual(p["env"]["TAILSHARE_STARTED_BY"], "Nick's iPhone")
         self.assertEqual(p["tmux"], {"session": "tailshare-start", "window": "appdev"})
@@ -417,8 +419,9 @@ runpy.run_module("tailshare", run_name="__main__", alter_sys=True)' "$@"
             f"Port {self.port}\nListenAddress 127.0.0.1\nHostKey {d / 'host'}\nAuthorizedKeysFile {d / 'authorized_keys'}\n"
             f"PidFile {d / 'pid'}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n"
             "PermitUserRC no\nStrictModes no\nPermitUserEnvironment no\n")
+        self.sshd_log = open(d / "log", "wb")
         self.sshd = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(d / "sshd_config")],
-                                     stdout=subprocess.DEVNULL, stderr=open(d / "log", "wb"))
+                                     stdout=subprocess.DEVNULL, stderr=self.sshd_log)
         self.addCleanup(self._stop)
         self.ssh = ["ssh", "-T", "-F", "none", "-p", str(self.port), "-i", str(d / "client"), "-o", "BatchMode=yes",
                     "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", f"UserKnownHostsFile={d / 'known'}",
@@ -431,6 +434,7 @@ runpy.run_module("tailshare", run_name="__main__", alter_sys=True)' "$@"
     def _stop(self):
         self.sshd.terminate()
         self.sshd.wait(5)
+        self.sshd_log.close()
 
     def send(self, cmd, doc, ident="client"):
         ssh = [x.replace(f"{os.sep}client", f"{os.sep}{ident}") if x.endswith(f"{os.sep}client") else x for x in self.ssh]
@@ -520,7 +524,8 @@ class Enroll(unittest.TestCase):
         net = StaticNet("air", ipmap={"100.1.1.1": "iphone"}, usermap={"100.1.1.1": "nick@example.com"})
         self.b = make_bus("air", net)
         p = [mock.patch.object(keys, "install_problem", return_value=""),
-             mock.patch.object(keys, "gate_exe", return_value="/x/tailshare")]
+             mock.patch.object(keys, "gate_exe", return_value="/x/tailshare"),
+             mock.patch.object(keys.Keys, "_notify")]  # no real macOS notification from a test
         for x in p:
             x.start()
             self.addCleanup(x.stop)
@@ -553,6 +558,14 @@ class Enroll(unittest.TestCase):
             f"{keys.parse_pubkey(self.plan)} tailshare:{kid} plan iPhone"])
         self.k.rm({"key_id": kid})  # removing the start key removes its plan key
         self.assertFalse([x for x in (self.tmp / "authorized_keys").read_text().splitlines() if "ecdsa" in x])
+
+    def test_start_keys_are_p256(self):
+        ed = self.tmp / "ed"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ed)], check=True, capture_output=True)
+        ed = (self.tmp / "ed.pub").read_text().strip()
+        for kw in ({"pubkey": ed}, {"plan_pubkey": ed}):
+            with self.assertRaises(bus.BusError):
+                self.start_request(**kw)
 
     def test_start_key_needs_its_plan_key(self):
         for bad in ({"plan_pubkey": None}, {"plan_pubkey": "nonsense"}):
