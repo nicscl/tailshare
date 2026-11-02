@@ -20,7 +20,8 @@ something the gate enforces. Approve only devices you would give a shell to.
    which the device cannot fake, and shows a desktop notification on macOS.
 3. A person runs `tailshare keys pending`, then `tailshare keys approve <id>`. The command prints the device,
    its tailnet node and owner (flagged when it is not one of yours), the fingerprint and what access it
-   grants. To approve, the person types the last 6 characters of the fingerprint shown on the device.
+   grants. To approve, the person types the last 6 characters of the fingerprint shown on the device (for a
+   start key, of the pair fingerprint, which covers its plan key too: [start.md](start.md)).
 4. The key is installed. The device polls `GET /bus/v1/keys/enroll/<request id>` until it sees `approved`,
    then connects with SSH.
 

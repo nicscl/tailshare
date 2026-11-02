@@ -198,6 +198,20 @@ def fingerprint(pubkey: str) -> str:
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
 
 
+def pair_fingerprint(pubkey: str, plan: str) -> str:
+    """A start key and its plan key as one: SHA256 of both key blobs, start first (both P-256, so fixed length).
+    Its last characters are the code for a start request, so a plan key swapped in by someone else changes it."""
+    blob = base64.b64decode(pubkey.split()[1]) + base64.b64decode(plan.split()[1])
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def confirm_code(r) -> str:
+    """What the person types to approve a request: the end of the fingerprint the device shows, which for a start
+    request covers its plan key too."""
+    fp = pair_fingerprint(r["pubkey"], r["plan_pubkey"]) if r["plan_pubkey"] else r["fingerprint"]
+    return fp[-CONFIRM_CHARS:]
+
+
 def clean_device(name: object) -> str:
     """The device name the client reported: shown to people and written as a key comment."""
     s = re.sub(r"[^A-Za-z0-9 ._'-]", "", name if isinstance(name, str) else "")
@@ -616,6 +630,7 @@ class Keys:
     # -- requests from devices --------------------------------------------------
     def _view(self, r) -> dict:
         return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN,
+                **({"pair_fingerprint": pair_fingerprint(r["pubkey"], r["plan_pubkey"])} if r["plan_pubkey"] else {}),
                 "owner": self.bus.net.user, "status": "pending" if r["status"] == "approving" else r["status"],
                 "expires": r["expires"], "purpose": r["purpose"], "want": json.loads(r["want"]),
                 "key_id": r["key_id"], "installed": json.loads(r["installed"])}
@@ -646,8 +661,8 @@ class Keys:
         now = time.time()
         with self.store.lock:
             self._expire()
-            same = self.store.one("SELECT * FROM key_requests WHERE ip=? AND pubkey=? AND status IN ('pending','approving','approved')"
-                                  " ORDER BY created DESC", ip, pubkey)
+            same = self.store.one("SELECT * FROM key_requests WHERE ip=? AND pubkey=? AND plan_pubkey=?"
+                                  " AND status IN ('pending','approving','approved') ORDER BY created DESC", ip, pubkey, plan)
             if same:
                 return self._view(same)
             for k in filter(None, (pubkey, plan)):
@@ -719,7 +734,8 @@ class Keys:
                 "targets": self.targets(), "pending": [
                     {**{k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires",
                                           "purpose", "plan_pubkey")}, "want": json.loads(r["want"]),
-                     "plan_fingerprint": fingerprint(r["plan_pubkey"]) if r["plan_pubkey"] else ""}
+                     "plan_fingerprint": fingerprint(r["plan_pubkey"]) if r["plan_pubkey"] else "",
+                     "pair_fingerprint": pair_fingerprint(r["pubkey"], r["plan_pubkey"]) if r["plan_pubkey"] else ""}
                     for r in rows]}
 
     def ls(self) -> dict:
@@ -830,11 +846,14 @@ class Keys:
         problem = mode_problem(mode, r["purpose"], json.loads(r["want"]))
         if problem:
             raise bus.BusError(problem)
-        tail = r["fingerprint"][-CONFIRM_CHARS:]
+        tail = confirm_code(r)
         if str(body.get("confirm") or "") != tail:
-            raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the fingerprint", 403)
-        twins = [x for x in self.store.q("SELECT fingerprint FROM key_requests WHERE status='pending' AND id!=?", rid)
-                 if x["fingerprint"][-CONFIRM_CHARS:] == tail]
+            raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the "
+                               f"{'pair ' if r['plan_pubkey'] else ''}fingerprint", 403)
+        # the same code, or the same start key with another plan key: one of them is not the device
+        twins = [x for x in self.store.q("SELECT fingerprint, pubkey, plan_pubkey FROM key_requests"
+                                         " WHERE status='pending' AND id!=?", rid)
+                 if confirm_code(x) == tail or (x["pubkey"] == r["pubkey"] and x["plan_pubkey"] != r["plan_pubkey"])]
         if twins:
             raise bus.BusError("another pending request ends in the same characters: someone may be imitating this "
                                "device. Deny the requests you do not recognize, then ask the device to enroll again", 409)
@@ -1176,6 +1195,7 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     print(f"  fingerprint  {p['fingerprint']}")
     if p.get("plan_fingerprint"):
         print(f"  plan key     {p['plan_fingerprint']} (dry runs only, without Face ID; installed with it)")
+        print(f"  pair         {p['pair_fingerprint']} (both keys: the device shows this one)")
     if mode == "pane":
         print(f"  access       attach to tmux panes of agents, as {d['login']}. Typing into a pane is as good as a shell.")
     elif mode in ("start", "start-skip"):
@@ -1188,10 +1208,11 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     else:
         print(f"  access       a full shell as {d['login']}")
     print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (no signing key found: this machine only)"))
-    want = p["fingerprint"][-CONFIRM_CHARS:]
+    want = confirm_code(p)
+    which = "pair fingerprint" if p.get("plan_pubkey") else "fingerprint"
     skip = "skip" if skip_ok else "cancel"
     for attempt in range(tries):
-        got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint shown on the device (Enter to {skip}): ").strip()
+        got = input(f"Type the last {CONFIRM_CHARS} characters of the {which} shown on the device (Enter to {skip}): ").strip()
         if not got:
             if skip_ok:
                 print("skipped: nothing installed. Approve later with `tailshare keys approve " + p["id"][:8] + "`")
@@ -1202,7 +1223,7 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
         if attempt + 1 < tries:
             print("✗ does not match; try again")
     else:
-        raise ValueError("does not match the fingerprint: nothing installed")
+        raise ValueError(f"does not match the {which}: nothing installed")
     if squads is None and mode in ("start", "start-skip"):
         squads = input("Let its plan key (no Face ID) also edit your squads from the app? [y/N]: ").strip().lower() in ("y", "yes")
     body = {"id": p["id"], "mode": mode, "confirm": got, "squads": bool(squads)}

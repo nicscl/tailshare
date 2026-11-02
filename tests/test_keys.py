@@ -256,7 +256,7 @@ class Flow(unittest.TestCase):
         p = self.air_keys.pending()["pending"][0]
         payload = keys.approval_doc("nick", "air", p, "k" + "a" * 12, "start", ["air", "pro"])
         sig = sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE)
-        body = {"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "start", "payload": payload,
+        body = {"confirm": r["pair_fingerprint"][-6:], "id": r["request_id"], "mode": "start", "payload": payload,
                 "signature": sig, "squads": True}
         with self.assertRaises(bus.BusError) as cm:  # the grant must be in what was signed, not only asked for
             self.air_keys.approve(body)
