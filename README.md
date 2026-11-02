@@ -188,6 +188,21 @@ only once (recorded in `~/.tailshare/claude-hooks.json`), so one you delete by h
 `notify = ["tailshare", "agent", "codex-notify"]` to `~/.codex/config.toml` (if `notify` is not already set)
 and its agents show `idle` after each turn.
 
+**Skipped permissions.** For the owner's own machines and devices only (another user, a tagged device or an unknown
+caller never gets it), each agent in `/hello` carries `skip: true` when it runs without asking, `false` when it
+asks, and nothing when that is not known. This is a display hint, not a security signal: any local process can
+post a hook or start a process with misleading flags, so a missing or false `skip` never means an agent is safe.
+- Claude: from the `permission_mode` in each of its hooks, so it follows a mode change mid-session. Modes
+  `bypassPermissions` and `auto` count as skip (`bus.SKIP_MODES`, the same set as start.json's). Unknown until
+  its first hook.
+- Codex: from its real argv (macOS `kern.procargs2`, Linux `/proc`), read once per process when it registers, and
+  only for a process of the account the mailbox runs as whose program is `codex`. A prompt is one argument, so
+  what it says is never taken for a flag. `--dangerously-bypass-approvals-and-sandbox` (`--yolo`) or a
+  `danger-full-access` sandbox (`-s`, `--sandbox`, `-c`/`--config sandbox_mode=`) is skip; another sandbox,
+  `--approve-for-me` or the older `--full-auto` is not. Anything else is unknown: a sandbox set only in
+  `~/.codex/config.toml`, two that disagree, a flag tailshare does not know, or a session inside the Codex app's
+  `app-server`.
+
 **Pairing the Hive app.** `tailshare hive pair` prints a QR code that makes this machine the Tailshare Hive
 app's first trusted machine, then waits until a phone uses it. The link is `tailsharehive://pair/<base64url JSON>`
 with `{v, ip, port, host, owner, hk, t, c, exp}`:

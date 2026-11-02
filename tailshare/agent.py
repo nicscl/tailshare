@@ -142,6 +142,39 @@ def attach_command(a: dict, here: str = "") -> str:
     return f"ssh -t {shlex.quote(dest)} {shlex.quote(remote)}"
 
 
+_codex_found = 0
+
+
+def _codex_pid() -> int:
+    """The codex process this shell or MCP server runs under, so the mailbox can read how it was started
+    (bus.pid_skip). Kept once found (the MCP server and watch register often); 0, asked again next time, if not."""
+    global _codex_found
+    if not _codex_found:
+        _codex_found = _find_codex_pid()
+    return _codex_found
+
+
+def _find_codex_pid() -> int:
+    try:
+        out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True,
+                             timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    procs = {}  # macOS cuts comm at 16 characters, so the program is args' first word
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), os.path.basename(parts[2]))
+    pid = os.getppid()
+    for _ in range(16):
+        if pid not in procs:
+            return 0
+        if procs[pid][1] == "codex":
+            return pid
+        pid = procs[pid][0]
+    return 0
+
+
 def _detect_session(hook: dict) -> Identity:
     env = os.environ
     if env.get("TAILSHARE_AGENT_ID"):
@@ -155,7 +188,7 @@ def _detect_session(hook: dict) -> Identity:
         return Identity(sid, "claude", cwd, _claude_title(tp), int(env.get("CLAUDE_PID") or 0))
     tid = env.get("CODEX_THREAD_ID")
     if tid:
-        return Identity(tid, "codex", os.getcwd(), _codex_title(tid))
+        return Identity(tid, "codex", os.getcwd(), _codex_title(tid), _codex_pid())
     cwd = os.getcwd()
     # A person at a shell: one identity per folder.
     return Identity("cli-" + hashlib.sha1(cwd.encode()).hexdigest()[:12], "cli", cwd, env.get("TAILSHARE_AGENT_NAME", ""))
