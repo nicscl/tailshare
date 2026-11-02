@@ -20,7 +20,8 @@ something the gate enforces. Approve only devices you would give a shell to.
    which the device cannot fake, and shows a desktop notification on macOS.
 3. A person runs `tailshare keys pending`, then `tailshare keys approve <id>`. The command prints the device,
    its tailnet node and owner (flagged when it is not one of yours), the fingerprint and what access it
-   grants. To approve, the person types the last 6 characters of the fingerprint shown on the device.
+   grants. To approve, the person types the last 6 characters of the fingerprint shown on the device (for a
+   start key, of the pair fingerprint, which covers its plan key too: [start.md](start.md)).
 4. The key is installed. The device polls `GET /bus/v1/keys/enroll/<request id>` until it sees `approved`,
    then connects with SSH.
 
@@ -28,6 +29,8 @@ something the gate enforces. Approve only devices you would give a shell to.
 tailshare keys pending                 # requests waiting here
 tailshare keys approve 3f2a91c0        # pane access (default)
 tailshare keys approve 3f2a91c0 --shell   # a full shell instead
+tailshare keys approve 3f2a91c0 --start=safe   # a start key: start sessions, never skip (docs/start.md)
+tailshare keys approve 3f2a91c0 --squads  # a start key whose plan key may also edit your squads (docs/squads.md)
 tailshare keys deny 3f2a91c0
 tailshare keys ls                      # keys tailshare installed here
 tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machines
@@ -75,8 +78,13 @@ sessions that are already open, and anything a session changed while attached (a
 Pane keys are installed as
 
 ```
-restrict,pty,command="/path/to/tailshare ssh-gate" ssh-ed25519 AAAA... tailshare:<key id> <device>
+restrict,pty,command="/path/to/python -I -m tailshare ssh-gate" ssh-ed25519 AAAA... tailshare:<key id> <device>
 ```
+
+The interpreter tailshare runs under, with `-I`, rather than the `tailshare` console script: `PYTHONPATH`,
+`PYTHONSTARTUP` and the like act before any of tailshare's code runs, so a variable sshd accepted from the client
+(`AcceptEnv`) could otherwise load code. If that interpreter's path is not plain, or tailshare does not import under it with `-I`
+(a `pip install --user`, say), the line keeps the console script. Lines already installed change the next time a key is installed or removed on that machine. The bus checks the interpreter once and keeps the answer, so after moving or upgrading tailshare's install, restart the mailbox before installing a key.
 
 `tailshare ssh-gate` reads `SSH_ORIGINAL_COMMAND` and accepts only
 
@@ -215,12 +223,14 @@ plain `attach`, which is a full tmux client.
   tailscaled's keys from `tailscale status`, not `/etc/ssh`. It ignores `authorized_keys`;
   access there follows the tailnet's SSH policy instead.
 
-`POST /bus/v1/keys/enroll` takes `{"pubkey": "ssh-ed25519 AAAA...", "device_name": "Nick's iPhone"}` and
+`POST /bus/v1/keys/enroll` takes `{"pubkey": "ssh-ed25519 AAAA...", "device_name": "Nick's iPhone"}`, plus
+`"purpose": "start"`, `"want": ["start"]` or `["start", "skip"]` and `"plan_pubkey"` (its plan key, a different key)
+for a start key ([start.md](start.md)), and
 answers:
 
 ```json
 {"request_id": "…", "fingerprint": "SHA256:…", "host": "macbook-pro", "login": "Glaciar", "owner": "…",
- "status": "pending", "expires": 1793390000.0, "key_id": "", "installed": []}
+ "status": "pending", "expires": 1793390000.0, "purpose": "pane", "want": [], "key_id": "", "installed": []}
 ```
 
 - Key types: `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`, `ecdsa-sha2-nistp256`.

@@ -19,6 +19,7 @@ the command prompt, or anything over -CC), so a pane key is a shell key and is a
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import json
 import os
@@ -38,7 +39,9 @@ from . import bus
 
 ENROLL = os.environ.get("TAILSHARE_SSH_ENROLL", "1") != "0"
 KEY_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256")
-MODES = ("pane", "shell")
+START_KEY_TYPE = "ecdsa-sha2-nistp256"  # start and plan keys: what the Secure Enclave makes, and nothing else
+MODES = ("pane", "shell", "start", "start-skip")
+PURPOSES = {"pane": ("pane", "shell"), "start": ("start", "start-skip")}  # what each kind of request may become
 REQUIRE_SK = True  # signed approvals must come from a security key (tests turn this off)
 CONFIRM_CHARS = 6  # of the fingerprint the person types: 36 bits, too many to grind a look-alike key
 PENDING_TTL = 900  # a request waits this long for a person
@@ -53,6 +56,10 @@ END = "# <<< tailshare managed keys <<<"
 _ID_RE = re.compile(r"[0-9a-f]{32}")
 _KEY_ID_RE = re.compile(r"k[0-9a-f]{12}")
 _EXE_RE = re.compile(r"/[A-Za-z0-9._/+-]+")
+SQUADS_NAMESPACE = "tailshare-squads"  # a device's signed squad write; never valid as a launch or a key approval
+SIGNED_WINDOW = 60  # how far a signed write's time may be from this machine's clock
+VERIFY_PER_MINUTE = 30  # signature checks per address: each one runs ssh-keygen
+SIGNED_HEADERS = ("X-Tailshare-Key", "X-Tailshare-Time", "X-Tailshare-Nonce", "X-Tailshare-Signature")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS key_requests(
@@ -192,6 +199,20 @@ def fingerprint(pubkey: str) -> str:
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
 
 
+def pair_fingerprint(pubkey: str, plan: str) -> str:
+    """A start key and its plan key as one: SHA256 of both key blobs, start first (both P-256, so fixed length).
+    Its last characters are the code for a start request, so a plan key swapped in by someone else changes it."""
+    blob = base64.b64decode(pubkey.split()[1]) + base64.b64decode(plan.split()[1])
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def confirm_code(r) -> str:
+    """What the person types to approve a request: the end of the fingerprint the device shows, which for a start
+    request covers its plan key too."""
+    fp = pair_fingerprint(r["pubkey"], r["plan_pubkey"]) if r["plan_pubkey"] else r["fingerprint"]
+    return fp[-CONFIRM_CHARS:]
+
+
 def clean_device(name: object) -> str:
     """The device name the client reported: shown to people and written as a key comment."""
     s = re.sub(r"[^A-Za-z0-9 ._'-]", "", name if isinstance(name, str) else "")
@@ -258,11 +279,44 @@ def install_problem() -> str:
     return ""
 
 
-def key_line(k: dict, exe: str) -> str:
-    comment = "tailshare:" + k["id"] + " " + k["device"].replace(" ", "-")
+@functools.lru_cache(maxsize=1)
+def gate_python() -> str:
+    """The interpreter tailshare runs under, for the keys' lines, or "" when its path is not plain or tailshare
+    does not import under it with -I (a `pip install --user`, or a checkout on PYTHONPATH): -I leaves those out."""
+    p = sys.executable
+    if not (p and _EXE_RE.fullmatch(p) and os.access(p, os.X_OK)):
+        return ""
+    try:
+        ok = subprocess.run([p, "-I", "-c", "import tailshare"], cwd="/", env={"PATH": "/usr/bin:/bin"},
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    return p if ok else ""
+
+
+def key_lines(k: dict, exe: str, python: str | None = None) -> list[str]:
+    """A key's authorized_keys lines: one, or two for a start key (the start key, then its plan key)."""
+    if k["mode"] in ("start", "start-skip") and k.get("plan_pubkey"):
+        return [key_line(k, exe, python), key_line(k, exe, python, plan=True)]
+    return [key_line(k, exe, python)]
+
+
+def key_line(k: dict, exe: str, python: str | None = None, plan: bool = False) -> str:
+    comment = "tailshare:" + k["id"] + (" plan" if plan else "") + " " + k["device"].replace(" ", "-")
     if k["mode"] == "shell":
         return f"{k['pubkey']} {comment}"
-    return f'restrict,pty,command="{exe} ssh-gate" {k["pubkey"]} {comment}'
+    # the interpreter itself with -I: PYTHONPATH, PYTHONSTARTUP and friends act before any of tailshare's code
+    # runs, so the console script's shebang (no -I) would let an AcceptEnv'd variable load code
+    py = gate_python() if python is None else python
+    if k["mode"] in ("start", "start-skip"):  # no pty: it only takes `tailshare-start` (tailshare/start.py)
+        grant = "skip" if k["mode"] == "start-skip" else "safe"
+        # the plan key (no Face ID) shares the start key's id, so its plans are the pair's, but it only dry-runs
+        flags = f"--start={grant} --key={k['id']}" + (" --plan" if plan else "")
+        cmd = f"{py} -I -m tailshare ssh-gate {flags}" if py else "/usr/bin/false"
+        return f'restrict,command="{cmd}" {k["plan_pubkey"] if plan else k["pubkey"]} {comment}'
+    # an interpreter path that is not plain keeps the console script: attaching still works, without -I
+    cmd = f"{py} -I -m tailshare ssh-gate" if py else f"{exe} ssh-gate" if exe else "/usr/bin/false"
+    return f'restrict,pty,command="{cmd}" {k["pubkey"]} {comment}'
 
 
 def replace_block(old: str, lines: list[str]) -> str:
@@ -312,6 +366,35 @@ def write_authorized_keys(lines: list[str], path: Path | None = None) -> bool:
         Path(tmp).unlink(missing_ok=True)
         raise
     return True
+
+
+def request_purpose(body: dict) -> tuple[str, list[str]]:
+    """What a device asks a key for: `pane` (attach, the default) or `start` with want ["start"] or ["start","skip"]."""
+    purpose = body.get("purpose", "pane")
+    if purpose not in PURPOSES:
+        raise bus.BusError("purpose must be pane or start")
+    if purpose == "pane":
+        return "pane", []
+    want = body.get("want", ["start"])
+    if not isinstance(want, list) or "start" not in want or not set(want) <= {"start", "skip"}:
+        raise bus.BusError('want must be ["start"] or ["start","skip"]')
+    return "start", sorted(set(want), key=["start", "skip"].index)
+
+
+def default_mode(purpose: str, want: list[str]) -> str:
+    return ("start-skip" if "skip" in want else "start") if purpose == "start" else "pane"
+
+
+def mode_problem(mode: str, purpose: str, want: list[str]) -> str:
+    """Why a request of `purpose` cannot be installed as `mode`, or "". An attach key never gets a start grant,
+    a start key never attaches, and a person can grant less than asked, never more."""
+    if mode not in MODES:
+        return f"mode must be one of {', '.join(MODES)}"
+    if mode not in PURPOSES.get(purpose, ()):
+        return f"a {purpose} key cannot be installed as {mode}"
+    if mode == "start-skip" and "skip" not in want:
+        return "the device did not ask to skip permissions"
+    return ""
 
 
 # --------------------------------------------------------------------------- the gate
@@ -429,9 +512,17 @@ def tmux_binary(registered: str) -> str:
     return ""
 
 
-def cmd_gate(_args) -> None:
-    """Forced command of pane keys: attach to a registered agent pane, or refuse."""
+def cmd_gate(args) -> None:
+    """Forced command of pane keys: attach to a registered agent pane, or refuse. Of start keys: start sessions."""
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    if getattr(args, "start", ""):
+        from . import start
+
+        if cmd.strip() != "tailshare-start":
+            sys.exit("tailshare ssh-gate: this key may only run `tailshare-start`, with the request on stdin")
+        # never from the environment: only the authorized_keys line itself may move these (tests do)
+        start.settle(args.state, args.bus_port, args.tmux_socket)
+        sys.exit(start.gate(args.start, getattr(args, "key", ""), plan_only=args.plan))
     try:
         panes = registered_panes(bus.STATE_DIR / "bus.db")
     except Exception as e:  # noqa: BLE001
@@ -469,8 +560,8 @@ def cmd_gate(_args) -> None:
 
 
 def approval_doc(signer: str, origin: str, r: dict, key_id: str, mode: str, hosts: list[str],
-                 ttl: int = APPROVAL_TTL) -> str:
-    """The exact text a person signs to install a key on `hosts`."""
+                 ttl: int = APPROVAL_TTL, squads: bool = False) -> str:
+    """The exact text a person signs to install a key on `hosts` (`squads`: its plan key may sign squad edits)."""
     from .sessions import canonical
 
     now = time.time()
@@ -478,6 +569,9 @@ def approval_doc(signer: str, origin: str, r: dict, key_id: str, mode: str, host
         "v": 1, "action": "ssh-key", "signer": signer, "origin": origin, "request": r["id"], "key_id": key_id,
         "pubkey": r["pubkey"], "fingerprint": r["fingerprint"], "device": r["device"], "node": r["node"],
         "user": r["user"], "mode": mode, "hosts": hosts, "nonce": secrets.token_hex(16),
+        **({"plan_pubkey": r["plan_pubkey"], "plan_fingerprint": fingerprint(r["plan_pubkey"])}
+           if mode in ("start", "start-skip") else {}),
+        **({"squads": True} if squads else {}),
         "issued": round(now, 3), "expires": round(now + ttl, 3),
     })
 
@@ -491,8 +585,19 @@ class Keys:
         self.signers = signers or SIGNERS
         self.keys_file = keys_file  # None: ~/.ssh/authorized_keys
         self.token = load_token(token_file or token_path(), create=True)
+        self._verified: dict[str, list[float]] = {}  # address -> times of its recent signature checks
         with self.store.lock:
             self.store.db.executescript(SCHEMA)
+            cols = {r[1] for r in self.store.db.execute("PRAGMA table_info(key_requests)")}
+            for col, decl in (("purpose", "TEXT NOT NULL DEFAULT 'pane'"), ("want", "TEXT NOT NULL DEFAULT '[]'"),
+                              ("plan_pubkey", "TEXT NOT NULL DEFAULT ''")):
+                if col not in cols:
+                    self.store.db.execute(f"ALTER TABLE key_requests ADD COLUMN {col} {decl}")
+            have = {r[1] for r in self.store.db.execute("PRAGMA table_info(ssh_keys)")}
+            if "plan_pubkey" not in have:
+                self.store.db.execute("ALTER TABLE ssh_keys ADD COLUMN plan_pubkey TEXT NOT NULL DEFAULT ''")
+            if "squads" not in have:  # 1: the plan key may sign squad edits (docs/squads.md), granted at approval
+                self.store.db.execute("ALTER TABLE ssh_keys ADD COLUMN squads INTEGER NOT NULL DEFAULT 0")
 
     def start(self) -> None:
         threading.Thread(target=self._loop, daemon=True, name="keys-loop").start()
@@ -536,9 +641,14 @@ class Keys:
 
     # -- requests from devices --------------------------------------------------
     def _view(self, r) -> dict:
-        return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN,
+        grant = {}
+        if r["purpose"] == "start" and r["status"] == "approved":  # a hint for the app; the 403 no_grant decides
+            k = self.store.one("SELECT squads FROM ssh_keys WHERE id=?", r["key_id"])
+            grant = {"squads": bool(k and k["squads"])}
+        return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN, **grant,
+                **({"pair_fingerprint": pair_fingerprint(r["pubkey"], r["plan_pubkey"])} if r["plan_pubkey"] else {}),
                 "owner": self.bus.net.user, "status": "pending" if r["status"] == "approving" else r["status"],
-                "expires": r["expires"],
+                "expires": r["expires"], "purpose": r["purpose"], "want": json.loads(r["want"]),
                 "key_id": r["key_id"], "installed": json.loads(r["installed"])}
 
     def _expire(self) -> None:
@@ -556,15 +666,24 @@ class Keys:
             raise bus.BusError(f"{ip} is not a device on this tailnet", 403)
         pubkey = parse_pubkey(body.get("pubkey"))
         device = clean_device(body.get("device_name"))
+        purpose, want = request_purpose(body)
+        plan = ""
+        if purpose == "start":  # a start key comes with its plan key: dry runs without Face ID, confirms with it
+            plan = parse_pubkey(body.get("plan_pubkey"))
+            if plan == pubkey:
+                raise bus.BusError("plan_pubkey must be a different key from pubkey")
+            if not all(k.startswith(START_KEY_TYPE + " ") for k in (pubkey, plan)):
+                raise bus.BusError(f"start and plan keys must be {START_KEY_TYPE}")
         now = time.time()
         with self.store.lock:
             self._expire()
-            same = self.store.one("SELECT * FROM key_requests WHERE ip=? AND pubkey=? AND status IN ('pending','approving','approved')"
-                                  " ORDER BY created DESC", ip, pubkey)
+            same = self.store.one("SELECT * FROM key_requests WHERE ip=? AND pubkey=? AND plan_pubkey=?"
+                                  " AND status IN ('pending','approving','approved') ORDER BY created DESC", ip, pubkey, plan)
             if same:
                 return self._view(same)
-            if self.store.one("SELECT 1 FROM ssh_keys WHERE pubkey=?", pubkey):
-                raise bus.BusError("this key is already installed here", 409)
+            for k in filter(None, (pubkey, plan)):
+                if self.store.one("SELECT 1 FROM ssh_keys WHERE pubkey=? OR plan_pubkey=?", k, k):
+                    raise bus.BusError("this key is already installed here", 409)
             pending = self.store.q("SELECT 1 FROM key_requests WHERE ip=? AND status='pending'", ip)
             today = self.store.q("SELECT 1 FROM key_requests WHERE ip=? AND created>?", ip, now - 86400)
             if len(pending) >= MAX_PENDING or len(today) >= MAX_PER_DAY:
@@ -572,11 +691,11 @@ class Keys:
             if len(self.store.q("SELECT 1 FROM key_requests WHERE status='pending'")) >= 20:
                 raise bus.BusError("too many pending key requests on this machine", 429)
             rid = secrets.token_hex(16)
-            self.store.x("INSERT INTO key_requests(id, ip, node, user, device, pubkey, fingerprint, created, expires, status)"
-                         " VALUES(?,?,?,?,?,?,?,?,?,'pending')", rid, ip, node, user or "", device, pubkey,
-                         fingerprint(pubkey), now, now + PENDING_TTL)
+            self.store.x("INSERT INTO key_requests(id, ip, node, user, device, pubkey, fingerprint, created, expires, status,"
+                         " purpose, want, plan_pubkey) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)", rid, ip, node, user or "",
+                         device, pubkey, fingerprint(pubkey), now, now + PENDING_TTL, purpose, json.dumps(want), plan)
             r = self.store.one("SELECT * FROM key_requests WHERE id=?", rid)
-        log(f"request {rid[:8]} from {node} ({user}), device {device!r}, {r['fingerprint']}")
+        log(f"request {rid[:8]} from {node} ({user}), device {device!r}, {r['fingerprint']}, {purpose} {want}")
         self._notify(device, node, user or "")
         return self._view(r)
 
@@ -629,7 +748,10 @@ class Keys:
         rows = self.store.q("SELECT * FROM key_requests WHERE status='pending' ORDER BY created")
         return {"host": self.host, "owner": self.bus.net.user, "login": bus.LOGIN, "problem": install_problem(),
                 "targets": self.targets(), "pending": [
-                    {k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires")}
+                    {**{k: r[k] for k in ("id", "ip", "node", "user", "device", "pubkey", "fingerprint", "created", "expires",
+                                          "purpose", "plan_pubkey")}, "want": json.loads(r["want"]),
+                     "plan_fingerprint": fingerprint(r["plan_pubkey"]) if r["plan_pubkey"] else "",
+                     "pair_fingerprint": pair_fingerprint(r["pubkey"], r["plan_pubkey"]) if r["plan_pubkey"] else ""}
                     for r in rows]}
 
     def ls(self) -> dict:
@@ -642,25 +764,35 @@ class Keys:
     def _rewrite(self) -> None:
         exe = gate_exe()
         rows = self.store.q("SELECT * FROM ssh_keys ORDER BY installed")
-        write_authorized_keys([key_line(dict(r), exe) for r in rows], self.keys_file)
+        write_authorized_keys([x for r in rows for x in key_lines(dict(r), exe)], self.keys_file)
 
-    def install_here(self, key_id: str, r: dict, mode: str, by: str) -> dict:
+    def install_here(self, key_id: str, r: dict, mode: str, by: str, squads: bool = False) -> dict:
         problem = install_problem()
         if problem:
             raise bus.BusError(problem, 409)
         with self.store.lock:
             if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
                 raise bus.BusError(f"key {key_id} was revoked; enroll again", 409)
+            plan = (r.get("plan_pubkey") or "") if mode in ("start", "start-skip") else ""
+            if mode in ("start", "start-skip") and not plan:
+                raise bus.BusError("a start key needs its plan key", 409)
+            if squads and not plan:
+                raise bus.BusError("only a start key's plan key may sign squad edits", 409)
+            if mode in ("start", "start-skip") and not all(x.startswith(START_KEY_TYPE + " ") for x in (r["pubkey"], plan)):
+                raise bus.BusError(f"start keys must be {START_KEY_TYPE}", 409)
+            for k in filter(None, (r["pubkey"], plan)):  # sshd takes the first line that matches a key: one line each
+                if self.store.one("SELECT 1 FROM ssh_keys WHERE id!=? AND (pubkey=? OR plan_pubkey=?)", key_id, k, k):
+                    raise bus.BusError("this key is already installed here under another id", 409)
             self.store.x("INSERT OR REPLACE INTO ssh_keys(id, pubkey, fingerprint, device, node, user, mode, approved_by,"
-                         " installed) VALUES(?,?,?,?,?,?,?,?,?)", key_id, r["pubkey"], r["fingerprint"], r["device"],
-                         r["node"], r["user"], mode, by, time.time())
+                         " installed, plan_pubkey, squads) VALUES(?,?,?,?,?,?,?,?,?,?,?)", key_id, r["pubkey"],
+                         r["fingerprint"], r["device"], r["node"], r["user"], mode, by, time.time(), plan, int(squads))
             try:
                 self._rewrite()
             except BaseException:
                 self.store.x("DELETE FROM ssh_keys WHERE id=?", key_id)
                 raise
-        log(f"installed {key_id} ({r['device']}, {r['fingerprint']}) mode={mode}, {by}")
-        return {"host": self.host, "login": bus.LOGIN, "mode": mode, "key_id": key_id}
+        log(f"installed {key_id} ({r['device']}, {r['fingerprint']}) mode={mode}{', squads' if squads else ''}, {by}")
+        return {"host": self.host, "login": bus.LOGIN, "mode": mode, "key_id": key_id, "squads": bool(squads)}
 
     def check_approval(self, payload: str, signature: str) -> dict:
         from .sessions import KEYS_NAMESPACE, verify
@@ -695,6 +827,17 @@ class Keys:
                 problems.append("key and fingerprint do not match")
         except bus.BusError:
             problems.append("bad key")
+        if d.get("mode") in ("start", "start-skip"):
+            try:
+                plan = parse_pubkey(d.get("plan_pubkey"))
+                if plan != d.get("plan_pubkey") or fingerprint(plan) != d.get("plan_fingerprint") or plan == d.get("pubkey"):
+                    problems.append("plan key and fingerprint do not match")
+                if not all(str(x).startswith(START_KEY_TYPE + " ") for x in (plan, d.get("pubkey"))):
+                    problems.append(f"start keys must be {START_KEY_TYPE}")
+            except bus.BusError:
+                problems.append("bad plan key")
+        if d.get("squads", False) is not False and (d.get("squads") is not True or d.get("mode") not in ("start", "start-skip")):
+            problems.append("squads is only a start key's grant, and only true")
         if problems:
             raise bus.BusError("approval refused: " + "; ".join(problems), 403)
         nonce = str(d.get("nonce"))
@@ -710,19 +853,28 @@ class Keys:
 
     def approve(self, body: dict) -> dict:
         """Called by `tailshare keys approve` on this machine (the local API)."""
-        rid, mode = str(body.get("id") or ""), str(body.get("mode") or "pane")
-        if mode not in MODES:
-            raise bus.BusError(f"mode must be one of {', '.join(MODES)}")
+        rid = str(body.get("id") or "")
         self._expire()
         r = self.store.one("SELECT * FROM key_requests WHERE id=? AND status='pending'", rid)
         if r is None:
             raise bus.BusError("no such pending request (it may have expired, or is being approved)", 404)
-        tail = r["fingerprint"][-CONFIRM_CHARS:]
+        mode = str(body.get("mode") or default_mode(r["purpose"], json.loads(r["want"])))
+        problem = mode_problem(mode, r["purpose"], json.loads(r["want"]))
+        if problem:
+            raise bus.BusError(problem)
+        if r["purpose"] == "start" and not r["plan_pubkey"]:  # enroll never stores one; never fall back to the start key's code
+            raise bus.BusError("this start request has no plan key; ask the device to enroll again", 409)
+        tail = confirm_code(r)
         if str(body.get("confirm") or "") != tail:
-            raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the fingerprint", 403)
-        twins = [x for x in self.store.q("SELECT fingerprint FROM key_requests WHERE status='pending' AND id!=?", rid)
-                 if x["fingerprint"][-CONFIRM_CHARS:] == tail]
-        if twins:
+            raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the "
+                               f"{'pair ' if r['plan_pubkey'] else ''}fingerprint", 403)
+        # the same code, or the same start key with another plan key: one of them is not the device
+        others = self.store.q("SELECT fingerprint, pubkey, plan_pubkey FROM key_requests WHERE status='pending' AND id!=?", rid)
+        if any(x["pubkey"] == r["pubkey"] and x["plan_pubkey"] != r["plan_pubkey"] for x in others):
+            raise bus.BusError("another pending request has the same start key with a different plan key: someone may be "
+                               "imitating this device. Deny the requests you do not recognize, then ask the device to "
+                               "enroll again", 409)
+        if any(confirm_code(x) == tail for x in others):
             raise bus.BusError("another pending request ends in the same characters: someone may be imitating this "
                                "device. Deny the requests you do not recognize, then ask the device to enroll again", 409)
         if not self.store.x("UPDATE key_requests SET status='approving' WHERE id=? AND status='pending'", rid):
@@ -735,15 +887,18 @@ class Keys:
 
     def _approve(self, rid: str, mode: str, body: dict) -> dict:
         r = dict(self.store.one("SELECT * FROM key_requests WHERE id=?", rid))
+        squads = body.get("squads", False) is True
         payload, signature = str(body.get("payload") or ""), str(body.get("signature") or "")
         if payload:
             d = self.check_approval(payload, signature)
-            if d.get("request") != rid or d["pubkey"] != r["pubkey"] or d["mode"] != mode:
+            if (d.get("request") != rid or d["pubkey"] != r["pubkey"] or d["mode"] != mode
+                    or d.get("squads", False) is not squads
+                    or d.get("plan_pubkey", "") != (r["plan_pubkey"] if mode in ("start", "start-skip") else "")):
                 raise bus.BusError("approval refused: signed for another request", 403)
             key_id, hosts, by = d["key_id"], [h for h in d["hosts"] if isinstance(h, str)], f"signed by {d['signer']}"
         else:
             key_id, hosts, by = "k" + secrets.token_hex(6), [self.host], "approved here"
-        installed, errors = [self.install_here(key_id, r, mode, by)], {}
+        installed, errors = [self.install_here(key_id, r, mode, by, squads)], {}
         for h in hosts:
             if h == self.host:
                 continue
@@ -765,14 +920,71 @@ class Keys:
             raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
         d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""))
-        r = {k: d[k] for k in ("pubkey", "fingerprint", "device", "node", "user")}
-        return self.install_here(d["key_id"], r, d["mode"], f"signed by {d['signer']} (from {d.get('origin')})")
+        r = {k: d.get(k, "") for k in ("pubkey", "fingerprint", "device", "node", "user", "plan_pubkey")}
+        return self.install_here(d["key_id"], r, d["mode"], f"signed by {d['signer']} (from {d.get('origin')})",
+                                 d.get("squads") is True)
 
     def deny(self, body: dict) -> dict:
         n = self.store.x("UPDATE key_requests SET status='denied' WHERE id=? AND status='pending'", str(body.get("id")))
         if not n:
             raise bus.BusError("no such pending request", 404)
         return {"denied": True}
+
+    # -- signed writes from devices ------------------------------------------------------
+    def check_signed(self, method: str, path: str, raw: bytes, headers: dict, owner: str, ip: str = "") -> dict:
+        """A device's signed write (docs/squads.md): signed with the plan key of one of `owner`'s start keys
+        installed here with the squads grant, for this machine, this method, path and body, recently and once. The
+        pane key (a file in iSH, say) and the start key (Face ID on every save) never sign one. Returns the key's
+        row; refuses with 403."""
+        from .sessions import ssh_keygen
+
+        def no(reason: str, why: str, **more) -> bus.BusError:
+            return bus.BusError("signature", 403, {"reason": reason, "detail": why, **more})
+
+        key_id, ts, nonce, sig = (str(headers.get(h) or "") for h in SIGNED_HEADERS)
+        if not (key_id or ts or nonce or sig):
+            raise no("unsigned", "squad writes from a device must be signed with one of its keys")
+        if not (_KEY_ID_RE.fullmatch(key_id) and re.fullmatch(r"[0-9]{1,12}", ts) and re.fullmatch(r"[0-9a-f]{32}", nonce)
+                and re.fullmatch(r"[A-Za-z0-9+/]{20,4096}={0,2}", sig)):
+            raise no("bad_signature", "malformed signature headers")
+        now = time.time()
+        if abs(now - int(ts)) > SIGNED_WINDOW:
+            raise no("expired", f"the request's time is more than {SIGNED_WINDOW} s from this machine's clock",
+                     now=int(now))  # so a device with a wrong clock can correct once
+        if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
+            raise no("revoked", f"key {key_id} was removed from {self.host}")
+        row = self.store.one("SELECT * FROM ssh_keys WHERE id=?", key_id)
+        if row is None or not owner or row["user"] != owner:
+            raise no("unknown_key", f"no key {key_id} of {owner or 'the owner'} is installed on {self.host}")
+        if not row["squads"] or not row["plan_pubkey"]:
+            raise no("no_grant", f"key {key_id} was not granted squad edits on {self.host}: approve its start key "
+                     "again with `tailshare keys approve --squads`")
+        with self.store.lock:
+            recent = [t for t in self._verified.get(ip, []) if t > now - 60]
+            if len(recent) >= VERIFY_PER_MINUTE:
+                raise bus.BusError("signature", 429, {"reason": "rate_limited", "detail": "too many signed writes from "
+                                   "this device in the last minute; try again shortly"})
+            self._verified[ip] = [*recent, now]
+            for a in [a for a, ts in self._verified.items() if not ts or ts[-1] <= now - 60]:
+                del self._verified[a]
+        message = "\n".join(["tailshare-squad-write/1", self.host, method, path, ts, nonce,
+                              hashlib.sha256(raw).hexdigest()])
+        armored = "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(sig[i : i + 70] for i in range(0, len(sig), 70)) \
+            + "\n-----END SSH SIGNATURE-----\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            signers, sigfile = Path(tmp) / "signers", Path(tmp) / "sig"
+            signers.write_text(f'{key_id} namespaces="{SQUADS_NAMESPACE}" {row["plan_pubkey"]}\n')
+            sigfile.write_text(armored)
+            cp = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", key_id, "-n", SQUADS_NAMESPACE,
+                                 "-s", str(sigfile)], input=message.encode(), capture_output=True, timeout=30)
+        if cp.returncode != 0:
+            raise no("bad_signature", "the signature does not match this request on this machine with that key")
+        with self.store.lock:
+            self.store.x("DELETE FROM key_nonces WHERE expires<?", now)
+            if self.store.one("SELECT 1 FROM key_nonces WHERE nonce=?", "sq:" + nonce):
+                raise no("replayed", "this nonce was already used: sign the write again")
+            self.store.x("INSERT INTO key_nonces(nonce, expires) VALUES(?,?)", "sq:" + nonce, int(ts) + 2 * SIGNED_WINDOW)
+        return dict(row)
 
     # -- revoking ------------------------------------------------------------------------
     def remove_here(self, key_id: str) -> bool:
@@ -947,18 +1159,20 @@ def cmd_pending(args):
     for p in d["pending"]:
         who = p["user"] or "unknown user"
         other = "" if p["user"] == d["owner"] else "   ⚠ not your device"
-        print(f"{p['id'][:8]}  {p['device']!r} on {p['node']} ({who}){other}")
+        kind = "" if p.get("purpose", "pane") == "pane" else "   start key" + (", wants skip" if "skip" in p.get("want", []) else "")
+        print(f"{p['id'][:8]}  {p['device']!r} on {p['node']} ({who}){other}{kind}")
         print(f"          {p['fingerprint']}  expires in {max(0, int(p['expires'] - time.time())) // 60} min")
     print("\napprove: tailshare keys approve <id>     deny: tailshare keys deny <id>")
 
 
 @_run
 def cmd_approve(args):
-    approve_interactive(args.id, args.shell, args.here, args.key, args.signer)
+    approve_interactive(args.id, args.shell, args.here, args.key, args.signer, start=args.start,
+                        squads=True if args.squads else None)
 
 
 def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_arg: str = "", signer_arg: str = "",
-                        tries: int = 1, skip_ok: bool = False) -> bool:
+                        tries: int = 1, skip_ok: bool = False, start: str = "", squads: bool | None = None) -> bool:
     """Show a pending request and install it if the person types the fingerprint's end. Returns whether a key
     was installed (False only when skip_ok and the person pressed Enter)."""
     from . import sessions, sessions_cli
@@ -968,7 +1182,21 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     if d.get("problem"):
         raise ValueError(d["problem"])
     p = _find(d["pending"], rid)
-    mode = "shell" if shell else "pane"
+    purpose, want = p.get("purpose", "pane"), p.get("want", [])
+    if purpose == "start":
+        if shell:
+            raise ValueError("this device asked for a start key; --shell is for attach keys")
+        mode = {"safe": "start", "skip": "start-skip"}.get(start) or default_mode(purpose, want)
+    elif start:
+        raise ValueError("this device asked for an attach key; it cannot get a start grant (the device enrolls a "
+                         "separate start key for that)")
+    else:
+        mode = "shell" if shell else "pane"
+    problem = mode_problem(mode, purpose, want)
+    if problem:
+        raise ValueError(problem)
+    if squads and mode not in ("start", "start-skip"):
+        raise ValueError("--squads is for a start key: its plan key signs the squad edits")
     key = None
     if not here:
         try:
@@ -985,15 +1213,26 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     print(f"  device       {p['device']!r} (the name the device gave itself)")
     print(f"  tailnet      {p['node']}, owned by {p['user'] or 'unknown'}" + ("" if mine else "   ⚠ NOT one of your devices"))
     print(f"  fingerprint  {p['fingerprint']}")
+    if p.get("plan_fingerprint"):
+        print(f"  plan key     {p['plan_fingerprint']} (dry runs only, without Face ID; installed with it)")
+        print(f"  pair         {p['pair_fingerprint']} (both keys: the device shows this one)")
     if mode == "pane":
         print(f"  access       attach to tmux panes of agents, as {d['login']}. Typing into a pane is as good as a shell.")
+    elif mode in ("start", "start-skip"):
+        print(f"  access       START agent sessions as {d['login']}, in the folders and kinds ~/.tailshare/start.json "
+              "allows (starting stays off where it has none)")
+        if mode == "start-skip":
+            print("               and may SKIP PERMISSIONS: the agent then runs any code without asking")
+        elif "skip" in want:
+            print("               (the device also asked to skip permissions; not granted: add --start=skip for that)")
     else:
         print(f"  access       a full shell as {d['login']}")
     print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (no signing key found: this machine only)"))
-    want = p["fingerprint"][-CONFIRM_CHARS:]
+    want = confirm_code(p)
+    which = "pair fingerprint" if p.get("plan_pubkey") else "fingerprint"
     skip = "skip" if skip_ok else "cancel"
     for attempt in range(tries):
-        got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint shown on the device (Enter to {skip}): ").strip()
+        got = input(f"Type the last {CONFIRM_CHARS} characters of the {which} shown on the device (Enter to {skip}): ").strip()
         if not got:
             if skip_ok:
                 print("skipped: nothing installed. Approve later with `tailshare keys approve " + p["id"][:8] + "`")
@@ -1004,15 +1243,17 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
         if attempt + 1 < tries:
             print("✗ does not match; try again")
     else:
-        raise ValueError("does not match the fingerprint: nothing installed")
-    body = {"id": p["id"], "mode": mode, "confirm": got}
+        raise ValueError(f"does not match the {which}: nothing installed")
+    if squads is None and mode in ("start", "start-skip"):
+        squads = input("Let its plan key (no Face ID) also edit your squads from the app? [y/N]: ").strip().lower() in ("y", "yes")
+    body = {"id": p["id"], "mode": mode, "confirm": got, "squads": bool(squads)}
     if key:
         signer = sessions_cli._principal(signer_arg)
-        payload = approval_doc(signer, d["host"], p, "k" + secrets.token_hex(6), mode, hosts)
+        payload = approval_doc(signer, d["host"], p, "k" + secrets.token_hex(6), mode, hosts, squads=bool(squads))
         body.update(payload=payload, signature=sessions.sign(payload, key, sessions.KEYS_NAMESPACE))
     r = _call("/keys/approve", body, timeout=90)
     for i in r["installed"]:
-        print(f"✓ installed on {i['host']} as {i['login']} ({i['mode']})")
+        print(f"✓ installed on {i['host']} as {i['login']} ({i['mode']}{', squad edits' if i.get('squads') else ''})")
     for h, e in r["errors"].items():
         print(f"✗ {h}: {e}")
     print(f"key id {r['key_id']}; remove it with `tailshare keys rm {r['key_id']}`")
@@ -1036,7 +1277,7 @@ def cmd_ls(args):
         print(f"no tailshare-managed SSH keys for {d['login']} on {d['host']}")
     for k in d["keys"]:
         when = time.strftime("%Y-%m-%d", time.localtime(k["installed"]))
-        print(f"{k['id']}  {k['mode']:<5}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
+        print(f"{k['id']}  {k['mode'] + ('+squads' if k.get('squads') else ''):<17}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
     for r in d.get("revoking", []):
         print(f"⚠ {r['key_id']} is still installed on {r['host']}: removal pending since "
               f"{time.strftime('%Y-%m-%d', time.localtime(r['created']))}" + (f" ({r['error']})" if r["error"] else ""))
@@ -1059,6 +1300,10 @@ def add_parser(sub) -> None:
     p = s.add_parser("approve", help="install a requested key (asks you to confirm its fingerprint)")
     p.add_argument("id")
     p.add_argument("--shell", action="store_true", help="full shell access, not only attaching to agent panes")
+    p.add_argument("--start", choices=("safe", "skip"), default="",
+                   help="for a start key: grant starting sessions (safe), or also skipping permissions (skip)")
+    p.add_argument("--squads", action="store_true",
+                   help="for a start key: its plan key may also edit your squads from the app (asked otherwise)")
     p.add_argument("--here", action="store_true", help="only this machine, even with a signing key")
     p.add_argument("--key", default="", help="signing key (default: TAILSHARE_SIGN_KEY or ~/.ssh/id_*_sk)")
     p.add_argument("--as", dest="signer", default="", help="signer name (default: your tailnet user)")
@@ -1072,4 +1317,11 @@ def add_parser(sub) -> None:
     p = s.add_parser("rm", help="remove a key here and on your other machines")
     p.add_argument("key_id")
     p.set_defaults(fn=cmd_rm)
-    sub.add_parser("ssh-gate", help="forced command of pane keys (run by sshd, not by hand)").set_defaults(fn=cmd_gate)
+    p = sub.add_parser("ssh-gate", help="forced command of tailshare's SSH keys (run by sshd, not by hand)")
+    p.add_argument("--start", choices=("safe", "skip"), default="", help="set by a start key's line")
+    p.add_argument("--key", default="", help="set by a start key's line")
+    p.add_argument("--plan", action="store_true", help="set by a plan key's line: dry runs only")
+    p.add_argument("--tmux-socket", default="", help="tests only: a private tmux server, set on the key's line")
+    p.add_argument("--state", default="", help="tests only: a state dir instead of ~/.tailshare, set on the key's line")
+    p.add_argument("--bus-port", type=int, default=0, help="tests only: the local bus port, set on the key's line")
+    p.set_defaults(fn=cmd_gate)

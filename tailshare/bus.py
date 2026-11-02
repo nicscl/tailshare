@@ -55,20 +55,23 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class BusError(Exception):
-    def __init__(self, message: str, code: int = 400) -> None:
+    def __init__(self, message: str, code: int = 400, extra: dict | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.extra = extra or {}  # more of the error reply, e.g. a 409's current state
 
 
 def log(msg: str) -> None:
     sys.stderr.write(f"{datetime.now():%H:%M:%S} bus: {msg}\n")
 
 
-def request(url: str, payload: dict | None = None, timeout: float = 5.0, headers: dict | None = None) -> dict:
-    """GET (payload None) or POST JSON to a bus endpoint. Raises BusError on HTTP errors."""
+def request(url: str, payload: dict | None = None, timeout: float = 5.0, headers: dict | None = None,
+            method: str = "") -> dict:
+    """GET (payload None) or POST JSON to a bus endpoint, or `method` (PUT, PATCH). Raises BusError on HTTP
+    errors, with the rest of the error reply in its `extra`."""
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
-        url, data=data, method="GET" if data is None else "POST",
+        url, data=data, method=method or ("GET" if data is None else "POST"),
         headers={HEADER: "1", "Content-Type": "application/json", **(headers or {})},
     )
     try:
@@ -76,10 +79,11 @@ def request(url: str, payload: dict | None = None, timeout: float = 5.0, headers
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         try:
-            msg = json.loads(e.read()).get("error") or str(e)
+            d = json.loads(e.read())
+            msg, extra = d.get("error") or str(e), {k: v for k, v in d.items() if k != "error"}
         except Exception:  # noqa: BLE001
-            msg = str(e)
-        raise BusError(msg, e.code) from None
+            msg, extra = str(e), {}
+        raise BusError(msg, e.code, extra) from None
 
 
 # --------------------------------------------------------------------------- addresses
@@ -299,6 +303,15 @@ def clean_tmux(t: object) -> dict:
     return out
 
 
+def clean_squad_tag(t: object) -> dict:
+    """{id, member}: which squad member an agent was started as (TAILSHARE_SQUAD/TAILSHARE_MEMBER), or {}."""
+    if not isinstance(t, dict):
+        return {}
+    sid, mid = t.get("id"), t.get("member")
+    ok = all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", x) for x in (sid, mid))
+    return {"id": sid, "member": mid} if ok else {}
+
+
 def is_pattern(target: str) -> bool:
     """Patterns and @user targets reach the agents that exist now; exact addresses wait for theirs."""
     return target.startswith("@") or any(c in target for c in "*?[")
@@ -438,7 +451,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "skip")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "squad"), ("agents", "skip")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -495,6 +508,7 @@ class Bus:
         self.updater = None  # set by start_bus when self-update is available
         self.sessions = None  # set by start_bus: sessions.Sessions (index, search, ask, launch)
         self.keys = None  # set by start_bus: keys.Keys (SSH keys devices ask for)
+        self.squads = None  # set by start_bus: squads.Squads (docs/squads.md)
         self.battery = power.Battery()
 
     # -- agents ---------------------------------------------------------------
@@ -507,6 +521,7 @@ class Bus:
         session = str(a.get("session") or "").strip()
         user = self._user_for(a)
         tmux = clean_tmux(a.get("tmux"))
+        squad = clean_squad_tag(a.get("squad"))
         pid = int(a.get("pid") or 0)
         was = self.store.one("SELECT pid, skip FROM agents WHERE id=?", aid)
         # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's
@@ -515,7 +530,8 @@ class Bus:
             skip = {True: "1", False: "0", None: ""}[pid_skip(pid)]
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
-        with self.store.lock:
+        with self.store.lock:  # the tag's "no other live holder" and the write that takes it, as one step
+            squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
             row = self.store.one("SELECT address FROM agents WHERE id=?", aid)
             if row and row["address"].split(":")[0] == base:
                 address = row["address"]  # keep a collision suffix stable
@@ -524,13 +540,13 @@ class Bus:
                 clash = any(r["address"].split(":")[0] == base for r in live)
                 address = f"{base}:{slug(aid)[:4]}" if clash else base
             self.store.x(
-                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux, skip)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
+                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux, squad, skip)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
                 " harness=excluded.harness, cwd=excluded.cwd, session=excluded.session,"
                 " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user, tmux=excluded.tmux,"
-                " skip=excluded.skip",
+                " squad=excluded.squad, skip=excluded.skip",
                 aid, address, harness, cwd, session, pid, now, now, user,
-                json.dumps(tmux) if tmux else "", skip,
+                json.dumps(tmux) if tmux else "", json.dumps(squad, sort_keys=True) if squad else "", skip,
             )
             self._claim(aid, address, user)
         return self.agent(aid)
@@ -574,6 +590,7 @@ class Bus:
             "online": r["last_seen"] > time.time() - LIVE, "host": self.net.host,
             "tmux": json.loads(r["tmux"]) if r["tmux"] else {}, "login": LOGIN,
             "state": json.loads(r["state"]) if r["state"] else None,
+            "squad": json.loads(r["squad"]) if r["squad"] else None,
             "skip": {"1": True, "0": False}.get(r["skip"]),  # a display hint (hook_skip): None when unknown
         }
 
@@ -728,20 +745,25 @@ class Bus:
         """What any tailnet peer may know. With SHARE_PANES, also where each agent's tmux pane is,
         so a person can attach to it; SSH to that machine is still the gate. `you` is what the tailnet
         says about the caller, so a client can tell its own machines from ones shared with it."""
+        u, own = "", False
+        if ip:
+            if self.net.host_for_ip(ip) is None and time.time() - self.net.updated > 30:
+                self.net.refresh()
+            u = self.net.user_for_ip(ip) or ""  # tagged machines have no owner: other tagged devices aren't own
+            own = bool(u) and u != "tagged-devices" and u == self.net.user
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login", "state") if SHARE_PANES else ())
+        keys += ("squad",) if own else ()  # which squad member an agent is: for its owner's machines and devices
         full = self.local_agents()
-        agents = [{k: a[k] for k in keys if k != "state" or a[k]} for a in full]
+        agents = [{k: a[k] for k in keys if k not in ("state", "squad") or a[k]} for a in full]
         for a in agents:
             if a.get("tmux"):
                 a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
         ssh = self.keys.ssh_info() if self.keys else {"enroll": False}
         out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
         if ip:
-            if self.net.host_for_ip(ip) is None and time.time() - self.net.updated > 30:
-                self.net.refresh()
-            out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
-            u = out["you"]["user"]  # tagged machines have no owner: other tagged devices aren't own
-            own = bool(u) and u != "tagged-devices" and u == self.net.user
+            out["you"] = {"user": u, "node": self.net.host_for_ip(ip) or ""}
+            if self.squads is not None:
+                out.update(self.squads.hello(u, own))
             battery = self.battery.for_caller(own=own)
             if battery:
                 out["power"] = battery
@@ -749,6 +771,12 @@ class Bus:
                 for a, f in zip(agents, full):
                     if f["skip"] is not None:
                         a["skip"] = f["skip"]
+            if own:  # what a start key may start here (tailshare/start.py); never the folders
+                from . import start
+
+                caps = start.capabilities()
+                if caps:
+                    out["start"] = caps
         return out
 
     def _pane_alive(self, t: dict) -> bool:
@@ -862,6 +890,15 @@ class Bus:
         self.require_same_user(ip)
         return self.updater.trigger()
 
+    def start_folders(self, ip: str) -> dict:
+        """The folders a start may use, for the owner's own devices: they say what is on this machine."""
+        from . import start
+
+        self.require_same_user(ip)
+        if not self.net.user or self.net.user == "tagged-devices":
+            raise BusError("this machine has no single tailnet owner", 403)
+        return {"folders": start.folders()}
+
     def require_same_user(self, ip: str) -> None:
         """Only machines owned by this machine's tailnet user may update it or read its sessions."""
         if self.net.user_for_ip(ip) is None:
@@ -951,6 +988,11 @@ class Bus:
                 h, p["ip"], str(d.get("version", "")), time.time(), json.dumps(d.get("agents", [])), p.get("id", ""),
                 json.dumps(power.clean(d.get("power"))),
             )
+            if self.squads is not None:
+                try:
+                    self.squads.sync_from(h, p, d)
+                except Exception as e:  # noqa: BLE001
+                    log(f"squads from {h}: {e!r}")
 
         if hosts:
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -976,6 +1018,8 @@ class Bus:
                 cutoff,
             )
             self.store.x("DELETE FROM agents WHERE last_seen<?", time.time() - 30 * 86400)
+        if self.squads is not None:
+            self.squads.prune()
 
     # -- running --------------------------------------------------------------
     def _loop(self) -> None:
@@ -1058,7 +1102,8 @@ class _Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n < 0 or n > limit:  # read(-1) would read until the peer closes
             raise BusError("request too large", 413)
-        d = json.loads(self.rfile.read(n) or b"{}")
+        self.raw = self.rfile.read(n)  # a signed squad write is signed over these bytes
+        d = json.loads(self.raw or b"{}")
         if not isinstance(d, dict):
             raise BusError("expected a JSON object")
         return d
@@ -1085,6 +1130,12 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         self._dispatch("POST")
 
+    def do_PUT(self):  # noqa: N802
+        self._dispatch("PUT")
+
+    def do_PATCH(self):  # noqa: N802
+        self._dispatch("PATCH")
+
     def _dispatch(self, method: str) -> None:
         local = self.server.local  # type: ignore[attr-defined]
         if self.headers.get(HEADER) != "1":
@@ -1096,11 +1147,24 @@ class _Handler(BaseHTTPRequestHandler):
         qs = {k: v[-1] for k, v in parse_qs(url.query).items()}
         try:
             # a hook's input carries the tool's input: a large Write must still say the agent is working
-            body = self._body(STATE_BODY if local and url.path == "/bus/v1/state" else 4 * MAX_BODY) if method == "POST" else {}
+            body = self._body(STATE_BODY if local and url.path == "/bus/v1/state" else 4 * MAX_BODY) if method in ("POST", "PUT", "PATCH") else {}
             b = self.bus
             path = url.path.removeprefix("/bus/v1")
             if path.startswith("/sessions/") and method == "POST":
                 return self._reply(200, self._sessions(path, body, local, ip))
+            if path == "/squads" or path.startswith("/squads/"):
+                if b.squads is None:
+                    raise BusError("squads are not available on this machine", 409)
+                from .keys import SIGNED_HEADERS
+
+                if method != "GET" and any(c in self.path for c in "?;#"):
+                    # urlparse splits these off the path, so a signature would not cover them: writes take none
+                    raise BusError("bad_request", 400, {"field": "query",
+                                                        "reason": "squad writes take no query, ;params or #fragment"})
+                signed = {h: self.headers.get(h, "") for h in SIGNED_HEADERS}
+                return self._reply(200, b.squads.route(method, path, body, local, ip, qs,
+                                                       self.headers.get("X-Tailshare-Keys", ""),
+                                                       (getattr(self, "raw", b""), signed)))
             if path.startswith("/keys/"):
                 if b.keys is None:
                     raise BusError("SSH keys are not available on this machine", 409)
@@ -1108,6 +1172,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello(ip))
+                if (method, path) == ("GET", "/sessions/start/folders"):
+                    return self._reply(200, b.start_folders(ip))
                 if (method, path) == ("GET", "/peers"):
                     return self._reply(200, {"peers": b.peer_list(ip)})
                 if (method, path) == ("POST", "/hive/pair"):
@@ -1145,7 +1211,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._reply(200, b.update(bool(body.get("all"))))
             self._reply(404, {"error": "not found"})
         except BusError as e:
-            self._reply(e.code, {"error": str(e)})
+            self._reply(e.code, {**e.extra, "error": str(e)})
         except (ValueError, json.JSONDecodeError) as e:
             self._reply(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
@@ -1173,6 +1239,12 @@ def start_bus() -> Bus | None:
         b.keys = keys.start(b)
     except Exception as e:  # noqa: BLE001
         log(f"keys not started: {e!r}")
+    try:
+        from . import squads
+
+        b.squads = squads.start(b)
+    except Exception as e:  # noqa: BLE001
+        log(f"squads not started: {e!r}")
     try:
         from . import agent
 

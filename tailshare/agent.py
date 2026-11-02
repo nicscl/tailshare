@@ -206,8 +206,34 @@ def call(path: str, payload: dict | None = None, timeout: float = 15.0) -> dict:
         raise Offline(f"tailshare mailbox is not running on this machine ({e}). Start it with `tailshare install`.") from None
 
 
+def squad_tag() -> dict:
+    """The squad member this session was started as, from the environment the start gate set."""
+    sid, mid = os.environ.get("TAILSHARE_SQUAD", ""), os.environ.get("TAILSHARE_MEMBER", "")
+    return {"id": sid, "member": mid} if sid and mid else {}
+
+
 def register(ident: Identity) -> dict:
-    return call("/register", asdict(ident))
+    tag = squad_tag()
+    return call("/register", {**asdict(ident), **({"squad": tag} if tag else {})})
+
+
+def squad_text(me: dict) -> str:
+    """One line for SessionStart: the squad, this member's role and its squadmates' addresses. "" if none."""
+    tag = me.get("squad") or {}
+    if not tag:
+        return ""
+    try:
+        sq = call(f"/squads/{tag['id']}")["squad"]
+    except (bus.BusError, OSError, KeyError):
+        return ""
+    mine = next((m for m in sq["members"] if m["id"] == tag["member"]), None)
+    if mine is None:
+        return ""
+    mates = [f"{m['name']}{' (' + m['role'] + ')' if m.get('role') else ''} `{m.get('agent') or 'not running'}`"
+             for m in sq["members"] if m["id"] != mine["id"]]
+    role = f", {mine['role']}" if mine.get("role") else ""
+    return (f"- You are {mine['name']}{role} in squad {sq['name']}."
+            + (f" Squadmates: {'; '.join(mates)}. `tailshare squad` shows the squad." if mates else ""))
 
 
 def exe() -> str:
@@ -398,6 +424,9 @@ def cmd_hook(args):
                 "`*/*/<folder>` reaches every agent working in that folder, `@<user>` every session of that person.\n"
                 f"- {NOTE}"
             )
+            squad = squad_text(me)
+            if squad:
+                text += "\n" + squad
             if msgs:
                 text += "\n\nMessages that arrived while you were away:\n" + "\n".join(format_message(m) for m in msgs)
             _hook_out("SessionStart", text)
