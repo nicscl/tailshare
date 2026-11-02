@@ -74,7 +74,9 @@ every option must still be allowed by its `start.json`: a squad never widens wha
 The session runs in tmux session `squad-<name>`, one window per member, with `TAILSHARE_SQUAD` and
 `TAILSHARE_MEMBER` set, and registers on the bus as that member. The bus keeps an agent's squad tag only if
 the member runs on this machine, is of the agent's kind and has its folder, and no other live agent holds the
-tag (a `claude -p` run in a member's shell inherits the variables, and is not the member). A member that already has a live agent is
+tag (a `claude -p` run in a member's shell inherits the variables, and is not the member). An agent counts
+as live for 90 s after it was last heard from: a member that crashed and is started again within that time
+runs without its tag, as the gate also says `running` until then. A member that already has a live agent is
 refused (`running`). The plan says `changed` when the member's instructions differ from the last time it was
 started here.
 
@@ -109,9 +111,52 @@ for the owner only; any other write, a sharee's for one, gets 403. The owner wri
 - on the local API, a caller that sends `~/.tailshare/keys.token` as `X-Tailshare-Keys`, as `tailshare squad
   edit` does. Every process of that account can read the file, an agent's included: the check keeps agents
   from editing squads by accident or through the plain API, not one set on reading the token.
-- on the peer API, a device of the same tailnet user (the Hive app). Not a machine: neither this one, by its
-  tailnet address, nor one that runs tailshare (it has answered `/hello`). Those write through their own local
-  API, so the token cannot be stepped around through the peer API.
+- on the peer API, a device of the same tailnet user (the Hive app), with each write signed by its plan key
+  installed on this machine with the squads grant (below). Unsigned, a machine never writes there: neither this one, by its tailnet
+  address, nor one that runs tailshare (it has answered `/hello`). Those write through their own local API, so
+  the token cannot be stepped around through the peer API.
+
+### Signed writes
+
+A device signs each squad write with the plan key of a start key installed on the machine it writes to. The
+plan key needs no Face ID, so saving does not prompt. The key must be the owner's (enrolled from the owner's
+device) and not removed. It must also hold the squads grant. The person gives it when approving the start key,
+with `tailshare keys approve --squads` or by answering yes when asked, and a signed approval carries it to the
+other machines. Once a start request is approved, its poll (`GET /keys/enroll/<id>`) carries `squads`, whether
+the grant was given, so the app can say so before a save; that is a hint, and the machine's 403 decides. No
+other key signs squad writes: not the start key, which asks for Face ID, and not a pane key,
+which the app keeps as a file in iSH. A key enrolled from a computer gets the grant the same way, only when the
+person gives it. Any of the owner's addresses may send a signed write, so the iPad, whose iSH runs tailshare, writes
+the same way as the iPhone. The signed message is UTF-8, seven lines joined by `\n` with no newline at the end:
+
+```
+tailshare-squad-write/1
+<host>          the machine's name, as its /hello "host"
+<METHOD>        PUT or PATCH
+<path>          /bus/v1/squads/<id>[/members/<member>], as sent, without the query
+<time>          unix seconds
+<nonce>         32 lowercase hex characters, new for each write
+<body sha256>   lowercase hex, of the exact body bytes sent
+```
+
+The path is the raw one in the request line, not decoded or normalized: sign exactly the bytes you send. The
+query string is not signed, so a write with one, or with `;params` or a `#fragment` (even a bare `?`, `;` or
+`#`), is refused with `400 bad_request`, field `query`. It is signed as `ssh-keygen -Y sign -n tailshare-squads` signs (SSHSIG, sha256). It is sent in headers:
+`X-Tailshare-Key` (the key id, `k` and 12 hex), `X-Tailshare-Time`, `X-Tailshare-Nonce` and
+`X-Tailshare-Signature` (the SSHSIG blob in base64, without the armor lines). The time may be at most 60 s from
+the machine's clock, and a nonce is used once. A refusal is `403 {"error": "signature", "reason": …}`, where
+the reason is one of these:
+
+- `unsigned`
+- `bad_signature`, which also covers another machine, path, method or body
+- `expired`, which carries the machine's `now`
+- `replayed`
+- `revoked`
+- `unknown_key`, when no key by that id of the owner is installed here
+- `no_grant`, when the key is installed but was not granted squad edits, or is not a start key's plan key
+
+Each signature check runs `ssh-keygen`, so one address gets 30 a minute. Past that the answer is `429 {"error":
+"signature", "reason": "rate_limited"}`.
 
 Each agent in `/hello` carries `squad: {id, member}` when it is a squad member, for the owner's machines and
 devices only.

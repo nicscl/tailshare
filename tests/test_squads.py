@@ -1,16 +1,21 @@
 """Squads: the icon subset, validation, compare-and-set writes, what sharees see, and syncing between an owner's
 machines. Everything runs on temp state and loopback buses; nothing touches ~/.tailshare or a real tmux."""
 
+import hashlib
+import http.client
 import json
 import os
+import secrets
 import shutil
+import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from tailshare import bus, squads, squads_cli, start, svg
+from tailshare import bus, keys, squads, squads_cli, start, svg
 
 from tests.test_bus import StaticNet, free_port, reg
 
@@ -254,6 +259,30 @@ class Views(unittest.TestCase):
                          {"id": "sq1", "member": "m1"})  # the member itself, registering again
         self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
 
+    def test_two_registrations_at_once_get_one_tag(self):
+        self.m.put("sq5", name="R", members=[{"id": "m1", **member(host="air", folder="/u/projects/app")}])
+        tag = {"id": "sq5", "member": "m1"}
+        real = self.m.squads.check_tag
+        barrier = threading.Barrier(2, timeout=2)
+
+        def slow(*a):  # both check before either writes, unless the check is under the lock
+            out = real(*a)
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return out
+
+        self.m.squads.check_tag = slow
+        threads = [threading.Thread(target=reg, args=(self.m.bus, f"a{i}", "app"),
+                                                  kwargs={"squad": tag, "cwd": "/u/projects/app"}) for i in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        held = [r["id"] for r in self.m.bus.store.q("SELECT id FROM agents WHERE squad!=''")]
+        self.assertEqual(len(held), 1, held)
+
     def test_sharees_get_no_start_options(self):
         sq = self.m.squads.squad("sq1")
         m = sq["members"][0]
@@ -265,9 +294,11 @@ class Views(unittest.TestCase):
         self.assertNotIn("/u/secret", json.dumps(alex))
         self.assertIn("add_dirs", self.get("100.1.1.1", "/squads/sq1")["squad"]["members"][0]["start"]["options"])
 
-    def test_no_writes_from_a_machine_on_the_peer_api(self):
+    def test_no_unsigned_writes_on_the_peer_api(self):
         """A program on this machine (by its tailnet IP) or on another of the owner's tailshare machines would
-        otherwise skip the local API's token; devices, which run no bus, still write."""
+        otherwise skip the local API's token, and a machine that runs no bus looks like a device: unsigned, none
+        of them write (Signed has the signed writes)."""
+        self.m.bus.keys = real_keys(self.m)
         self.m.net.ip = "100.9.9.9"
         self.m.net.usermap.update({"100.9.9.9": "nick@example.com", "100.4.4.4": "nick@example.com"})
         self.m.net.ipmap.update({"100.9.9.9": "air", "100.4.4.4": "pro", "100.1.1.1": "iphone"})
@@ -277,8 +308,11 @@ class Views(unittest.TestCase):
             with self.assertRaises(bus.BusError) as c:
                 self.m.squads.route("PATCH", "/squads/sq1", {"name": "X", "base_rev": rev}, False, ip, {})
             self.assertEqual(c.exception.code, 403, ip)
-        out = self.m.squads.route("PATCH", "/squads/sq1", {"name": "From the phone", "base_rev": rev}, False, "100.1.1.1", {})
-        self.assertEqual(out["squad"]["name"], "From the phone")
+            self.assertIn("local API", str(c.exception))
+        with self.assertRaises(bus.BusError) as c:
+            self.m.squads.route("PATCH", "/squads/sq1", {"name": "From the phone", "base_rev": rev}, False, "100.1.1.1", {})
+        self.assertEqual((c.exception.code, str(c.exception), c.exception.extra["reason"]), (403, "signature", "unsigned"))
+        self.assertNotEqual(self.m.squads.squad("sq1")["name"], "From the phone")
 
     def test_remote_agent_hint_only_from_the_owners_machine(self):
         self.m.put("sq4", name="C", members=[{"id": "m1", **member(host="pro")}])
@@ -497,6 +531,183 @@ class Starting(unittest.TestCase):
         con.execute("INSERT INTO member_starts VALUES('sq1','m1','old',?)", (time.time(),))
         self.assertIn("instructions changed", start._changed(con, plan))
         self.assertEqual(start._canon({**plan, "changed": "x"}), start._canon(plan))
+
+
+ENV = {"PATH": "/usr/bin:/bin"}
+
+
+def real_keys(m):
+    """Real keys on the machine's temp state (its own authorized_keys file), with the fixture's token."""
+    k = keys.Keys(m.bus, m.tmp / "signers", m.tmp / "authorized_keys", m.tmp / "keys.token")
+    k.token = TOKEN
+    return k
+
+
+class Signed(unittest.TestCase):
+    """Squad writes on the peer API carry a signature by one of the owner's device keys installed here."""
+
+    def setUp(self):
+        self.m = Machine(self, "air")
+        b = self.m.bus
+        b.keys = real_keys(self.m)
+        self.m.put("sq1", name="S", members=[{"id": "m1", **member()}])
+        b.net.ip = "100.9.9.9"
+        b.net.usermap.update({ip: "nick@example.com" for ip in ("100.9.9.9", "100.96.0.1", "100.1.1.1")})
+        b.net.usermap["100.7.7.7"] = "eve@example.com"
+        b.net.ipmap.update({"100.9.9.9": "air", "100.96.0.1": "ipad", "100.1.1.1": "iphone"})
+        b.store.x("INSERT INTO peers(host, ip, last_ok) VALUES('ipad', '100.96.0.1', 1)")  # it runs tailshare (iSH)
+        self.start, self.plan, self.other = (self.keygen(n) for n in ("start", "plan", "other"))
+        self.install("k0123456789ab", self.start, self.plan)  # the iPad's start key and its plan key, granted
+
+    def keygen(self, name, kind=("-t", "ecdsa", "-b", "256")):
+        path = self.m.tmp / name
+        subprocess.run(["ssh-keygen", "-q", *kind, "-N", "", "-C", "", "-f", str(path)],
+                       check=True, env={**ENV, "HOME": str(self.m.tmp)}, stdin=subprocess.DEVNULL)
+        return path
+
+    def install(self, key_id, key, plan=None, user="nick@example.com", grant=True):
+        pub = lambda p: " ".join(Path(f"{p}.pub").read_text().split()[:2])  # noqa: E731
+        self.m.bus.store.x("INSERT INTO ssh_keys(id, pubkey, fingerprint, device, node, user, mode, approved_by,"
+                           " installed, plan_pubkey, squads) VALUES(?,?,?,?,?,?,?,?,?,?,?)", key_id, pub(key),
+                           keys.fingerprint(pub(key)), "iPad", "n1", user, "start" if plan else "pane", "test", 1,
+                           pub(plan) if plan else "", int(grant and bool(plan)))
+
+    def sign(self, key, raw, key_id="k0123456789ab", method="PATCH", path="/bus/v1/squads/sq1", host="air",
+             ts=None, nonce=None, namespace=keys.SQUADS_NAMESPACE):
+        ts, nonce = str(int(time.time() if ts is None else ts)), nonce or secrets.token_hex(16)
+        msg = "\n".join(["tailshare-squad-write/1", host, method, path, ts, nonce, hashlib.sha256(raw).hexdigest()])
+        cp = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", str(key), "-n", namespace], input=msg.encode(),
+                            capture_output=True, check=True, env={**ENV, "HOME": str(self.m.tmp)})
+        sig = "".join(l for l in cp.stdout.decode().splitlines() if not l.startswith("-----"))
+        return {"X-Tailshare-Key": key_id, "X-Tailshare-Time": ts, "X-Tailshare-Nonce": nonce, "X-Tailshare-Signature": sig}
+
+    def write(self, ip, raw, headers, path="/squads/sq1", method="PATCH"):
+        return self.m.squads.route(method, path, json.loads(raw), False, ip, {}, "", (raw, headers))
+
+    def body(self, name):
+        return json.dumps({"name": name, "base_rev": self.m.squads.squad("sq1")["rev"]}).encode()
+
+    def refused(self, ip, raw, headers, **kw):
+        with self.assertRaises(bus.BusError) as c:
+            self.write(ip, raw, headers, **kw)
+        self.assertEqual((c.exception.code, str(c.exception)), (403, "signature"), c.exception.extra)
+        return c.exception.extra["reason"]
+
+    def test_a_signed_write_lands_from_the_ipad_and_from_a_phone(self):
+        raw = self.body("From the iPad")
+        self.assertEqual(self.write("100.96.0.1", raw, self.sign(self.plan, raw))["squad"]["name"], "From the iPad")
+        raw = self.body("From the phone")
+        self.assertEqual(self.write("100.1.1.1", raw, self.sign(self.plan, raw))["squad"]["name"], "From the phone")
+        mid = "m_new"
+        raw = json.dumps({"base_rev": None, **member(name="New")}).encode()
+        out = self.write("100.1.1.1", raw, self.sign(self.plan, raw, path=f"/bus/v1/squads/sq1/members/{mid}"),
+                         path=f"/squads/sq1/members/{mid}")
+        self.assertEqual(out["member"]["name"], "New")
+
+    def test_only_a_granted_plan_key_signs(self):
+        """Not the start key (Face ID on every save), not a pane key (the app's is a file in iSH), not a plan key
+        the person did not grant squad edits."""
+        raw = self.body("X")
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(self.start, raw)), "bad_signature")
+        pane = self.keygen("pane", ("-t", "ed25519"))
+        self.install("k0000000000aa", pane)
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(pane, raw, key_id="k0000000000aa")), "no_grant")
+        start2, plan2 = self.keygen("start2"), self.keygen("plan2")
+        self.install("k0000000000bb", start2, plan2, grant=False)
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(plan2, raw, key_id="k0000000000bb")), "no_grant")
+        self.assertEqual(self.m.squads.squad("sq1")["name"], "S")
+
+    def test_the_signature_covers_host_method_path_body_and_key(self):
+        raw = self.body("X")
+        self.install("k00000000000e", self.keygen("start3"), self.other)  # another granted pair
+        for why, headers in [
+            ("another machine", self.sign(self.plan, raw, host="pro")),
+            ("another method", self.sign(self.plan, raw, method="PUT")),
+            ("another path", self.sign(self.plan, raw, path="/bus/v1/squads/sq2")),
+            ("another body", self.sign(self.plan, self.body("Y"))),
+            ("another installed key's id", self.sign(self.plan, raw, key_id="k00000000000e")),
+            ("another namespace", self.sign(self.plan, raw, namespace="tailshare-keys")),
+            ("another pair's plan key", self.sign(self.other, raw)),
+            ("a key not installed here", self.sign(self.keygen("stray"), raw)),
+        ]:
+            self.assertEqual(self.refused("100.96.0.1", raw, headers), "bad_signature", why)
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(self.plan, raw), method="PUT"), "bad_signature")
+        self.m.net.host = "air2"  # signed for the name this machine has now
+        self.assertEqual(self.refused("100.96.0.1", raw, self.sign(self.plan, raw)), "bad_signature")
+        self.assertEqual(self.write("100.96.0.1", raw, self.sign(self.plan, raw, host="air2"))["squad"]["name"], "X")
+        raw = self.body("Z")
+        self.m.net.host = "air"
+        h = self.sign(self.plan, raw)
+        self.assertEqual(self.refused("100.96.0.1", raw, {**h, "X-Tailshare-Time": str(int(h["X-Tailshare-Time"]) + 1)}),
+                         "bad_signature")
+        self.assertEqual(self.refused("100.96.0.1", raw, {**h, "X-Tailshare-Signature": "!" * 40}), "bad_signature")
+        self.assertEqual(self.m.squads.squad("sq1")["name"], "X")
+
+    def test_a_put_signed_as_put_lands(self):
+        raw = json.dumps({"base_rev": None, "name": "New"}).encode()
+        out = self.write("100.1.1.1", raw, self.sign(self.plan, raw, method="PUT", path="/bus/v1/squads/sq9"),
+                         path="/squads/sq9", method="PUT")
+        self.assertEqual(out["squad"]["name"], "New")
+
+    def test_signature_checks_are_limited_per_address(self):
+        raw = self.body("X")
+        bad = {**self.sign(self.plan, raw), "X-Tailshare-Signature": "A" * 40}
+        for _ in range(keys.VERIFY_PER_MINUTE):
+            self.assertEqual(self.refused("100.1.1.1", raw, bad), "bad_signature")
+        with self.assertRaises(bus.BusError) as c:
+            self.write("100.1.1.1", raw, self.sign(self.plan, raw))
+        self.assertEqual((c.exception.code, c.exception.extra["reason"]), (429, "rate_limited"))
+        self.assertEqual(self.write("100.96.0.1", raw, self.sign(self.plan, raw))["squad"]["name"], "X")  # another address
+        self.m.bus.keys._verified["100.1.1.1"] = [time.time() - 61] * keys.VERIFY_PER_MINUTE  # a minute later
+        raw = self.body("Y")
+        self.assertEqual(self.write("100.1.1.1", raw, self.sign(self.plan, raw))["squad"]["name"], "Y")
+
+    def test_old_replayed_and_unknown_keys(self):
+        raw = self.body("X")
+        self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.plan, raw, ts=time.time() - 120)), "expired")
+        with self.assertRaises(bus.BusError) as c:
+            self.write("100.1.1.1", raw, self.sign(self.plan, raw, ts=0))
+        self.assertLess(abs(c.exception.extra["now"] - time.time()), 5)  # the device corrects its clock by it
+        self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.plan, raw, ts=time.time() + 120)), "expired")
+        h = self.sign(self.plan, raw)
+        self.write("100.1.1.1", raw, h)
+        self.assertEqual(self.refused("100.1.1.1", raw, h), "replayed")  # before the stale base_rev's 409
+        self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.plan, raw, key_id="k999999999999")), "unknown_key")
+        self.install("k00000000000e", self.keygen("start3"), self.other, user="eve@example.com")  # not the owner's
+        raw = self.body("Y")
+        self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.other, raw, key_id="k00000000000e")), "unknown_key")
+        self.m.bus.store.x("INSERT INTO revoked_keys(id, at) VALUES('k0123456789ab', 1)")  # revoked, row not yet gone
+        self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.plan, raw)), "revoked")
+        self.m.bus.store.x("DELETE FROM revoked_keys")
+        self.m.bus.keys.remove_here("k0123456789ab")
+        self.assertEqual(self.refused("100.1.1.1", raw, self.sign(self.plan, raw)), "revoked")
+        self.assertEqual(self.m.squads.squad("sq1")["name"], "X")
+
+    def test_still_owner_only(self):
+        raw = self.body("X")
+        with self.assertRaises(bus.BusError) as c:  # a valid signature does not make eve the owner
+            self.write("100.7.7.7", raw, self.sign(self.plan, raw))
+        self.assertIn("owner", str(c.exception))
+
+    def test_over_http_the_exact_bytes_are_signed(self):
+        self.m.serve(self)
+        self.m.net.usermap["127.0.0.1"] = "nick@example.com"
+
+        def send(raw, headers, query=""):  # http.client sends the target as given (urllib drops a #fragment)
+            c = http.client.HTTPConnection("127.0.0.1", self.m.bus.port, timeout=10)
+            self.addCleanup(c.close)
+            c.request("PATCH", "/bus/v1/squads/sq1" + query, raw, {"X-Tailshare": "1", **headers})
+            r = c.getresponse()
+            return r.status, json.load(r)
+
+        raw = self.body("Over HTTP")
+        code, out = send(raw.replace(b", ", b",  "), self.sign(self.plan, raw))  # same JSON, other bytes
+        self.assertEqual((code, out["error"], out["reason"]), (403, "signature", "bad_signature"))
+        for query in ("?x", "?", "?tombstones=1", ";x", ";", "#x", "#"):  # not signed, so a write may not carry one
+            code, out = send(raw, self.sign(self.plan, raw), query)
+            self.assertEqual((code, out["error"], out["field"]), (400, "bad_request", "query"), query)
+        code, out = send(raw, self.sign(self.plan, raw))
+        self.assertEqual((code, out["squad"]["name"]), (200, "Over HTTP"))
 
 
 if __name__ == "__main__":

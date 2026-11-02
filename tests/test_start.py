@@ -543,6 +543,7 @@ class Enroll(unittest.TestCase):
 
     def test_start_key_installs_with_its_grant(self):
         r = self.start_request()
+        self.assertNotIn("squads", r)  # pending: nothing granted yet
         self.assertEqual((r["purpose"], r["want"]), ("start", ["start", "skip"]))
         p = self.k.pending()["pending"][0]
         self.assertEqual((p["purpose"], p["want"]), ("start", ["start", "skip"]))
@@ -556,6 +557,7 @@ class Enroll(unittest.TestCase):
             self.k.approve({"id": r["request_id"], "mode": "pane", "confirm": tail})
         out = self.k.approve({"id": r["request_id"], "mode": "start", "confirm": tail})  # grant less than asked
         self.assertEqual(out["installed"][0]["mode"], "start")
+        self.assertIs(self.k.status("100.1.1.1", r["request_id"])["squads"], False)  # not granted
         lines = [x for x in (self.tmp / "authorized_keys").read_text().splitlines() if "ecdsa" in x]
         kid = out["key_id"]
         self.assertEqual(lines, [  # both keys, with the same id: the plan key's plans are the pair's

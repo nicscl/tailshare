@@ -30,6 +30,7 @@ tailshare keys pending                 # requests waiting here
 tailshare keys approve 3f2a91c0        # pane access (default)
 tailshare keys approve 3f2a91c0 --shell   # a full shell instead
 tailshare keys approve 3f2a91c0 --start=safe   # a start key: start sessions, never skip (docs/start.md)
+tailshare keys approve 3f2a91c0 --squads  # a start key whose plan key may also edit your squads (docs/squads.md)
 tailshare keys deny 3f2a91c0
 tailshare keys ls                      # keys tailshare installed here
 tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machines
