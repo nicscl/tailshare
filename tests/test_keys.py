@@ -98,6 +98,19 @@ class Block(unittest.TestCase):
         self.assertEqual(keys.key_line(k, "/u/bin/tailshare", ""),  # an interpreter path that is not plain
                          'restrict,pty,command="/u/bin/tailshare ssh-gate" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
         self.assertEqual(keys.key_line({**k, "mode": "shell"}, "/x"), "ssh-ed25519 AAAA tailshare:k0123456789ab Nick's-iPhone")
+        self.assertEqual(keys.key_line(k, "", ""),  # neither: fail closed, as start keys do
+                         'restrict,pty,command="/usr/bin/false" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
+
+    def test_gate_python_imports_tailshare_under_I(self):
+        """A `pip install --user` or a checkout is off sys.path under -I: those keep the console script."""
+        keys.gate_python.cache_clear()
+        self.addCleanup(keys.gate_python.cache_clear)
+        self.assertEqual(keys.gate_python(), sys.executable)  # the suite's interpreter has tailshare installed
+        keys.gate_python.cache_clear()
+        with mock.patch.object(keys.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+            self.assertEqual(keys.gate_python(), "")
+        self.assertEqual(run.call_args.args[0], [sys.executable, "-I", "-c", "import tailshare"])
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
 
 
 class Gate(unittest.TestCase):
