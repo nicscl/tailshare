@@ -171,6 +171,106 @@ class Hello(unittest.TestCase):
         self.assertIsNone(got["pro/claude/bad"]["state"])
 
 
+class Skip(unittest.TestCase):
+    """Whether an agent runs with permissions skipped: a display hint for the owner's machines and devices."""
+
+    def setUp(self):
+        self.b = make_bus("pro", StaticNet("pro", usermap={"100.1.1.1": "nick@example.com", "100.2.2.2": "alex@example.com",
+                                                           "100.3.3.3": "tagged-devices"}))
+        reg(self.b, "S", "api")
+        reg(self.b, "Q", "web")
+
+    def skips(self, ip="100.1.1.1"):
+        return {a["address"]: a.get("skip") for a in self.b.hello(ip)["agents"]}
+
+    def test_modes(self):
+        self.assertEqual(bus.SKIP_MODES, ("bypassPermissions", "auto"))  # auto counts until Nicholas rules on it
+        for mode, want in [("bypassPermissions", True), ("auto", True), ("default", False), ("plan", False),
+                           ("acceptEdits", False), ("dontAsk", False)]:
+            self.assertEqual(bus.hook_skip(hook("Stop", permission_mode=mode)), ("S", want), mode)
+        for d in (hook("Stop"), hook("Stop", permission_mode=""), hook("Stop", permission_mode=["auto"]),
+                  {"permission_mode": "auto"}, {"session_id": 7, "permission_mode": "auto"}):
+            self.assertEqual(bus.hook_skip(d), ("", None), d)
+
+    def test_follows_the_hooks_and_is_unknown_until_one(self):
+        self.assertEqual(self.skips(), {"pro/claude/api": None, "pro/claude/web": None})  # omitted, never guessed
+        self.b.report_state(hook("SessionStart", source="startup", permission_mode="bypassPermissions"))
+        self.assertIs(self.skips()["pro/claude/api"], True)
+        self.b.report_state(hook("PreCompact", permission_mode="default"))  # says no state, still says the mode
+        self.assertIs(self.skips()["pro/claude/api"], False)
+        self.b.report_state(hook("Stop"))  # a hook without the field leaves it
+        self.assertIs(self.skips()["pro/claude/api"], False)
+        reg(self.b, "S", "api")  # registering again keeps it
+        self.assertIs(self.skips()["pro/claude/api"], False)
+        self.assertEqual(self.b.report_state(hook("Stop", sid="nobody", permission_mode="auto")), {"ok": False})
+        self.assertIsNone(self.b.store.one("SELECT 1 FROM agents WHERE id='nobody'"))
+
+    def test_only_the_owner_sees_it(self):
+        self.b.report_state(hook("Stop", permission_mode="auto"))
+        self.assertIs(self.skips("100.1.1.1")["pro/claude/api"], True)
+        for ip in ("100.2.2.2", "100.3.3.3", "100.9.9.9"):  # another user, a tagged device, an unknown caller
+            self.assertTrue(all("skip" not in a for a in self.b.hello(ip)["agents"]), ip)
+        self.assertTrue(all("skip" not in a for a in self.b.hello()["agents"]))  # no caller: nothing
+
+    def test_peer_skip_is_a_boolean_or_nothing(self):
+        air = make_bus("air", StaticNet("air", peers={"pro": {"ip": "127.0.0.1", "port": free_port(), "online": True}}))
+        air.store.x("INSERT INTO peers(host, last_ok, agents) VALUES('pro', 1, ?)", json.dumps(
+            [{"address": "pro/claude/a", "skip": True}, {"address": "pro/claude/b", "skip": "true"},
+             {"address": "pro/claude/c", "skip": 1}, {"address": "pro/claude/d", "skip": False}, {"address": "pro/claude/e"}]))
+        got = {a["address"]: a for a in air.directory()["agents"] if a["host"] == "pro"}
+        self.assertEqual({k: a.get("skip", "absent") for k, a in got.items()},
+                         {"pro/claude/a": True, "pro/claude/b": "absent", "pro/claude/c": "absent",
+                          "pro/claude/d": False, "pro/claude/e": "absent"})
+
+    def test_codex_flags(self):
+        for args, want in [(["codex", "--dangerously-bypass-approvals-and-sandbox"], True), (["codex", "--yolo"], True),
+                           (["codex", "-s", "danger-full-access"], True), (["codex", "--sandbox=danger-full-access"], True),
+                           (["codex", "-c", 'sandbox_mode="danger-full-access"'], True),
+                           (["codex", "-s", "workspace-write", "-a", "never"], False), (["codex", "--full-auto"], False),
+                           (["codex", "--sandbox=read-only"], False), (["codex", "-a", "never"], None), (["codex"], None),
+                           (["codex", "-s"], False)]:
+            self.assertEqual(bus.codex_skip(args), want, args)
+
+    def test_codex_argv_read_once_per_process_and_only_our_own(self):
+        p = subprocess.Popen(["/bin/sh", "-c", "sleep 30; :", "codex", "--yolo"])  # its args say --yolo (the ; keeps sh from exec)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        self.assertIs(bus.pid_skip(p.pid), True)
+        with mock.patch.object(bus, "pid_skip", wraps=bus.pid_skip) as read:
+            self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": p.pid})
+            self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": p.pid})
+            self.assertEqual(read.call_count, 1)  # once per process
+            self.b.register({"id": "C", "harness": "claude", "cwd": "/x/cl", "pid": p.pid})
+            self.assertEqual(read.call_count, 1)  # Claude's comes from its hooks
+        self.assertIs(self.skips()["pro/codex/cx"], True)
+        with mock.patch.object(bus, "pid_skip", return_value=None):
+            self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": p.pid + 100000})
+        self.assertIsNone(self.skips()["pro/codex/cx"])  # a new process is read again
+        theirs = SimpleNamespace(returncode=0, stdout="    0 /opt/codex --yolo\n")
+        with mock.patch.object(bus.subprocess, "run", return_value=theirs):
+            self.assertIsNone(bus.pid_skip(4242))  # another uid's process: not read
+        for bad in (OSError("no ps"), subprocess.TimeoutExpired("ps", 2)):
+            with mock.patch.object(bus.subprocess, "run", side_effect=bad):
+                self.assertIsNone(bus.pid_skip(4242))
+        with mock.patch.object(bus.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="")):
+            self.assertIsNone(bus.pid_skip(4242))
+        self.assertIsNone(bus.pid_skip(0))
+        self.assertIsNone(bus.pid_skip(1))
+
+    def test_codex_pid_is_the_codex_ancestor(self):
+        parent = 9
+        table = "\n".join(["  9   8 /bin/zsh -l", "  8   7 /Users/n/.codex/bin/codex --yolo", "  7   6 node /opt/homebrew/bin/codex --yolo",
+                            "  6   1 /Applications/Ghostty.app/Contents/MacOS/ghostty"])
+        out = SimpleNamespace(returncode=0, stdout=table)
+        with mock.patch.object(agent.subprocess, "run", return_value=out), mock.patch.object(agent.os, "getppid", return_value=parent):
+            self.assertEqual(agent._codex_pid(), 8)
+        no = SimpleNamespace(returncode=0, stdout="  9   1 /bin/zsh -l")
+        with mock.patch.object(agent.subprocess, "run", return_value=no), mock.patch.object(agent.os, "getppid", return_value=parent):
+            self.assertEqual(agent._codex_pid(), 0)
+        with mock.patch.object(agent.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(agent._codex_pid(), 0)
+
+
 class CurlHook(unittest.TestCase):
     """The installed command, run by a shell as Claude Code would, against a throwaway local bus."""
 

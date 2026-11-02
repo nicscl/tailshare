@@ -21,6 +21,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -158,6 +159,55 @@ def clean_state(s: object) -> dict | None:
     if s["v"] == "waiting_input" and s.get("reason") in REASONS:
         out["reason"] = s["reason"]
     return out
+
+
+# Claude permission modes that run without asking. auto counts until Nicholas decides otherwise; start.json's
+# skip check should use this same set, so that decision is this one line.
+SKIP_MODES = ("bypassPermissions", "auto")
+
+
+def hook_skip(d: dict) -> tuple[str, bool | None]:
+    """(agent id, whether it runs with permissions skipped) from a Claude Code hook's permission_mode; None
+    when the hook does not say. A display hint, not a security signal: any local process can post a hook."""
+    aid, mode = d.get("session_id"), d.get("permission_mode")
+    if not (isinstance(aid, str) and aid and isinstance(mode, str) and mode):
+        return "", None
+    return aid, mode in SKIP_MODES
+
+
+def codex_skip(args: list[str]) -> bool | None:
+    """Whether a Codex command line runs without asking: the bypass flag, or no sandbox. None when its
+    flags leave it to config.toml, which is not read."""
+    sandbox = None
+    for i, a in enumerate(args):
+        nxt = args[i + 1] if i + 1 < len(args) else ""
+        if a in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+            return True
+        if a == "--full-auto":
+            sandbox = sandbox or "workspace-write"
+        elif a in ("-s", "--sandbox"):
+            sandbox = nxt
+        elif a.startswith("--sandbox="):
+            sandbox = a.split("=", 1)[1]
+        elif a in ("-c", "--config") and nxt.replace(" ", "").startswith("sandbox_mode="):
+            sandbox = nxt.split("=", 1)[1].strip().strip("'\"")
+    return None if sandbox is None else sandbox == "danger-full-access"
+
+
+def pid_skip(pid: int) -> bool | None:
+    """codex_skip of a running process's argv, read with ps (no shell). Only a process of the uid this
+    mailbox runs as, so a registration cannot make it read anyone else's; None on any failure."""
+    if pid <= 1 or not hasattr(os, "getuid"):
+        return None
+    try:
+        cp = subprocess.run(["/bin/ps", "-o", "uid=,args=", "-p", str(pid)], capture_output=True, text=True,
+                            timeout=2, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        uid, _, args = cp.stdout.strip().partition(" ")
+        if cp.returncode != 0 or int(uid) != os.getuid():
+            return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return codex_skip(args.split())
 
 
 def clean_tmux(t: object) -> dict:
@@ -315,7 +365,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "skip")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -384,6 +434,11 @@ class Bus:
         session = str(a.get("session") or "").strip()
         user = self._user_for(a)
         tmux = clean_tmux(a.get("tmux"))
+        pid = int(a.get("pid") or 0)
+        was = self.store.one("SELECT pid, skip FROM agents WHERE id=?", aid)
+        skip = was["skip"] if was and was["pid"] == pid else ""  # Claude's comes from its hooks
+        if harness == "codex" and pid and not (was and was["pid"] == pid):  # once per process, outside the lock
+            skip = {True: "1", False: "0", None: ""}[pid_skip(pid)]
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:
@@ -395,12 +450,13 @@ class Bus:
                 clash = any(r["address"].split(":")[0] == base for r in live)
                 address = f"{base}:{slug(aid)[:4]}" if clash else base
             self.store.x(
-                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
+                "INSERT INTO agents(id, address, harness, cwd, session, pid, first_seen, last_seen, user, tmux, skip)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET address=excluded.address,"
                 " harness=excluded.harness, cwd=excluded.cwd, session=excluded.session,"
-                " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user, tmux=excluded.tmux",
-                aid, address, harness, cwd, session, int(a.get("pid") or 0), now, now, user,
-                json.dumps(tmux) if tmux else "",
+                " pid=excluded.pid, last_seen=excluded.last_seen, user=excluded.user, tmux=excluded.tmux,"
+                " skip=excluded.skip",
+                aid, address, harness, cwd, session, pid, now, now, user,
+                json.dumps(tmux) if tmux else "", skip,
             )
             self._claim(aid, address, user)
         return self.agent(aid)
@@ -444,10 +500,14 @@ class Bus:
             "online": r["last_seen"] > time.time() - LIVE, "host": self.net.host,
             "tmux": json.loads(r["tmux"]) if r["tmux"] else {}, "login": LOGIN,
             "state": json.loads(r["state"]) if r["state"] else None,
+            "skip": {"1": True, "0": False}.get(r["skip"]),  # a display hint (hook_skip): None when unknown
         }
 
     def report_state(self, d: dict) -> dict:
         """What an agent's harness says it is doing, from its hooks. Only agents that registered count."""
+        sid, skip = hook_skip(d)
+        if skip is not None:  # every hook says the mode, which Shift+Tab can change mid-session
+            self.store.x("UPDATE agents SET skip=? WHERE id=?", "1" if skip else "0", sid)
         aid, state, reason = hook_state(d)
         if not state:
             return {"ok": False}
@@ -488,6 +548,8 @@ class Bus:
                 a.update(host=p["host"], online=bool(a.get("online")) and up, host_online=up,
                          tmux=clean_tmux(a.get("tmux")), login=clean_login(a.get("login")),
                          state=clean_state(a.get("state")))
+                if not isinstance(a.get("skip"), bool):  # a JSON boolean or nothing
+                    a.pop("skip", None)
                 out.append(a)
         return {"host": self.net.host, "agents": out}
 
@@ -593,7 +655,8 @@ class Bus:
         so a person can attach to it; SSH to that machine is still the gate. `you` is what the tailnet
         says about the caller, so a client can tell its own machines from ones shared with it."""
         keys = ("address", "user", "harness", "session", "online", "last_seen") + (("tmux", "login", "state") if SHARE_PANES else ())
-        agents = [{k: a[k] for k in keys if k != "state" or a[k]} for a in self.local_agents()]
+        full = self.local_agents()
+        agents = [{k: a[k] for k in keys if k != "state" or a[k]} for a in full]
         for a in agents:
             if a.get("tmux"):
                 a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
@@ -604,9 +667,14 @@ class Bus:
                 self.net.refresh()
             out["you"] = {"user": self.net.user_for_ip(ip) or "", "node": self.net.host_for_ip(ip) or ""}
             u = out["you"]["user"]  # tagged machines have no owner: other tagged devices aren't own
-            battery = self.battery.for_caller(own=bool(u) and u != "tagged-devices" and u == self.net.user)
+            own = bool(u) and u != "tagged-devices" and u == self.net.user
+            battery = self.battery.for_caller(own=own)
             if battery:
                 out["power"] = battery
+            if own:  # which agents run without asking: the owner's machines and devices only
+                for a, f in zip(agents, full):
+                    if f["skip"] is not None:
+                        a["skip"] = f["skip"]
         return out
 
     def _pane_alive(self, t: dict) -> bool:
