@@ -167,8 +167,8 @@ class Flow(unittest.TestCase):
         self.signing_key, sign_pub = keypair(self.tmp, "signer")
         self.signers.write_text(sessions.trust_line("nick", sign_pub))
         os.chmod(self.signers, 0o600)
-        self.air_keys = keys.Keys(self.air, self.signers, self.tmp / "air" / "authorized_keys", self.tmp / "air.token")
-        self.pro_keys = keys.Keys(self.pro, self.signers, self.tmp / "pro" / "authorized_keys", self.tmp / "pro.token")
+        self.air_keys = self.machine_keys(self.air, "air")
+        self.pro_keys = self.machine_keys(self.pro, "pro")
         self.air.keys, self.pro.keys = self.air_keys, self.pro_keys
         self.air.store.x("INSERT INTO peers(host, ip, version, last_ok) VALUES('pro','127.0.0.1','t',?)", time.time())
         _, self.phone_pub = keypair(self.tmp, "phone")
@@ -179,6 +179,11 @@ class Flow(unittest.TestCase):
         keys.REQUIRE_SK = self._sk
         self.srv.shutdown()
         self.srv.server_close()
+
+    def machine_keys(self, b, name):
+        d = self.tmp / name
+        return keys.Keys(b, self.signers, d / "authorized_keys", self.tmp / f"{name}.token",
+                         machine_key=d / "machine_key", trusted=d / "trusted_machines")
 
     def enroll(self, ip=PHONE, pub=None, device="Nick's iPhone"):
         return self.air_keys.enroll(ip, {"pubkey": pub or self.phone_pub, "device_name": device})
@@ -466,7 +471,7 @@ class Flow(unittest.TestCase):
 
     def test_peer_routes_need_same_user(self):
         eve = make_bus("eve", StaticNet("eve", usermap={"127.0.0.1": "eve@example.com"}, user=OWNER))
-        eve.keys = keys.Keys(eve, self.signers, self.tmp / "eve" / "authorized_keys", self.tmp / "eve.token")
+        eve.keys = self.machine_keys(eve, "eve")
         with self.assertRaises(bus.BusError) as cm:
             eve.keys.install_from_peer("127.0.0.1", {"payload": "{}", "signature": ""})
         self.assertEqual(cm.exception.code, 403)
@@ -532,6 +537,200 @@ class Flow(unittest.TestCase):
             self.pro_keys.revoke_from_peer("127.0.0.1", {"key_id": "kaaaaaaaaaaaa"})
         self.assertEqual(cm.exception.code, 403)
         self.assertEqual(self.pro_keys.targets(), ["pro"])
+
+
+    # -- machine trust: directed edges, one hop, retries (docs/ssh-keys.md#machine-trust) --------------------
+    def trust(self, on, of):
+        """A person on `on` runs `tailshare keys trust-machine` for `of` (Keys objects)."""
+        pub = of.machine_pub()
+        return on.trust({"host": of.host, "pubkey": pub, "confirm": keys.fingerprint(pub)[-6:]})
+
+    def approve_here(self, r, mode="pane", **extra):
+        code = (r.get("pair_fingerprint") or r["fingerprint"])[-6:]
+        return self.air_keys.approve({"confirm": code, "id": r["request_id"], "mode": mode, **extra})
+
+    def prismo(self):
+        """A third machine of the owner, which sees air at 100.64.0.1 and pro at 100.64.0.2."""
+        b = make_bus("prismo", StaticNet("prismo", ipmap={"100.64.0.1": "air", "100.64.0.2": "pro"},
+                                         usermap={"100.64.0.1": OWNER, "100.64.0.2": OWNER}, user=OWNER))
+        b.keys = self.machine_keys(b, "prismo")
+        return b.keys
+
+    def test_a_trusted_machine_installs_with_its_own_key_and_no_mode_cap(self):
+        self.trust(self.pro_keys, self.air_keys)
+        r = self.enroll()
+        out = self.approve_here(r, "shell")
+        self.assertEqual(sorted(i["host"] for i in out["installed"]), ["air", "pro"], out)
+        self.assertEqual(out["errors"], {})
+        k = self.pro_keys.ls()["keys"][0]
+        self.assertEqual((k["id"], k["mode"], k["approved_by"]), (out["key_id"], "shell", "trusted machine air"))
+        st = self.air_keys.status(PHONE, r["request_id"])
+        self.assertEqual(([i["host"] for i in st["installed"]], st["not_installed"]), (["air", "pro"], {}))
+        # a start key that may skip permissions, with the squads grant, goes the same way
+        start_pub, plan_pub = self.p256("start"), self.p256("plan")
+        r = self.air_keys.enroll(PHONE, {"pubkey": start_pub, "plan_pubkey": plan_pub, "purpose": "start",
+                                         "want": ["start", "skip"], "device_name": "iPad"})
+        out = self.approve_here(r, "start-skip", squads=True)
+        self.assertEqual(sorted((i["host"], i["mode"], i["squads"]) for i in out["installed"]),
+                         [("air", "start-skip", True), ("pro", "start-skip", True)], out)
+        self.assertEqual({k["plan_pubkey"] for k in self.pro_keys.ls()["keys"] if k["mode"] == "start-skip"}, {plan_pub})
+
+    def test_trust_goes_one_way(self):
+        self.trust(self.air_keys, self.pro_keys)  # pro -> air: air takes pro's approvals, not the other way round
+        r = self.enroll()
+        out = self.approve_here(r)
+        self.assertEqual([i["host"] for i in out["installed"]], ["air"])
+        self.assertIn("pro does not trust air", out["errors"]["pro"])
+        self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
+        st = self.air_keys.status(PHONE, r["request_id"])
+        self.assertIn("does not trust air", st["not_installed"]["pro"])  # the app can say: approve on pro too
+        self.assertEqual(self.air_keys.retry_installs(), {})  # a refusal is not asked again
+        self.assertEqual(self.air_keys.ls()["installing"][0]["final"], 1)
+
+    def test_here_keeps_it_on_this_machine_even_when_trusted(self):
+        self.trust(self.pro_keys, self.air_keys)
+        out = self.approve_here(self.enroll(), here=True)
+        self.assertEqual(([i["host"] for i in out["installed"]], out["errors"]), (["air"], {}))
+        self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
+
+    def machine_doc(self, signer_keys, hosts, origin=None, key_id="k" + "d" * 12, sign_with=None):
+        pub = keys.parse_pubkey(keypair(self.tmp, f"dev-{key_id}")[1])
+        p = {"id": "f" * 32, "pubkey": pub, "fingerprint": keys.fingerprint(pub), "device": "iPad", "node": "ipad",
+             "user": OWNER}
+        payload = keys.approval_doc(signer_keys.host, origin or signer_keys.host, p, key_id, "pane", hosts, machine=True)
+        if sign_with is None:
+            return payload, signer_keys._machine_sign(payload)
+        return payload, sessions.sign(payload, sign_with, sessions.KEYS_NAMESPACE)
+
+    def test_only_direct_edges_count_never_a_relay(self):
+        """air -> pro and pro -> prismo: air's approval reaches pro, not prismo, sent by air or passed on by pro."""
+        prismo = self.prismo()
+        self.trust(self.pro_keys, self.air_keys)
+        self.trust(prismo, self.pro_keys)
+        payload, sig = self.machine_doc(self.air_keys, ["air", "pro", "prismo"])
+        for sender in ("100.64.0.1", "100.64.0.2"):  # from air itself, and relayed by pro
+            with self.assertRaises(bus.BusError) as cm:
+                prismo.install_from_peer(sender, {"payload": payload, "signature": sig})
+            self.assertEqual(cm.exception.code, 403)
+        self.assertEqual(prismo.ls()["keys"], [])
+        payload, sig = self.machine_doc(self.pro_keys, ["prismo"], key_id="k" + "e" * 12)  # pro's own: a direct edge
+        self.assertEqual(prismo.install_from_peer("100.64.0.2", {"payload": payload, "signature": sig})["host"], "prismo")
+        self.assertEqual(prismo.ls()["keys"][0]["approved_by"], "trusted machine pro")
+
+    def test_a_machine_approval_must_come_from_that_machine_and_its_key(self):
+        prismo = self.prismo()
+        self.trust(prismo, self.air_keys)
+        cases = {
+            "sent by pro": (self.machine_doc(self.air_keys, ["prismo"], key_id="k" + "1" * 12), "100.64.0.2"),
+            "origin is not the signer": (self.machine_doc(self.air_keys, ["prismo"], origin="pro", key_id="k" + "2" * 12),
+                                         "100.64.0.1"),
+            "another key": (self.machine_doc(self.air_keys, ["prismo"], key_id="k" + "3" * 12,
+                                             sign_with=self.signing_key), "100.64.0.1"),
+            "not for prismo": (self.machine_doc(self.air_keys, ["pro"], key_id="k" + "4" * 12), "100.64.0.1"),
+        }
+        for name, ((payload, sig), sender) in cases.items():
+            with self.subTest(name), self.assertRaises(bus.BusError) as cm:
+                prismo.install_from_peer(sender, {"payload": payload, "signature": sig})
+            self.assertEqual(cm.exception.code, 403, name)
+        self.assertEqual(prismo.ls()["keys"], [])
+        # a person's approval here never takes a machine-signed document either
+        r = self.enroll(pub=keypair(self.tmp, "local")[1])
+        p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r["request_id"])
+        payload = keys.approval_doc("pro", "pro", p, "k" + "5" * 12, "pane", ["air"], machine=True)
+        self.trust(self.air_keys, self.pro_keys)
+        with self.assertRaises(bus.BusError) as cm:
+            self.approve_here(r, payload=payload, signature=self.pro_keys._machine_sign(payload))
+        self.assertIn("only accepted from that machine", str(cm.exception))
+        # replay: the same machine approval works once
+        payload, sig = self.machine_doc(self.air_keys, ["prismo"], key_id="k" + "6" * 12)
+        prismo.install_from_peer("100.64.0.1", {"payload": payload, "signature": sig})
+        with self.assertRaises(bus.BusError) as cm:
+            prismo.install_from_peer("100.64.0.1", {"payload": payload, "signature": sig})
+        self.assertIn("already used", str(cm.exception))
+
+    def test_trusted_machines_file_is_for_key_approvals_only(self):
+        self.trust(self.pro_keys, self.air_keys)
+        text = (self.tmp / "pro" / "trusted_machines").read_text()
+        self.assertEqual(text, f'air namespaces="tailshare-keys" {self.air_keys.machine_pub()}\n')
+        self.assertEqual(os.stat(self.tmp / "pro" / "trusted_machines").st_mode & 0o777, 0o600)
+        self.assertNotIn(self.air_keys.machine_pub().split()[1], self.signers.read_text())  # launches never trust it
+        payload = sessions.canonical({"v": 1, "signer": "air", "action": "launch"})
+        with self.assertRaises(bus.BusError):
+            sessions.verify(payload, self.air_keys._machine_sign(payload), self.tmp / "pro" / "trusted_machines")
+
+    def test_trust_needs_the_fingerprint_and_a_machine_key(self):
+        pub, p256 = self.air_keys.machine_pub(), self.p256("p")
+        bad = {"wrong code": {"host": "air", "pubkey": pub, "confirm": "xxxxxx"},
+               "itself": {"host": "pro", "pubkey": pub, "confirm": keys.fingerprint(pub)[-6:]},
+               "not a machine key": {"host": "air", "pubkey": p256, "confirm": keys.fingerprint(p256)[-6:]},
+               "bad name": {"host": "air x", "pubkey": pub, "confirm": keys.fingerprint(pub)[-6:]}}
+        for name, body in bad.items():
+            with self.subTest(name), self.assertRaises(bus.BusError):
+                self.pro_keys.trust(body)
+        self.assertEqual(self.pro_keys.trusted_view()["trusted"], [])
+        self.trust(self.pro_keys, self.air_keys)
+        self.trust(self.pro_keys, self.air_keys)  # again: still one line
+        self.assertEqual([t["host"] for t in self.pro_keys.trusted_view()["trusted"]], ["air"])
+        self.assertEqual(self.pro_keys.untrust({"host": "air"})["removed"], True)
+        self.assertEqual(self.pro_keys.untrust({"host": "air"})["removed"], False)
+        out = self.approve_here(self.enroll())
+        self.assertIn("pro", out["errors"])  # untrusted again: nothing installs there
+
+    def test_trust_machine_fetches_the_key_and_sees_a_mutual_edge(self):
+        m = self.air_keys.peer_machine({"host": "pro"})  # over HTTP, from pro's GET /keys/machine
+        self.assertEqual((m["pubkey"], m["trusts_us"]), (self.pro_keys.machine_pub(), False))
+        self.trust(self.pro_keys, self.air_keys)
+        self.assertIs(self.air_keys.peer_machine({"host": "pro"})["trusts_us"], True)
+        for host in ("air", "nobody"):
+            with self.subTest(host), self.assertRaises(bus.BusError):
+                self.air_keys.peer_machine({"host": host})
+        with self.assertRaises(bus.BusError) as cm:  # only the owner's machines may ask
+            self.pro_keys.machine_info("100.64.0.66")
+        self.assertEqual(cm.exception.code, 403)
+
+    def test_offline_machines_get_it_later_signed_again(self):
+        self.trust(self.pro_keys, self.air_keys)
+        self.air.net.peers["pro"]["online"] = False
+        r = self.enroll()
+        out = self.approve_here(r)
+        self.assertEqual(out["errors"], {"pro": "offline: will retry"})
+        self.assertEqual(self.air_keys.status(PHONE, r["request_id"])["not_installed"], {"pro": "offline: will retry"})
+        self.assertEqual(self.air_keys.retry_installs(), {})  # still offline: nothing sent
+        self.air.net.peers["pro"]["online"] = True
+        self.assertEqual(self.air_keys.retry_installs(), {"pro": "installed"})
+        self.assertEqual(self.pro_keys.ls()["keys"][0]["id"], out["key_id"])
+        st = self.air_keys.status(PHONE, r["request_id"])
+        self.assertEqual(([i["host"] for i in st["installed"]], st["not_installed"]), (["air", "pro"], {}))
+        self.assertEqual(self.air_keys.retry_installs(), {})
+        self.assertEqual(self.air_keys.ls()["installing"], [])
+
+    def test_a_person_signed_approval_is_retried_with_the_machine_key(self):
+        self.trust(self.pro_keys, self.air_keys)
+        self.air.net.peers["pro"]["online"] = False
+        r = self.enroll()
+        payload, sig = self.signed(r)
+        out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane",
+                                     "payload": payload, "signature": sig})
+        self.assertEqual(out["errors"], {"pro": "offline: will retry"})
+        self.air.net.peers["pro"]["online"] = True
+        self.assertEqual(self.air_keys.retry_installs(), {"pro": "installed"})
+        self.assertEqual(self.pro_keys.ls()["keys"][0]["approved_by"], "trusted machine air")
+
+    def test_retries_stop_when_removed_or_too_old(self):
+        self.trust(self.pro_keys, self.air_keys)
+        self.air.net.peers["pro"]["online"] = False
+        a = self.approve_here(self.enroll())
+        b = self.approve_here(self.enroll(pub=keypair(self.tmp, "second")[1]))
+        self.air_keys.rm({"key_id": a["key_id"]})
+        self.assertEqual([i["key_id"] for i in self.air_keys.ls()["installing"]], [b["key_id"]])  # gone at once
+        self.air.store.x("UPDATE key_installs SET created=? WHERE key_id=?", time.time() - keys.INSTALL_RETRY_FOR - 1,
+                         b["key_id"])
+        self.air.net.peers["pro"]["online"] = True
+        self.assertEqual(self.air_keys.retry_installs(), {})
+        self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
+        left = self.air_keys.ls()["installing"]
+        self.assertEqual([(i["key_id"], i["final"]) for i in left], [(b["key_id"], 1)])
+        self.assertIn("gave up", left[0]["error"])
 
 
 class Token(unittest.TestCase):

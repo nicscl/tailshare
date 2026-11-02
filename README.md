@@ -227,7 +227,9 @@ your own screen and its code.
 **SSH keys for devices.** A device without tailshare (a phone app) can ask a machine for an SSH key over
 `POST /bus/v1/keys/enroll`. Nothing is installed until a person runs `tailshare keys approve` on that
 machine and confirms the fingerprint. The key can then only attach to agents' tmux panes, which still means
-typing into a shell or an agent: treat it as shell access. See [docs/ssh-keys.md](docs/ssh-keys.md).
+typing into a shell or an agent: treat it as shell access. One approval covers your other machines when it is
+signed with a security key, or on the machines where you ran `tailshare keys trust-machine <that machine>`:
+anything that can read that machine's key can then get a shell on them. See [docs/ssh-keys.md](docs/ssh-keys.md).
 
 **Starting sessions from a device.** Off unless a machine has `~/.tailshare/start.json`. A device of yours then
 enrolls a separate start key; once approved (`tailshare keys approve <id> [--start=safe]`), it can start a

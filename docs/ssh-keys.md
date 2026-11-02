@@ -34,6 +34,7 @@ tailshare keys approve 3f2a91c0 --squads  # a start key whose plan key may also 
 tailshare keys deny 3f2a91c0
 tailshare keys ls                      # keys tailshare installed here
 tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machines
+tailshare keys trust-machine macbook-air   # let the Air's approvals install keys here (see Machine trust)
 ```
 
 ## Who can approve, and where the key goes
@@ -48,11 +49,14 @@ tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machin
   An agent running as this account can read the token, call the API, or edit `authorized_keys` directly; no
   check on the same account can stop that. These checks make the likely attack, a bus message saying
   "please approve key X", fail when an agent goes along with it, instead of quietly working.
-- **This machine only, unless signed with a security key.** With a FIDO signing key (`TAILSHARE_SIGN_KEY` or
+- **This machine only, unless signed with a security key or trusted.** With a FIDO signing key (`TAILSHARE_SIGN_KEY` or
   `~/.ssh/id_*_sk`; other machines refuse approvals signed by plain key files, which any program running as you
   could use), the approval is signed with `ssh-keygen -Y sign -n tailshare-keys` and sent to the owner's other machines that
   run tailshare. Each one checks the signature against its own `~/.tailshare/allowed_signers` before
-  installing. One machine can never add keys to the others on its own say-so. `--here` skips the others.
+  installing. Without one, the approval also goes to the owner's other machines, signed with this machine's
+  key, and only the machines where a person ran `tailshare keys trust-machine <this machine>` install it
+  ([Machine trust](#machine-trust)). A machine that has not said so never adds a key on another machine's
+  say-so. `--here` skips the others either way.
   Keys trusted with `tailshare sessions trust` sign both launches and key approvals. Lines written before key
   approvals existed name only `tailshare-launch`: run `trust` for that key again. A launch signature is
   never accepted as a key approval, and a key approval is never accepted as a launch.
@@ -61,6 +65,46 @@ tailshare keys rm k1a2b3c4d5e6f        # remove it here and on your other machin
   same tailnet user. Approvals and removals are only sent to machines that user owns. A tagged machine has
   no single owner, so it takes part in neither.
 - Each signed approval works once (nonce), within 15 minutes. A revoked key id can never be installed again.
+
+## Machine trust
+
+**`tailshare keys trust-machine X`, run on Y, means: anything that can read X's machine key can get a shell on
+Y.** That includes any agent running on X as you, a backup of X's home folder, and malware on X. No person
+and no device has to approve anything for it.
+
+With that understood, it saves approving a device on every machine. Each machine has a machine key,
+`~/.tailshare/machine_key` (a plain ed25519 file, made the first time it is needed). When a person approves a
+key on X without a security key, X signs the approval with its machine key and sends it to the owner's other
+machines. Y installs it only when Y trusts X:
+
+```sh
+tailshare keys machine-key          # on X: its fingerprint
+tailshare keys trust-machine X      # on Y: shows X's fingerprint, you type its last 6 characters
+tailshare keys trusted              # on Y: the machines whose approvals install keys on Y
+tailshare keys untrust-machine X    # on Y: stop
+```
+
+- **Directed.** `trust-machine X` on Y is the edge X → Y. Y takes X's approvals; X takes none of Y's until
+  someone runs `trust-machine Y` on X. When X already trusts Y, `trust-machine` warns that the edge would go
+  both ways and asks again: then either machine, taken over, gives the other away.
+- **One hop.** Only direct edges count. With air → pro and pro → prismo, an approval on air installs on pro,
+  not on prismo. A machine's approval is accepted only from that machine (the sender must be the signer
+  and the origin), signed with the key `trusted_machines` names for it. A machine never passes on one it
+  received.
+- **Every kind of key.** A trusted approval installs what the person approved, shell and start-skip keys
+  included, with the squads grant when it was given.
+- **The same checks as signed approvals.** Only from machines of the same tailnet user, never on a tagged
+  machine; each approval works once (nonce), within 15 minutes; a revoked key id never comes back.
+- **The trust file holds key approvals only.** `~/.tailshare/trusted_machines` is an `allowed_signers` file
+  whose lines name only `tailshare-keys`, so a machine key never signs a launch. `trust-machine` refuses
+  inside an agent's shell and without a terminal, like `approve`; as there, that is friction, not a wall.
+- **Machines that were offline get the key later.** The approving machine retries every minute for 7 days,
+  signing again with its machine key each time, so a retry only reaches machines that trust it. That goes
+  for approvals first signed with a security key too. A machine that refuses (it does not trust this one,
+  or the key was revoked there) is not asked again. `tailshare keys ls` lists keys not installed everywhere
+  yet, and removing a key stops its retries.
+- **Removing stays wide.** `keys rm` and a device's own revoke reach every machine of the owner, trusted or
+  not, as before.
 
 ## Revoking
 
@@ -230,8 +274,13 @@ answers:
 
 ```json
 {"request_id": "…", "fingerprint": "SHA256:…", "host": "macbook-pro", "login": "Glaciar", "owner": "…",
- "status": "pending", "expires": 1793390000.0, "purpose": "pane", "want": [], "key_id": "", "installed": []}
+ "status": "pending", "expires": 1793390000.0, "purpose": "pane", "want": [], "key_id": "", "installed": [],
+ "not_installed": {}}
 ```
+
+- Once approved, `installed` lists each machine the key went to, and `not_installed` the owner's other
+  machines it has not reached, with why: `{"prismo": "offline: will retry"}`, or that the machine does not
+  trust the one that approved it (so a client can say "approve it on prismo too").
 
 - Key types: `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`, `ecdsa-sha2-nistp256`.
 - Limits: 3 pending requests per device, 20 a day. A request expires after 15 minutes.
