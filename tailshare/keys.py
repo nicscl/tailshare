@@ -629,7 +629,11 @@ class Keys:
 
     # -- requests from devices --------------------------------------------------
     def _view(self, r) -> dict:
-        return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN,
+        grant = {}
+        if r["purpose"] == "start" and r["status"] == "approved":  # a hint for the app; the 403 no_grant decides
+            k = self.store.one("SELECT squads FROM ssh_keys WHERE id=?", r["key_id"])
+            grant = {"squads": bool(k and k["squads"])}
+        return {"request_id": r["id"], "fingerprint": r["fingerprint"], "host": self.host, "login": bus.LOGIN, **grant,
                 **({"pair_fingerprint": pair_fingerprint(r["pubkey"], r["plan_pubkey"])} if r["plan_pubkey"] else {}),
                 "owner": self.bus.net.user, "status": "pending" if r["status"] == "approving" else r["status"],
                 "expires": r["expires"], "purpose": r["purpose"], "want": json.loads(r["want"]),

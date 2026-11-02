@@ -122,7 +122,9 @@ A device signs each squad write with the plan key of a start key installed on th
 plan key needs no Face ID, so saving does not prompt. The key must be the owner's (enrolled from the owner's
 device) and not removed. It must also hold the squads grant. The person gives it when approving the start key,
 with `tailshare keys approve --squads` or by answering yes when asked, and a signed approval carries it to the
-other machines. No other key signs squad writes: not the start key, which asks for Face ID, and not a pane key,
+other machines. Once a start request is approved, its poll (`GET /keys/enroll/<id>`) carries `squads`, whether
+the grant was given, so the app can say so before a save; that is a hint, and the machine's 403 decides. No
+other key signs squad writes: not the start key, which asks for Face ID, and not a pane key,
 which the app keeps as a file in iSH. A key enrolled from a computer gets the grant the same way, only when the
 person gives it. Any of the owner's addresses may send a signed write, so the iPad, whose iSH runs tailshare, writes
 the same way as the iPhone. The signed message is UTF-8, seven lines joined by `\n` with no newline at the end:

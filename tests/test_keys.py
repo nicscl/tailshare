@@ -266,10 +266,12 @@ class Flow(unittest.TestCase):
         out = self.air_keys.approve({**body, "payload": payload, "signature": sig})
         self.assertEqual(sorted((i["host"], i["squads"]) for i in out["installed"]), [("air", True), ("pro", True)], out)
         self.assertEqual([k["squads"] for k in self.pro_keys.ls()["keys"]], [1])
+        self.assertIs(self.air_keys.status(PHONE, r["request_id"])["squads"], True)  # the phone's poll says so
         # without it: nothing
         r2 = self.enroll()
         out = self.air_keys.approve({"confirm": r2["fingerprint"][-6:], "id": r2["request_id"], "mode": "pane"})
         self.assertFalse(out["installed"][0]["squads"])
+        self.assertNotIn("squads", self.air_keys.status(PHONE, r2["request_id"]))  # an attach key: no such grant
         self.assertEqual({k["id"]: k["squads"] for k in self.air_keys.ls()["keys"]},
                          {"kaaaaaaaaaaaa": 1, out["key_id"]: 0})
         other = self.p256("other")
