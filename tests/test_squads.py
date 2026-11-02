@@ -499,6 +499,24 @@ class Starting(unittest.TestCase):
         self.assertRegex(plan["session"], r"^[0-9a-f-]{36}$")
         self.assertIn(f"--session-id={plan['session']}", plan["argv"])
 
+    def test_codex_and_resuming_members(self):
+        rid = "0b0e0f2a-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+        self.m.put("sq2", name="Other", members=[
+            {"id": "cx", **member(name="Cx", kind="codex", folder=str(self.root / "app"), start={})},
+            {"id": "rs", **member(name="Rs", folder=str(self.root / "app"), start={"options": {"resume": rid}})}])
+        cfg = {**self.cfg, "kinds": {"claude": {"bin": "/bin/echo", "options": ["resume"]},
+                                     "codex": {"bin": "/bin/echo", "options": []}}}
+        con = start._db(self.m.tmp / "start.db")
+        self.addCleanup(con.close)
+        out = start.dry_run(con, [{"squad": {"id": "sq2", "member": "cx"}}, {"squad": {"id": "sq2", "member": "rs"}}],
+                            cfg, "safe", "key", "air")
+        cx, rs = (r["plan"] for r in out)
+        self.assertEqual(cx["session"], "")  # Codex picks its own
+        self.assertFalse(any(a.startswith("--session-id") for a in cx["argv"]))
+        self.assertEqual(rs["session"], rid)  # resuming: its own id, not a new one
+        self.assertIn(f"--resume={rid}", rs["argv"])
+        self.assertFalse(any(a.startswith("--session-id") for a in rs["argv"]))
+
     def test_one_owner_only(self):
         self.m.bus.store.x("INSERT INTO squads VALUES('old@example.com', 'sqO', '{}', 1, 'air', 0, 1)")
         with self.assertRaises(start.Refused):  # the machine's login changed: whose squads are these?
