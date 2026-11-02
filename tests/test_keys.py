@@ -286,6 +286,24 @@ class Flow(unittest.TestCase):
             self.pro_keys.check_approval(payload, sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE))
         self.assertIn("squads is only a start key's grant", str(cm.exception))
 
+    def test_the_poll_tells_each_start_key_its_own_grant(self):
+        """Two start keys side by side, one granted squad edits: each poll says its own, and a revoked one says none."""
+        rs = [self.air_keys.enroll(PHONE, {"pubkey": self.p256(f"start{i}"), "plan_pubkey": self.p256(f"plan{i}"),
+                                           "purpose": "start", "device_name": "iPad"}) for i in (0, 1)]
+        for r, squads in zip(rs, (True, False)):
+            p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r["request_id"])
+            key_id = "k" + ("a" if squads else "b") * 12
+            payload = keys.approval_doc("nick", "air", p, key_id, "start", ["air"], squads=squads)
+            self.air_keys.approve({"confirm": r["pair_fingerprint"][-6:], "id": r["request_id"], "mode": "start",
+                                   "payload": payload, "squads": squads,
+                                   "signature": sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE)})
+        self.assertEqual([self.air_keys.status(PHONE, r["request_id"])["squads"] for r in rs], [True, False])
+        self.air_keys.revoke(PHONE, {"key_id": "kaaaaaaaaaaaa"})
+        gone = self.air_keys.status(PHONE, rs[0]["request_id"])
+        self.assertEqual(gone["status"], "revoked")
+        self.assertNotIn("squads", gone)
+        self.assertIs(self.air_keys.status(PHONE, rs[1]["request_id"])["squads"], False)
+
     def test_device_revokes_its_own_key(self):
         r = self.enroll()
         payload, sig = self.signed(r)
