@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -142,9 +143,10 @@ def attach_command(a: dict, here: str = "") -> str:
     return f"ssh -t {shlex.quote(dest)} {shlex.quote(remote)}"
 
 
+@functools.cache
 def _codex_pid() -> int:
     """The codex process this shell or MCP server runs under, so the mailbox can read how it was started
-    (bus.pid_skip). One ps call; 0 if it is not found."""
+    (bus.pid_skip). One ps call per process (the MCP server and watch register often); 0 if it is not found."""
     try:
         out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True,
                              timeout=2).stdout

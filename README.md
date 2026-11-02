@@ -195,10 +195,13 @@ post a hook or start a process with misleading flags, so a missing or false `ski
 - Claude: from the `permission_mode` in each of its hooks, so it follows a mode change mid-session. Modes
   `bypassPermissions` and `auto` count as skip (`bus.SKIP_MODES`, the same set as start.json's). Unknown until
   its first hook.
-- Codex: from its command line, read once per process with `ps` when it registers, and only for a process of the
-  account the mailbox runs as. `--dangerously-bypass-approvals-and-sandbox` (`--yolo`) or a `danger-full-access`
-  sandbox is skip; another sandbox or `--full-auto` is not. Otherwise (it is set only in `~/.codex/config.toml`,
-  or the session runs inside the Codex app's `app-server`) it is unknown.
+- Codex: from its real argv (macOS `kern.procargs2`, Linux `/proc`), read once per process when it registers, and
+  only for a process of the account the mailbox runs as whose program is `codex`. A prompt is one argument, so
+  what it says is never taken for a flag. `--dangerously-bypass-approvals-and-sandbox` (`--yolo`) or a
+  `danger-full-access` sandbox (`-s`, `--sandbox`, `-c`/`--config sandbox_mode=`) is skip; another sandbox,
+  `--approve-for-me` or the older `--full-auto` is not. Anything else is unknown: a sandbox set only in
+  `~/.codex/config.toml`, two that disagree, a flag tailshare does not know, or a session inside the Codex app's
+  `app-server`.
 
 **Pairing the Hive app.** `tailshare hive pair` prints a QR code that makes this machine the Tailshare Hive
 app's first trusted machine, then waits until a phone uses it. The link is `tailsharehive://pair/<base64url JSON>`

@@ -175,39 +175,106 @@ def hook_skip(d: dict) -> tuple[str, bool | None]:
     return aid, mode in SKIP_MODES
 
 
-def codex_skip(args: list[str]) -> bool | None:
-    """Whether a Codex command line runs without asking: the bypass flag, or no sandbox. None when its
-    flags leave it to config.toml, which is not read."""
-    sandbox = None
-    for i, a in enumerate(args):
-        nxt = args[i + 1] if i + 1 < len(args) else ""
-        if a in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
-            return True
-        if a == "--full-auto":
-            sandbox = sandbox or "workspace-write"
-        elif a in ("-s", "--sandbox"):
-            sandbox = nxt
-        elif a.startswith("--sandbox="):
-            sandbox = a.split("=", 1)[1]
-        elif a in ("-c", "--config") and nxt.replace(" ", "").startswith("sandbox_mode="):
-            sandbox = nxt.split("=", 1)[1].strip().strip("'\"")
-    return None if sandbox is None else sandbox == "danger-full-access"
+# Codex flags that take a value, and those that do not (0.160 to 0.166, with --full-auto from before).
+# Any other flag makes the command line unknown: it may take a value that would be misread as a flag.
+_CODEX_VALUE = {"-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env", "-i", "--image", "-m",
+                "--model", "--local-provider", "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a",
+                "--ask-for-approval", "--thread-source", "--output-schema", "--color", "-o", "--output-last-message"}
+_CODEX_BOOL = {"--strict-config", "--oss", "--approve-for-me", "--full-auto", "--dangerously-bypass-hook-trust",
+               "--worktree", "--search", "--no-alt-screen", "--no-daemon", "--skip-git-repo-check", "--ephemeral",
+               "--ignore-user-config", "--ignore-rules", "--json", "--last", "--all", "--include-non-interactive"}
+_CODEX_BYPASS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo"}
+_CODEX_SESSIONS = {"exec", "e", "resume", "fork", "review"}  # subcommands that run a session from these flags
+_CODEX_COMMANDS = {"agents", "login", "logout", "mcp", "mcp-server", "plugin", "app-server", "remote-control", "app",
+                   "completion", "update", "doctor", "sandbox", "debug", "apply", "a", "queue", "archive", "delete",
+                   "migrate-rollouts", "unarchive", "cloud", "exec-server", "features", "help"}
+
+
+def codex_skip(argv: list[str]) -> bool | None:
+    """Whether a Codex process's argv runs without asking: the bypass flag, or no sandbox. None when it is not
+    codex, its flags leave it to config.toml (not read), or anything in it is unclear. The argv must be the real
+    one, one word per argument: a prompt that mentions --yolo is a single argument, and not a flag."""
+    if not argv or os.path.basename(argv[0]) != "codex":
+        return None
+    sandbox, bypass, first, i = set(), False, True, 1
+    while i < len(argv):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        if not a.startswith("-") or a == "-":
+            if first and a in _CODEX_COMMANDS:  # the app server, MCP server and the rest: their threads say
+                return None
+            first = False  # a session subcommand, or the prompt
+            continue
+        flag, eq, value = a.partition("=") if a.startswith("--") else (a[:2], bool(a[2:]), a[2:].removeprefix("="))
+        if flag in _CODEX_BYPASS and not eq:
+            bypass = True
+        elif flag in ("--full-auto", "--approve-for-me") and not eq:
+            sandbox.add("workspace-write")
+        elif flag in _CODEX_VALUE:
+            if not eq:
+                if i >= len(argv):
+                    return None
+                value, i = argv[i], i + 1
+            if flag in ("-s", "--sandbox"):
+                sandbox.add(value)
+            elif flag in ("-c", "--config") and value.replace(" ", "").startswith("sandbox_mode="):
+                sandbox.add(value.split("=", 1)[1].strip().strip("'\""))
+        elif flag not in _CODEX_BOOL or eq:
+            return None
+    if bypass:
+        return True
+    if len(sandbox) != 1:  # none given, or two that disagree
+        return None
+    return sandbox.pop() == "danger-full-access"
+
+
+def proc_argv(pid: int) -> list[str] | None:
+    """A process's argv exactly as it was passed (macOS kern.procargs2, Linux /proc), without a shell or ps's
+    space-joined args; None if it cannot be read."""
+    try:
+        if sys.platform.startswith("linux"):
+            return open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")[:-1] or None
+        if sys.platform != "darwin":
+            return None
+        import ctypes
+
+        libc = ctypes.CDLL("/usr/lib/libc.dylib", use_errno=True)
+        mib, size = (ctypes.c_int * 3)(1, 49, pid), ctypes.c_size_t(0)  # CTL_KERN, KERN_PROCARGS2
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or not 4 < size.value <= 4 << 20:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buf.raw[:size.value]
+        argc = int.from_bytes(raw[:4], sys.byteorder)
+        rest = raw[4:].split(b"\0", 1)[1].lstrip(b"\0")  # the executable's path, then padding, then argv
+        argv = rest.split(b"\0")[:argc]
+        return [x.decode(errors="replace") for x in argv] if 0 < argc == len(argv) else None
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def pid_uid(pid: int) -> int | None:
+    try:
+        if sys.platform.startswith("linux"):
+            return os.stat(f"/proc/{pid}").st_uid
+        cp = subprocess.run(["/bin/ps", "-o", "uid=", "-p", str(pid)], capture_output=True, text=True,
+                            timeout=2, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        return int(cp.stdout) if cp.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def pid_skip(pid: int) -> bool | None:
-    """codex_skip of a running process's argv, read with ps (no shell). Only a process of the uid this
-    mailbox runs as, so a registration cannot make it read anyone else's; None on any failure."""
-    if pid <= 1 or not hasattr(os, "getuid"):
+    """codex_skip of a running process's real argv. Only a process of the uid this mailbox runs as, so a
+    registration cannot make it read anyone else's; None on any failure, or when the program is not codex
+    (another program, or the pid was reused)."""
+    if pid <= 1 or not hasattr(os, "getuid") or pid_uid(pid) != os.getuid():
         return None
-    try:
-        cp = subprocess.run(["/bin/ps", "-o", "uid=,args=", "-p", str(pid)], capture_output=True, text=True,
-                            timeout=2, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-        uid, _, args = cp.stdout.strip().partition(" ")
-        if cp.returncode != 0 or int(uid) != os.getuid():
-            return None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    return codex_skip(args.split())
+    argv = proc_argv(pid)
+    return codex_skip(argv) if argv else None
 
 
 def clean_tmux(t: object) -> dict:
@@ -436,7 +503,8 @@ class Bus:
         tmux = clean_tmux(a.get("tmux"))
         pid = int(a.get("pid") or 0)
         was = self.store.one("SELECT pid, skip FROM agents WHERE id=?", aid)
-        skip = was["skip"] if was and was["pid"] == pid else ""  # Claude's comes from its hooks
+        # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's
+        skip = was["skip"] if was and (was["pid"] == pid or harness != "codex") else ""
         if harness == "codex" and pid and not (was and was["pid"] == pid):  # once per process, outside the lock
             skip = {True: "1", False: "0", None: ""}[pid_skip(pid)]
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)

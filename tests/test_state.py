@@ -202,6 +202,9 @@ class Skip(unittest.TestCase):
         self.assertIs(self.skips()["pro/claude/api"], False)
         reg(self.b, "S", "api")  # registering again keeps it
         self.assertIs(self.skips()["pro/claude/api"], False)
+        for pid in (777, 0):  # a hook-launched register with CLAUDE_PID, then an MCP call without it
+            self.b.register({"id": "S", "harness": "claude", "cwd": "/x/api", "pid": pid})
+            self.assertIs(self.skips()["pro/claude/api"], False, pid)
         self.assertEqual(self.b.report_state(hook("Stop", sid="nobody", permission_mode="auto")), {"ok": False})
         self.assertIsNone(self.b.store.one("SELECT 1 FROM agents WHERE id='nobody'"))
 
@@ -211,6 +214,13 @@ class Skip(unittest.TestCase):
         for ip in ("100.2.2.2", "100.3.3.3", "100.9.9.9"):  # another user, a tagged device, an unknown caller
             self.assertTrue(all("skip" not in a for a in self.b.hello(ip)["agents"]), ip)
         self.assertTrue(all("skip" not in a for a in self.b.hello()["agents"]))  # no caller: nothing
+        for user in ("tagged-devices", ""):  # a tagged machine's mailbox, and one that does not know its login
+            usermap = {"100.1.1.1": user, "100.3.3.3": "tagged-devices"}
+            b = make_bus("tg", StaticNet("tg", user=user, usermap=usermap))
+            reg(b, "S", "api")
+            b.report_state(hook("Stop", permission_mode="auto"))
+            for ip in ("100.1.1.1", "100.3.3.3", "100.9.9.9"):
+                self.assertTrue(all("skip" not in a for a in b.hello(ip)["agents"]), (user, ip))
 
     def test_peer_skip_is_a_boolean_or_nothing(self):
         air = make_bus("air", StaticNet("air", peers={"pro": {"ip": "127.0.0.1", "port": free_port(), "online": True}}))
@@ -223,19 +233,39 @@ class Skip(unittest.TestCase):
                           "pro/claude/d": False, "pro/claude/e": "absent"})
 
     def test_codex_flags(self):
-        for args, want in [(["codex", "--dangerously-bypass-approvals-and-sandbox"], True), (["codex", "--yolo"], True),
-                           (["codex", "-s", "danger-full-access"], True), (["codex", "--sandbox=danger-full-access"], True),
-                           (["codex", "-c", 'sandbox_mode="danger-full-access"'], True),
-                           (["codex", "-s", "workspace-write", "-a", "never"], False), (["codex", "--full-auto"], False),
-                           (["codex", "--sandbox=read-only"], False), (["codex", "-a", "never"], None), (["codex"], None),
-                           (["codex", "-s"], False)]:
+        c = "/opt/homebrew/bin/codex"
+        for args, want in [([c, "--dangerously-bypass-approvals-and-sandbox"], True), ([c, "--yolo"], True),
+                           ([c, "-s", "danger-full-access"], True), ([c, "--sandbox=danger-full-access"], True),
+                           ([c, "-sdanger-full-access"], True), ([c, "-s=danger-full-access"], True),
+                           ([c, "-c", 'sandbox_mode="danger-full-access"'], True),
+                           ([c, "--config=sandbox_mode=danger-full-access"], True), ([c, "-csandbox_mode=danger-full-access"], True),
+                           ([c, "-s", "workspace-write", "-a", "never"], False), ([c, "--full-auto"], False),
+                           ([c, "--approve-for-me"], False), ([c, "--sandbox=read-only"], False),
+                           ([c, "-a", "never"], None), ([c], None), ([c, "-s"], None),
+                           # the prompt is one argument, whatever it says; flags may also follow it
+                           ([c, "-s", "danger-full-access", "explain -s read-only"], True),
+                           ([c, "-s", "read-only", "why does --yolo exist"], False),
+                           ([c, "fix it", "--yolo"], True), ([c, "exec", "-s", "danger-full-access", "go"], True),
+                           ([c, "resume", "--last", "--approve-for-me"], False),
+                           ([c, "--", "--yolo"], None), ([c, "-m", "--yolo"], None),  # a value, not a flag
+                           # unclear: say nothing
+                           ([c, "-s", "read-only", "-c", "sandbox_mode=danger-full-access"], None),
+                           ([c, "--new-flag", "-s", "danger-full-access"], None), ([c, "--yolo=1"], None),
+                           ([c, "app-server", "--yolo"], None), ([c, "sandbox", "--yolo"], None),
+                           # not codex
+                           (["/usr/bin/vim", "--yolo"], None), (["codex-wrapper", "--yolo"], None), ([], None)]:
             self.assertEqual(bus.codex_skip(args), want, args)
 
     def test_codex_argv_read_once_per_process_and_only_our_own(self):
-        p = subprocess.Popen(["/bin/sh", "-c", "sleep 30; :", "codex", "--yolo"])  # its args say --yolo (the ; keeps sh from exec)
+        # a sh called "codex", whose real argv has a prompt that mentions -s read-only (the ; keeps sh from exec)
+        p = subprocess.Popen(["codex", "-c", "sleep 30; :", "x", "--yolo", "explain -s read-only"], executable="/bin/sh")
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
         self.assertIs(bus.pid_skip(p.pid), True)
+        vim = subprocess.Popen(["vim", "-c", "sleep 30; :", "x", "--yolo"], executable="/bin/sh")
+        self.addCleanup(vim.wait)
+        self.addCleanup(vim.kill)
+        self.assertIsNone(bus.pid_skip(vim.pid))  # not codex, or the pid went to another program
         with mock.patch.object(bus, "pid_skip", wraps=bus.pid_skip) as read:
             self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": p.pid})
             self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": p.pid})
@@ -246,27 +276,37 @@ class Skip(unittest.TestCase):
         with mock.patch.object(bus, "pid_skip", return_value=None):
             self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": p.pid + 100000})
         self.assertIsNone(self.skips()["pro/codex/cx"])  # a new process is read again
-        theirs = SimpleNamespace(returncode=0, stdout="    0 /opt/codex --yolo\n")
-        with mock.patch.object(bus.subprocess, "run", return_value=theirs):
-            self.assertIsNone(bus.pid_skip(4242))  # another uid's process: not read
+        with mock.patch.object(bus.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="    0\n")), \
+                mock.patch.object(bus, "proc_argv") as argv:
+            self.assertIsNone(bus.pid_skip(p.pid))  # another uid's process: not read
+            argv.assert_not_called()
         for bad in (OSError("no ps"), subprocess.TimeoutExpired("ps", 2)):
             with mock.patch.object(bus.subprocess, "run", side_effect=bad):
-                self.assertIsNone(bus.pid_skip(4242))
+                self.assertIsNone(bus.pid_skip(p.pid))
         with mock.patch.object(bus.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="")):
-            self.assertIsNone(bus.pid_skip(4242))
+            self.assertIsNone(bus.pid_skip(p.pid))
+        with mock.patch.object(bus, "proc_argv", return_value=None):
+            self.assertIsNone(bus.pid_skip(p.pid))
+        self.assertIsNone(bus.proc_argv(999999))
         self.assertIsNone(bus.pid_skip(0))
         self.assertIsNone(bus.pid_skip(1))
 
     def test_codex_pid_is_the_codex_ancestor(self):
+        agent._codex_pid.cache_clear()
+        self.addCleanup(agent._codex_pid.cache_clear)
         parent = 9
         table = "\n".join(["  9   8 /bin/zsh -l", "  8   7 /Users/n/.codex/bin/codex --yolo", "  7   6 node /opt/homebrew/bin/codex --yolo",
                             "  6   1 /Applications/Ghostty.app/Contents/MacOS/ghostty"])
         out = SimpleNamespace(returncode=0, stdout=table)
         with mock.patch.object(agent.subprocess, "run", return_value=out), mock.patch.object(agent.os, "getppid", return_value=parent):
             self.assertEqual(agent._codex_pid(), 8)
+            self.assertEqual(agent._codex_pid(), 8)
+            self.assertEqual(agent.subprocess.run.call_count, 1)  # once per process
+        agent._codex_pid.cache_clear()
         no = SimpleNamespace(returncode=0, stdout="  9   1 /bin/zsh -l")
         with mock.patch.object(agent.subprocess, "run", return_value=no), mock.patch.object(agent.os, "getppid", return_value=parent):
             self.assertEqual(agent._codex_pid(), 0)
+        agent._codex_pid.cache_clear()
         with mock.patch.object(agent.subprocess, "run", side_effect=OSError("no ps")):
             self.assertEqual(agent._codex_pid(), 0)
 
