@@ -277,16 +277,17 @@ def key_line(k: dict, exe: str, python: str | None = None, plan: bool = False) -
     comment = "tailshare:" + k["id"] + (" plan" if plan else "") + " " + k["device"].replace(" ", "-")
     if k["mode"] == "shell":
         return f"{k['pubkey']} {comment}"
+    # the interpreter itself with -I: PYTHONPATH, PYTHONSTARTUP and friends act before any of tailshare's code
+    # runs, so the console script's shebang (no -I) would let an AcceptEnv'd variable load code
+    py = gate_python() if python is None else python
     if k["mode"] in ("start", "start-skip"):  # no pty: it only takes `tailshare-start` (tailshare/start.py)
         grant = "skip" if k["mode"] == "start-skip" else "safe"
-        # the interpreter itself with -I: PYTHONPATH, PYTHONSTARTUP and friends act before any of tailshare's code
-        # runs, so the console script's shebang (no -I) would let an AcceptEnv'd variable load code
-        py = gate_python() if python is None else python
         # the plan key (no Face ID) shares the start key's id, so its plans are the pair's, but it only dry-runs
         flags = f"--start={grant} --key={k['id']}" + (" --plan" if plan else "")
         cmd = f"{py} -I -m tailshare ssh-gate {flags}" if py else "/usr/bin/false"
         return f'restrict,command="{cmd}" {k["plan_pubkey"] if plan else k["pubkey"]} {comment}'
-    return f'restrict,pty,command="{exe} ssh-gate" {k["pubkey"]} {comment}'
+    # an interpreter path that is not plain keeps the console script: attaching still works, without -I
+    return f'restrict,pty,command="{f"{py} -I -m tailshare" if py else exe} ssh-gate" {k["pubkey"]} {comment}'
 
 
 def replace_block(old: str, lines: list[str]) -> str:

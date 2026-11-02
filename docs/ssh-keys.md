@@ -76,8 +76,13 @@ sessions that are already open, and anything a session changed while attached (a
 Pane keys are installed as
 
 ```
-restrict,pty,command="/path/to/tailshare ssh-gate" ssh-ed25519 AAAA... tailshare:<key id> <device>
+restrict,pty,command="/path/to/python -I -m tailshare ssh-gate" ssh-ed25519 AAAA... tailshare:<key id> <device>
 ```
+
+The interpreter tailshare runs under, with `-I`, rather than the `tailshare` console script: `PYTHONPATH`,
+`PYTHONSTARTUP` and the like act before any of tailshare's code runs, so a variable sshd accepted from the client
+(`AcceptEnv`) could otherwise load code. If that interpreter's path is not plain, the line keeps the console
+script. Lines already installed change the next time a key is installed or removed on that machine.
 
 `tailshare ssh-gate` reads `SSH_ORIGINAL_COMMAND` and accepts only
 

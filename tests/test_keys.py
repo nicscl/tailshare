@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -92,7 +93,9 @@ class Block(unittest.TestCase):
 
     def test_key_line(self):
         k = {"id": "k0123456789ab", "device": "Nick's iPhone", "pubkey": "ssh-ed25519 AAAA", "mode": "pane"}
-        self.assertEqual(keys.key_line(k, "/u/bin/tailshare"),
+        self.assertEqual(keys.key_line(k, "/u/bin/tailshare", "/u/bin/python"),  # -I: no PYTHON* from the client
+                         'restrict,pty,command="/u/bin/python -I -m tailshare ssh-gate" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
+        self.assertEqual(keys.key_line(k, "/u/bin/tailshare", ""),  # an interpreter path that is not plain
                          'restrict,pty,command="/u/bin/tailshare ssh-gate" ssh-ed25519 AAAA tailshare:k0123456789ab Nick\'s-iPhone')
         self.assertEqual(keys.key_line({**k, "mode": "shell"}, "/x"), "ssh-ed25519 AAAA tailshare:k0123456789ab Nick's-iPhone")
 
@@ -194,7 +197,7 @@ class Flow(unittest.TestCase):
         out = self.air_keys.approve({"confirm": r["fingerprint"][-6:], "id": r["request_id"], "mode": "pane"})
         self.assertEqual([i["host"] for i in out["installed"]], ["air"])
         text = (self.tmp / "air" / "authorized_keys").read_text()
-        self.assertIn(f'restrict,pty,command="/u/bin/tailshare ssh-gate" {keys.parse_pubkey(self.phone_pub)} '
+        self.assertIn(f'restrict,pty,command="{sys.executable} -I -m tailshare ssh-gate" {keys.parse_pubkey(self.phone_pub)} '
                       f"tailshare:{out['key_id']} Nick's-iPhone", text)
         self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())
         st = self.air_keys.status(PHONE, r["request_id"])
