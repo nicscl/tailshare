@@ -6,10 +6,12 @@ A client with no tailshare install (the iOS app) generates a key and calls a mac
   GET  /bus/v1/keys/enroll/<id>   its status, for polling
 
 Nothing is installed until a person runs `tailshare keys approve` in a terminal on that machine. That
-installs the key there, and when the person signs the approval with a key the other machines trust
-(the same ~/.tailshare/allowed_signers as launches, namespace tailshare-keys), on the owner's other
-machines too. Keys are written into a managed block of ~/.ssh/authorized_keys and, by default, can
-only run `tailshare ssh-gate`, which attaches to a tmux pane an agent on that machine registered.
+installs the key there, and on the owner's other machines when the person signs the approval with a
+security key they trust (the same ~/.tailshare/allowed_signers as launches, namespace tailshare-keys).
+Without one, the approval still reaches those of them where a person ran `tailshare keys trust-machine
+<this machine>`: this machine's own key signs it (docs/ssh-keys.md#machine-trust). Keys are written into a
+managed block of ~/.ssh/authorized_keys and, by default, can only run `tailshare ssh-gate`, which attaches
+to a tmux pane an agent on that machine registered.
 That still lets the client type into an agent or a shell, so approving a key is approving shell-level
 access as this account; the gate only keeps the key from doing anything else (no other commands,
 no port or agent forwarding). An attached client can still run tmux commands (`run-shell`, new windows,
@@ -60,6 +62,9 @@ SQUADS_NAMESPACE = "tailshare-squads"  # a device's signed squad write; never va
 SIGNED_WINDOW = 60  # how far a signed write's time may be from this machine's clock
 VERIFY_PER_MINUTE = 30  # signature checks per address: each one runs ssh-keygen
 SIGNED_HEADERS = ("X-Tailshare-Key", "X-Tailshare-Time", "X-Tailshare-Nonce", "X-Tailshare-Signature")
+MACHINE_KEY_TYPE = "ssh-ed25519"  # a machine key is a plain file: whatever reads it signs as the machine
+INSTALL_RETRY_FOR = 7 * 86400  # how long an approval keeps trying a machine that was offline
+_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")  # also a valid allowed_signers principal
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS key_requests(
@@ -73,6 +78,9 @@ CREATE TABLE IF NOT EXISTS revoked_keys(id TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS key_nonces(nonce TEXT PRIMARY KEY, expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS key_revocations(
   key_id TEXT NOT NULL, host TEXT NOT NULL, created REAL NOT NULL, done REAL, error TEXT, PRIMARY KEY(key_id, host));
+CREATE TABLE IF NOT EXISTS key_installs(
+  key_id TEXT NOT NULL, host TEXT NOT NULL, created REAL NOT NULL, done REAL, final INTEGER NOT NULL DEFAULT 0,
+  error TEXT, PRIMARY KEY(key_id, host));
 """
 
 
@@ -108,6 +116,55 @@ TOKEN_HEADER = "X-Tailshare-Keys"
 
 def token_path() -> Path:
     return bus.STATE_DIR / "keys.token"
+
+
+def machine_key_path() -> Path:
+    """This machine's own signing key, for approvals it sends to the machines that trust it."""
+    return bus.STATE_DIR / "machine_key"
+
+
+def trusted_machines_path() -> Path:
+    """The machines whose approvals this one accepts (`tailshare keys trust-machine`): an allowed_signers file
+    whose lines name only the tailshare-keys namespace, so a machine key never signs a launch here."""
+    return bus.STATE_DIR / "trusted_machines"
+
+
+def machine_line(host: str, pubkey: str) -> str:
+    from .sessions import KEYS_NAMESPACE
+
+    if not _HOST_RE.fullmatch(host):
+        raise bus.BusError("bad machine name")
+    return f'{host} namespaces="{KEYS_NAMESPACE}" {parse_pubkey(pubkey)}\n'
+
+
+def read_trusted(path: Path) -> list[dict]:
+    """[{host, pubkey, fingerprint}] of a trusted_machines file (none when it is missing)."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and _HOST_RE.fullmatch(parts[0]) and parts[1].startswith("namespaces="):
+            try:
+                pub = parse_pubkey(" ".join(parts[2:4]))
+            except bus.BusError:
+                continue
+            out.append({"host": parts[0], "pubkey": pub, "fingerprint": fingerprint(pub)})
+    return out
+
+
+def write_trusted(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".trusted_machines.")  # mode 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("".join(machine_line(r["host"], r["pubkey"]) for r in rows))
+        os.replace(tmp, path)
+    finally:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
 
 
 def load_token(path: Path, create: bool = False) -> str:
@@ -560,8 +617,9 @@ def cmd_gate(args) -> None:
 
 
 def approval_doc(signer: str, origin: str, r: dict, key_id: str, mode: str, hosts: list[str],
-                 ttl: int = APPROVAL_TTL, squads: bool = False) -> str:
-    """The exact text a person signs to install a key on `hosts` (`squads`: its plan key may sign squad edits)."""
+                 ttl: int = APPROVAL_TTL, squads: bool = False, machine: bool = False) -> str:
+    """The exact text a person signs to install a key on `hosts` (`squads`: its plan key may sign squad edits).
+    `machine`: signed by the origin's machine key, not a person's security key (`tailshare keys trust-machine`)."""
     from .sessions import canonical
 
     now = time.time()
@@ -572,17 +630,21 @@ def approval_doc(signer: str, origin: str, r: dict, key_id: str, mode: str, host
         **({"plan_pubkey": r["plan_pubkey"], "plan_fingerprint": fingerprint(r["plan_pubkey"])}
            if mode in ("start", "start-skip") else {}),
         **({"squads": True} if squads else {}),
+        **({"by": "machine"} if machine else {}),
         "issued": round(now, 3), "expires": round(now + ttl, 3),
     })
 
 
 class Keys:
     def __init__(self, b: bus.Bus, signers: Path | None = None, keys_file: Path | None = None,
-                 token_file: Path | None = None) -> None:
+                 token_file: Path | None = None, machine_key: Path | None = None, trusted: Path | None = None) -> None:
         from .sessions import SIGNERS
 
         self.bus, self.store = b, b.store
         self.signers = signers or SIGNERS
+        self.machine_key = machine_key or machine_key_path()
+        self.trusted = trusted or trusted_machines_path()
+        self._key_lock = threading.Lock()
         self.keys_file = keys_file  # None: ~/.ssh/authorized_keys
         self.token = load_token(token_file or token_path(), create=True)
         self._verified: dict[str, list[float]] = {}  # address -> times of its recent signature checks
@@ -609,6 +671,10 @@ class Keys:
                 self.retry_revocations()
             except Exception as e:  # noqa: BLE001
                 log(f"revocations: {e!r}")
+            try:
+                self.retry_installs()
+            except Exception as e:  # noqa: BLE001
+                log(f"installs: {e!r}")
 
     @property
     def host(self) -> str:
@@ -625,6 +691,90 @@ class Keys:
         if not p or not p.get("online") or self._owner_problem() or p.get("user") != self.bus.net.user:
             return None
         return p
+
+    # -- machine trust (docs/ssh-keys.md#machine-trust) ----------------------------
+    def machine_pub(self) -> str:
+        """This machine's public machine key, made on first use (mode 0600, by ssh-keygen)."""
+        from .sessions import ssh_keygen
+
+        with self._key_lock:
+            pub = Path(str(self.machine_key) + ".pub")
+            if not self.machine_key.exists():
+                self.machine_key.parent.mkdir(parents=True, exist_ok=True)
+                for f in (self.machine_key, pub):
+                    if os.path.lexists(f):
+                        os.unlink(f)
+                cp = subprocess.run([ssh_keygen(), "-q", "-t", "ed25519", "-N", "", "-C",
+                                     f"tailshare machine key of {self.host}", "-f", str(self.machine_key)],
+                                    capture_output=True, stdin=subprocess.DEVNULL)
+                if cp.returncode != 0:
+                    raise bus.BusError(f"ssh-keygen could not make {self.machine_key}", 500)
+                log(f"made the machine key {self.machine_key}")
+            return parse_pubkey(pub.read_text())
+
+    def _machine_sign(self, payload: str) -> str:
+        from .sessions import KEYS_NAMESPACE, sign
+
+        self.machine_pub()
+        return sign(payload, self.machine_key, KEYS_NAMESPACE)
+
+    def machine_info(self, ip: str) -> dict:
+        """GET /keys/machine, for the owner's other machines: the key to trust, and which machines this one trusts
+        (so `trust-machine` can say when an edge goes both ways)."""
+        if self._owner_problem():
+            raise bus.BusError(self._owner_problem(), 403)
+        self.bus.require_same_user(ip)
+        pub = self.machine_pub()
+        return {"host": self.host, "pubkey": pub, "fingerprint": fingerprint(pub),
+                "trusts": [t["host"] for t in read_trusted(self.trusted)]}
+
+    def trusted_view(self) -> dict:
+        pub = self.machine_pub()
+        return {"host": self.host, "fingerprint": fingerprint(pub), "trusted": read_trusted(self.trusted)}
+
+    def peer_machine(self, body: dict) -> dict:
+        """Fetch machine `host`'s key for `tailshare keys trust-machine` (the person then checks its fingerprint)."""
+        host = str(body.get("host") or "")
+        if not _HOST_RE.fullmatch(host) or host == self.host:
+            raise bus.BusError("name another of your machines")
+        if self._owner_problem():
+            raise bus.BusError(self._owner_problem(), 409)
+        p = self._own_peer(host)
+        if not p:
+            raise bus.BusError(f"{host} is offline, or not a machine of {self.bus.net.user}", 404)
+        d = bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/machine", timeout=10)
+        pub = parse_pubkey(d.get("pubkey"))
+        if d.get("host") != host or not pub.startswith(MACHINE_KEY_TYPE + " "):
+            raise bus.BusError(f"{host} answered with something that is not its machine key", 502)
+        trusts = [h for h in d.get("trusts") or [] if isinstance(h, str)]
+        return {"host": host, "pubkey": pub, "fingerprint": fingerprint(pub), "trusts_us": self.host in trusts}
+
+    def trust(self, body: dict) -> dict:
+        """Add the edge host -> this machine: approvals signed by host's machine key install keys here."""
+        host, confirm = str(body.get("host") or ""), str(body.get("confirm") or "")
+        pub = parse_pubkey(body.get("pubkey"))
+        if not _HOST_RE.fullmatch(host) or host == self.host:
+            raise bus.BusError("name another of your machines")
+        if not pub.startswith(MACHINE_KEY_TYPE + " "):
+            raise bus.BusError(f"a machine key is {MACHINE_KEY_TYPE}")
+        if confirm != fingerprint(pub)[-CONFIRM_CHARS:]:
+            raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of {host}'s machine key fingerprint", 403)
+        with self._key_lock:
+            rows = [t for t in read_trusted(self.trusted) if t["host"] != host and t["pubkey"] != pub]
+            write_trusted(self.trusted, [*rows, {"host": host, "pubkey": pub}])
+        log(f"now trusts {host}'s machine key {fingerprint(pub)}")
+        return {"host": self.host, "trusts": host, "fingerprint": fingerprint(pub)}
+
+    def untrust(self, body: dict) -> dict:
+        host = str(body.get("host") or "")
+        with self._key_lock:
+            rows = read_trusted(self.trusted)
+            keep = [t for t in rows if t["host"] != host]
+            if len(keep) != len(rows):
+                write_trusted(self.trusted, keep)
+        if len(keep) != len(rows):
+            log(f"no longer trusts {host}'s machine key")
+        return {"host": self.host, "removed": len(keep) != len(rows)}
 
     # -- what peers may know ----------------------------------------------------
     def ssh_info(self) -> dict:
@@ -649,7 +799,10 @@ class Keys:
                 **({"pair_fingerprint": pair_fingerprint(r["pubkey"], r["plan_pubkey"])} if r["plan_pubkey"] else {}),
                 "owner": self.bus.net.user, "status": "pending" if r["status"] == "approving" else r["status"],
                 "expires": r["expires"], "purpose": r["purpose"], "want": json.loads(r["want"]),
-                "key_id": r["key_id"], "installed": json.loads(r["installed"])}
+                "key_id": r["key_id"], "installed": json.loads(r["installed"]),
+                "not_installed": {q["host"]: q["error"] or "not installed" for q in self.store.q(
+                    "SELECT host, error FROM key_installs WHERE key_id=? AND done IS NULL ORDER BY host", r["key_id"])}
+                if r["key_id"] else {}}
 
     def _expire(self) -> None:
         self.store.x("UPDATE key_requests SET status='expired' WHERE status='pending' AND expires<?", time.time())
@@ -757,8 +910,9 @@ class Keys:
     def ls(self) -> dict:
         rows = self.store.q("SELECT * FROM ssh_keys ORDER BY installed")
         unfinished = self.store.q("SELECT key_id, host, created, error FROM key_revocations WHERE done IS NULL")
+        installing = self.store.q("SELECT key_id, host, created, final, error FROM key_installs WHERE done IS NULL")
         return {"host": self.host, "login": bus.LOGIN, "keys": [dict(r) for r in rows],
-                "revoking": [dict(r) for r in unfinished]}
+                "revoking": [dict(r) for r in unfinished], "installing": [dict(r) for r in installing]}
 
     # -- approving and installing ---------------------------------------------------
     def _rewrite(self) -> None:
@@ -794,21 +948,38 @@ class Keys:
         log(f"installed {key_id} ({r['device']}, {r['fingerprint']}) mode={mode}{', squads' if squads else ''}, {by}")
         return {"host": self.host, "login": bus.LOGIN, "mode": mode, "key_id": key_id, "squads": bool(squads)}
 
-    def check_approval(self, payload: str, signature: str) -> dict:
+    def check_approval(self, payload: str, signature: str, sender: str | None = None) -> dict:
+        """The approval, if it may install here. `sender`: the machine that sent it (None: a person on this one).
+        A person's approval is signed with a security key in allowed_signers. A machine's (`"by": "machine"`)
+        is signed with its machine key, accepted only from that machine itself, and only when trusted_machines
+        here names it: one direct edge, never relayed by another machine."""
         from .sessions import KEYS_NAMESPACE, verify
 
         if len(payload) > 16 * 1024 or len(signature) > 8 * 1024:
             raise bus.BusError("approval too large", 413)
-        if REQUIRE_SK and not signature_key_type(signature).startswith("sk-"):
-            raise bus.BusError("approval refused: key approvals for other machines must be signed with a security key "
-                               "(ed25519-sk), so a program that can read a key file cannot sign one", 403)
         try:
-            d = verify(payload, signature, self.signers, KEYS_NAMESPACE)
-        except bus.BusError as e:
-            if e.code != 403:
-                raise
-            raise bus.BusError(f"{e}. If this key was trusted before key approvals existed, run `tailshare sessions "
-                               "trust` for it again: its line needs namespaces=\"...,tailshare-keys\"", 403) from None
+            head = json.loads(payload)
+        except json.JSONDecodeError:
+            head = None
+        if isinstance(head, dict) and head.get("by") == "machine":
+            signer = str(head.get("signer") or "")
+            if sender is None or signer != sender or head.get("origin") != signer:
+                raise bus.BusError("approval refused: a machine's approval is only accepted from that machine", 403)
+            if not any(t["host"] == signer for t in read_trusted(self.trusted)):
+                raise bus.BusError(f"approval refused: {self.host} does not trust {signer} (a person on {self.host} "
+                                   f"can run `tailshare keys trust-machine {signer}`)", 403)
+            d = verify(payload, signature, self.trusted, KEYS_NAMESPACE)
+        else:
+            if REQUIRE_SK and not signature_key_type(signature).startswith("sk-"):
+                raise bus.BusError("approval refused: key approvals for other machines must be signed with a security key "
+                                   "(ed25519-sk), so a program that can read a key file cannot sign one", 403)
+            try:
+                d = verify(payload, signature, self.signers, KEYS_NAMESPACE)
+            except bus.BusError as e:
+                if e.code != 403:
+                    raise
+                raise bus.BusError(f"{e}. If this key was trusted before key approvals existed, run `tailshare sessions "
+                                   "trust` for it again: its line needs namespaces=\"...,tailshare-keys\"", 403) from None
         now = time.time()
         problems = []
         if d.get("v") != 1 or d.get("action") != "ssh-key":
@@ -897,32 +1068,91 @@ class Keys:
                 raise bus.BusError("approval refused: signed for another request", 403)
             key_id, hosts, by = d["key_id"], [h for h in d["hosts"] if isinstance(h, str)], f"signed by {d['signer']}"
         else:
-            key_id, hosts, by = "k" + secrets.token_hex(6), [self.host], "approved here"
-        installed, errors = [self.install_here(key_id, r, mode, by, squads)], {}
-        for h in hosts:
-            if h == self.host:
-                continue
-            p = self._own_peer(h)
-            if not p:
-                errors[h] = "offline, or not a machine of this owner"
-                continue
-            try:
-                installed.append(bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/install",
-                                             {"v": bus.PROTOCOL, "payload": payload, "signature": signature}, timeout=20))
-            except Exception as e:  # noqa: BLE001
-                errors[h] = str(e)[:200]
+            key_id, by = "k" + secrets.token_hex(6), "approved here"
+            # the machines that trust this one take its machine key's word; the others answer that they do not
+            hosts = [self.host] if body.get("here") is True else self.targets()
+        installed = [self.install_here(key_id, r, mode, by, squads)]
+        others = [h for h in hosts if h != self.host]
+        if others and not payload:
+            payload = approval_doc(self.host, self.host, r, key_id, mode, [self.host, *others], squads=squads, machine=True)
+            signature = self._machine_sign(payload)
+        errors = {}
+        for h in others:
+            got, error = self._deliver(key_id, h, payload, signature)
+            if got:
+                installed.append(got)
+            else:
+                errors[h] = error
         self.store.x("UPDATE key_requests SET status='approved', key_id=?, installed=? WHERE id=?",
                      key_id, json.dumps(installed), rid)
         return {"key_id": key_id, "installed": installed, "errors": errors}
+
+    def _deliver(self, key_id: str, h: str, payload: str, signature: str) -> tuple[dict | None, str]:
+        """Send a signed approval to machine h. Not installed: queued in key_installs, to retry (offline, no
+        answer) or not (h refused it, e.g. it does not trust this machine), and (None, why)."""
+        p = self.bus.net.peers.get(h)
+        error, final = "", False
+        if p and p.get("user") != self.bus.net.user or self._owner_problem():
+            error, final = "not a machine of this owner", True
+        elif not self._own_peer(h):
+            error = "offline: will retry"
+        else:
+            try:
+                got = bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/install",
+                                  {"v": bus.PROTOCOL, "payload": payload, "signature": signature}, timeout=20)
+                if got.get("host") != h:
+                    raise bus.BusError(f"answered as {got.get('host')!r}", 502)
+                self.store.x("INSERT OR REPLACE INTO key_installs(key_id, host, created, done, final, error)"
+                             " VALUES(?,?,?,?,0,NULL)", key_id, h, time.time(), time.time())
+                return got, ""
+            except bus.BusError as e:
+                error, final = str(e)[:200], 400 <= e.code < 500  # h said no: asking again changes nothing
+            except Exception as e:  # noqa: BLE001
+                error = f"{str(e)[:150]}: will retry"
+        with self.store.lock:
+            was = self.store.one("SELECT created FROM key_installs WHERE key_id=? AND host=?", key_id, h)
+            self.store.x("INSERT OR REPLACE INTO key_installs(key_id, host, created, done, final, error)"
+                         " VALUES(?,?,?,NULL,?,?)", key_id, h, was["created"] if was else time.time(), int(final), error)
+        return None, error
+
+    def retry_installs(self) -> dict:
+        """Approvals for machines that were offline: signed again with the machine key (the first signature,
+        a person's or not, has expired by then), so only machines that trust this one take them."""
+        now, out = time.time(), {}
+        for q in self.store.q("SELECT * FROM key_installs WHERE done IS NULL AND final=0"):
+            key_id, h = q["key_id"], q["host"]
+            k = self.store.one("SELECT * FROM ssh_keys WHERE id=?", key_id)
+            r = self.store.one("SELECT * FROM key_requests WHERE key_id=? AND status='approved'", key_id)
+            if k is None or r is None:  # removed here meanwhile: the approval is gone with it
+                self.store.x("DELETE FROM key_installs WHERE key_id=? AND host=?", key_id, h)
+                continue
+            if now - q["created"] > INSTALL_RETRY_FOR:
+                self.store.x("UPDATE key_installs SET final=1, error=? WHERE key_id=? AND host=?",
+                             f"gave up after {INSTALL_RETRY_FOR // 86400} days offline: approve it there", key_id, h)
+                continue
+            if not self._own_peer(h):
+                continue
+            payload = approval_doc(self.host, self.host, dict(r), key_id, k["mode"], [h], squads=bool(k["squads"]),
+                                   machine=True)
+            got, error = self._deliver(key_id, h, payload, self._machine_sign(payload))
+            if got:
+                with self.store.lock:
+                    row = self.store.one("SELECT installed FROM key_requests WHERE id=?", r["id"])
+                    self.store.x("UPDATE key_requests SET installed=? WHERE id=?",
+                                 json.dumps([*json.loads(row["installed"]), got]), r["id"])
+                log(f"installed {key_id} on {h}, which was offline at approval")
+            out[h] = "installed" if got else error
+        return out
 
     def install_from_peer(self, ip: str, body: dict) -> dict:
         if self._owner_problem():
             raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
-        d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""))
+        d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""),
+                                sender=self.bus.net.host_for_ip(ip) or "")
         r = {k: d.get(k, "") for k in ("pubkey", "fingerprint", "device", "node", "user", "plan_pubkey")}
-        return self.install_here(d["key_id"], r, d["mode"], f"signed by {d['signer']} (from {d.get('origin')})",
-                                 d.get("squads") is True)
+        by = f"trusted machine {d['signer']}" if d.get("by") == "machine" else f"signed by {d['signer']} (from {d.get('origin')})"
+        return self.install_here(d["key_id"], r, d["mode"], by, d.get("squads") is True)
 
     def deny(self, body: dict) -> dict:
         n = self.store.x("UPDATE key_requests SET status='denied' WHERE id=? AND status='pending'", str(body.get("id")))
@@ -1004,6 +1234,7 @@ class Keys:
         if not _KEY_ID_RE.fullmatch(key_id):
             raise bus.BusError("bad key id")
         removed = self.remove_here(key_id)
+        self.store.x("DELETE FROM key_installs WHERE key_id=? AND done IS NULL", key_id)  # stop installing it
         now = time.time()
         hosts = set(self.targets()[1:])
         for r in self.store.q("SELECT installed FROM key_requests WHERE key_id=?", key_id):
@@ -1064,7 +1295,11 @@ class Keys:
                 raise bus.BusError(f"missing or wrong {TOKEN_HEADER} token (only {bus.LOGIN} can manage keys here)", 403)
             routes = {("GET", "/keys/pending"): lambda: self.pending(), ("GET", "/keys/ls"): lambda: self.ls(),
                       ("POST", "/keys/approve"): lambda: self.approve(body),
-                      ("POST", "/keys/deny"): lambda: self.deny(body), ("POST", "/keys/rm"): lambda: self.rm(body)}
+                      ("POST", "/keys/deny"): lambda: self.deny(body), ("POST", "/keys/rm"): lambda: self.rm(body),
+                      ("GET", "/keys/trusted"): lambda: self.trusted_view(),
+                      ("POST", "/keys/peer-machine"): lambda: self.peer_machine(body),
+                      ("POST", "/keys/trust"): lambda: self.trust(body),
+                      ("POST", "/keys/untrust"): lambda: self.untrust(body)}
         else:
             if method == "GET" and path.startswith("/keys/enroll/"):
                 return self.status(ip, path.removeprefix("/keys/enroll/"))
@@ -1072,7 +1307,8 @@ class Keys:
                 return self.cancel(ip, path.removeprefix("/keys/enroll/").removesuffix("/cancel"))
             routes = {("POST", "/keys/enroll"): lambda: self.enroll(ip, body),
                       ("POST", "/keys/install"): lambda: self.install_from_peer(ip, body),
-                      ("POST", "/keys/revoke"): lambda: self.revoke(ip, body)}
+                      ("POST", "/keys/revoke"): lambda: self.revoke(ip, body),
+                      ("GET", "/keys/machine"): lambda: self.machine_info(ip)}
         fn = routes.get((method, path))
         if fn is None:
             raise bus.BusError("not found", 404)
@@ -1207,7 +1443,7 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
         print(f"⚠ {key} is not a security key, or ~/.tailshare/allowed_signers does not trust it for key approvals "
               "(re-run `tailshare sessions trust`): this machine only", file=sys.stderr)
         key = None
-    hosts = d["targets"] if key else [d["host"]]
+    hosts = d["targets"] if key or not here else [d["host"]]
     mine = p["user"] == d["owner"]
     print("You are approving an SSH key:")
     print(f"  device       {p['device']!r} (the name the device gave itself)")
@@ -1227,7 +1463,11 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
             print("               (the device also asked to skip permissions; not granted: add --start=skip for that)")
     else:
         print(f"  access       a full shell as {d['login']}")
-    print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (no signing key found: this machine only)"))
+    if key or here:
+        print(f"  machines     {', '.join(hosts)}" + ("" if key else "   (--here: this machine only)"))
+    else:
+        print(f"  machines     {d['host']}, and those of {', '.join(hosts[1:]) or 'your other machines'} that trust "
+              f"{d['host']} (`tailshare keys trust-machine {d['host']}` there)")
     want = confirm_code(p)
     which = "pair fingerprint" if p.get("plan_pubkey") else "fingerprint"
     skip = "skip" if skip_ok else "cancel"
@@ -1246,7 +1486,7 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
         raise ValueError(f"does not match the {which}: nothing installed")
     if squads is None and mode in ("start", "start-skip"):
         squads = input("Let its plan key (no Face ID) also edit your squads from the app? [y/N]: ").strip().lower() in ("y", "yes")
-    body = {"id": p["id"], "mode": mode, "confirm": got, "squads": bool(squads)}
+    body = {"id": p["id"], "mode": mode, "confirm": got, "squads": bool(squads), "here": bool(here)}
     if key:
         signer = sessions_cli._principal(signer_arg)
         payload = approval_doc(signer, d["host"], p, "k" + secrets.token_hex(6), mode, hosts, squads=bool(squads))
@@ -1255,9 +1495,61 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     for i in r["installed"]:
         print(f"✓ installed on {i['host']} as {i['login']} ({i['mode']}{', squad edits' if i.get('squads') else ''})")
     for h, e in r["errors"].items():
-        print(f"✗ {h}: {e}")
+        print(f"✗ not on {h}: {e}")
     print(f"key id {r['key_id']}; remove it with `tailshare keys rm {r['key_id']}`")
     return True
+
+
+@_run
+def cmd_machine_key(args):
+    d = _call("/keys/trusted")
+    print(f"{d['host']}'s machine key: {d['fingerprint']}")
+    print(f"To let another of your machines take {d['host']}'s approvals, run there: tailshare keys trust-machine {d['host']}")
+
+
+@_run
+def cmd_trust_machine(args):
+    """The edge X -> this machine: a person here checks X's key and types the end of its fingerprint."""
+    _human_check()
+    m = _call("/keys/peer-machine", {"host": args.host})
+    here = _call("/keys/trusted")["host"]
+    print(f"You are letting {m['host']} install SSH keys on {here}:")
+    print(f"  machine key  {m['fingerprint']} (`tailshare keys machine-key` on {m['host']} shows it)")
+    print(f"  means        anything that can read {m['host']}'s machine key (~/.tailshare/machine_key there), an agent")
+    print(f"               running on {m['host']} included, can get a shell on {here}, with no person approving")
+    print(f"  not          {here}'s approvals going to {m['host']}: that is `tailshare keys trust-machine {here}` "
+          f"on {m['host']}")
+    if m.get("trusts_us"):
+        print(f"⚠ {m['host']} already trusts {here}: with this, each one can install keys on the other, so either one "
+              "taken over gives the other away too.")
+        if input("Trust both ways? [y/N]: ").strip().lower() not in ("y", "yes"):
+            raise ValueError("cancelled: nothing changed")
+    got = input(f"Type the last {CONFIRM_CHARS} characters of the fingerprint {m['host']} shows (Enter to cancel): ").strip()
+    if not got:
+        raise ValueError("cancelled: nothing changed")
+    if got != m["fingerprint"][-CONFIRM_CHARS:]:
+        raise ValueError("does not match the fingerprint: nothing changed")
+    _call("/keys/trust", {"host": m["host"], "pubkey": m["pubkey"], "confirm": got})
+    print(f"✓ {here} now takes key approvals from {m['host']} (undo: tailshare keys untrust-machine {m['host']})")
+
+
+@_run
+def cmd_untrust_machine(args):
+    r = _call("/keys/untrust", {"host": args.host})
+    print(f"✓ {r['host']} no longer takes approvals from {args.host}" if r["removed"] else f"{r['host']} did not trust {args.host}")
+
+
+@_run
+def cmd_trusted(args):
+    d = _call("/keys/trusted")
+    if args.json:
+        print(json.dumps(d, indent=1))
+        return
+    print(f"{d['host']}'s machine key: {d['fingerprint']}")
+    if not d["trusted"]:
+        print(f"{d['host']} takes key approvals from no other machine")
+    for t in d["trusted"]:
+        print(f"  {t['host']:<20} {t['fingerprint']}   may install keys on {d['host']}")
 
 
 @_run
@@ -1278,6 +1570,9 @@ def cmd_ls(args):
     for k in d["keys"]:
         when = time.strftime("%Y-%m-%d", time.localtime(k["installed"]))
         print(f"{k['id']}  {k['mode'] + ('+squads' if k.get('squads') else ''):<17}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
+    for r in d.get("installing", []):
+        print(f"⚠ {r['key_id']} is not installed on {r['host']}" + ("" if r["final"] else ", retrying") +
+              (f" ({r['error']})" if r["error"] else ""))
     for r in d.get("revoking", []):
         print(f"⚠ {r['key_id']} is still installed on {r['host']}: removal pending since "
               f"{time.strftime('%Y-%m-%d', time.localtime(r['created']))}" + (f" ({r['error']})" if r["error"] else ""))
@@ -1304,7 +1599,7 @@ def add_parser(sub) -> None:
                    help="for a start key: grant starting sessions (safe), or also skipping permissions (skip)")
     p.add_argument("--squads", action="store_true",
                    help="for a start key: its plan key may also edit your squads from the app (asked otherwise)")
-    p.add_argument("--here", action="store_true", help="only this machine, even with a signing key")
+    p.add_argument("--here", action="store_true", help="only this machine, even with a signing key or trusting machines")
     p.add_argument("--key", default="", help="signing key (default: TAILSHARE_SIGN_KEY or ~/.ssh/id_*_sk)")
     p.add_argument("--as", dest="signer", default="", help="signer name (default: your tailnet user)")
     p.set_defaults(fn=cmd_approve)
@@ -1317,6 +1612,17 @@ def add_parser(sub) -> None:
     p = s.add_parser("rm", help="remove a key here and on your other machines")
     p.add_argument("key_id")
     p.set_defaults(fn=cmd_rm)
+    p = s.add_parser("trust-machine", help="let machine HOST's approvals install keys here (one direction, no relaying)")
+    p.add_argument("host")
+    p.set_defaults(fn=cmd_trust_machine)
+    p = s.add_parser("untrust-machine", help="stop taking approvals from machine HOST")
+    p.add_argument("host")
+    p.set_defaults(fn=cmd_untrust_machine)
+    p = s.add_parser("trusted", help="the machines whose approvals install keys here")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_trusted)
+    p = s.add_parser("machine-key", help="this machine's key fingerprint, to check from `trust-machine`")
+    p.set_defaults(fn=cmd_machine_key)
     p = sub.add_parser("ssh-gate", help="forced command of tailshare's SSH keys (run by sshd, not by hand)")
     p.add_argument("--start", choices=("safe", "skip"), default="", help="set by a start key's line")
     p.add_argument("--key", default="", help="set by a start key's line")
