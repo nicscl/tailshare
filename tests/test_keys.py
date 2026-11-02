@@ -225,6 +225,23 @@ class Flow(unittest.TestCase):
             self.pro_keys.install_here("kaaaaaaaaaaaa", {"pubkey": "x", "fingerprint": "y", "device": "d",
                                                          "node": "n", "user": "u"}, "pane", "test")
 
+    def test_start_keys_must_be_p256_at_install_and_verify(self):
+        """An ed25519 pair cannot become a start key here, nor through a signed approval for another machine."""
+        r = self.enroll()
+        p = self.air_keys.pending()["pending"][0]
+        plan = keys.parse_pubkey(keypair(self.tmp, "plan")[1])
+        rec = {**p, "plan_pubkey": plan, "plan_fingerprint": keys.fingerprint(plan)}
+        with self.assertRaises(bus.BusError) as cm:
+            self.air_keys.install_here("k" + "b" * 12, rec, "start", "test")
+        self.assertEqual(cm.exception.code, 409)
+        payload = keys.approval_doc("nick", "air", rec, "k" + "a" * 12, "start", ["air", "pro"])
+        sig = sessions.sign(payload, self.signing_key, sessions.KEYS_NAMESPACE)
+        with self.assertRaises(bus.BusError) as cm:
+            self.pro_keys.check_approval(payload, sig)
+        self.assertEqual(cm.exception.code, 403)
+        self.assertIn("start keys must be ecdsa-sha2-nistp256", str(cm.exception))
+        self.assertTrue(r["request_id"])
+
     def test_device_revokes_its_own_key(self):
         r = self.enroll()
         payload, sig = self.signed(r)

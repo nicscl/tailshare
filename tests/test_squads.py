@@ -53,6 +53,23 @@ class Icons(unittest.TestCase):
             with self.assertRaises(svg.Bad, msg=b[:60]):
                 svg.clean(b)
 
+    def test_only_xml_characters(self):
+        """NUL and the rest outside XML 1.0's Char, a BOM, or text that is not UTF-8 never reach the parser: with
+        NULs a parser may guess UTF-16 or UCS-4 and read past the checks."""
+        for c in ("\0", "\x01", "\x1f", "\ufeff", "\ufffe", "\uffff", "\ud800", "\udfff"):
+            for t in (c + ICON, ICON.replace("<path", c + "<path"), ICON.replace('fill="#fa0"', f'fill="#fa0{c}"')):
+                with self.assertRaises(svg.Bad, msg=repr(c)):
+                    svg.clean(t)
+        utf16 = ICON.encode("utf-16-le").decode("latin-1")  # UTF-16 read as text: NULs between the letters
+        with self.assertRaises(svg.Bad):
+            svg.clean(utf16)
+        with self.assertRaises(svg.Bad):  # whatever the declaration says, the bytes are read as UTF-8
+            svg.clean('<?xml version="1.0" encoding="UTF-16"?>' + ICON)
+        self.assertTrue(svg.clean("\t\n" + ICON + "\r\n"))
+        self.assertTrue(svg.clean('<?xml version="1.0" encoding="UTF-8"?>' + ICON))
+        with self.assertRaises(squads.Bad):  # nor in squad text, where a lone surrogate would fail to encode
+            squads.clean_member(member(instructions="a\ud800b"))
+
 
 def member(**kw):
     return {"name": "AppDev", "role": "iOS app", "host": "air", "kind": "claude", "folder": "/u/projects/app",

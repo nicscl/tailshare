@@ -43,7 +43,7 @@ Up to 32 members, 50 squads per owner and 64 KB per squad. Names and roles lose 
 `rect`, `line`, `polyline`, `polygon`; geometry, `transform`, `fill`/`stroke` as `#rgb`, `#rrggbb` or a few
 names, `stroke-width`, `opacity`, `fill-rule`, `stroke-linecap`, `stroke-linejoin`. `viewBox` is required;
 `width` and `height` are accepted and dropped. No text, links, images, styles, scripts, comments, entities or
-other namespaces; at most 8 KB, 200 elements, 10 levels and 2000 path segments. Anything else is refused,
+other namespaces; only characters XML 1.0 allows (no NUL), no byte-order mark, UTF-8 only; at most 8 KB, 200 elements, 10 levels and 2000 path segments. Anything else is refused,
 not cleaned up, and what is stored is re-written in one canonical form.
 
 **From marks.** `instructions_from` and `start.prompt_from` hold a tailnet login when that text was copied

@@ -37,6 +37,8 @@ _NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
 _NUM_RE = re.compile(_NUM)
 _SEP = re.compile(r"[\s,]*")
 _COLOR = re.compile(r"#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}")
+# what XML 1.0 allows (Char), less the BOM: anything else, NUL first, could make a parser guess UTF-16 or UCS-4
+_NOT_XML = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufefe\uff00-\ufffd\U00010000-\U0010ffff]")
 
 
 class Bad(ValueError):
@@ -169,7 +171,9 @@ def clean(text: object) -> str:
         return ""
     if not isinstance(text, str):
         raise Bad("icon must be a string")
-    raw = text.encode()
+    if _NOT_XML.search(text):
+        raise Bad("character not allowed in XML, or a BOM")
+    raw = text.encode()  # no lone surrogates left after the check: valid UTF-8
     if len(raw) > MAX_BYTES:
         raise Bad(f"icon over {MAX_BYTES // 1024} KB")
     out: list[str] = []
@@ -207,6 +211,10 @@ def clean(text: object) -> str:
         stack.append((local, len(out)))
         out.append("<" + " ".join(parts) + ">")
 
+    def decl(version, encoding, standalone):
+        if encoding and encoding.lower() != "utf-8":
+            raise Bad("encoding must be UTF-8")
+
     def end(tag):
         local, at = stack.pop()
         if at == len(out) - 1:  # no children
@@ -218,8 +226,9 @@ def clean(text: object) -> str:
         if data.strip():
             raise Bad("text not allowed")
 
-    p = expat.ParserCreate(namespace_separator=" ")
+    p = expat.ParserCreate("UTF-8", namespace_separator=" ")  # whatever the document declares
     p.StartElementHandler, p.EndElementHandler, p.CharacterDataHandler = start, end, chars
+    p.XmlDeclHandler = decl
     p.StartDoctypeDeclHandler = refuse("DOCTYPE")
     p.EntityDeclHandler = refuse("entities")
     p.CommentHandler = refuse("comments")

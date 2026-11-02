@@ -59,10 +59,13 @@ def _id(v: object, field: str) -> str:
     return v
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
 def _text(v: object, field: str, cap: int, required: bool = False, oneline: bool = True) -> str:
     if v is None:
         v = ""
-    if not isinstance(v, str) or "\0" in v:
+    if not isinstance(v, str) or "\0" in v or _SURROGATE.search(v):  # a lone surrogate is no UTF-8 at all
         raise Bad(field)
     if oneline:  # display text: no control or format characters
         v = "".join(c for c in v if unicodedata.category(c)[0] != "C").strip()
