@@ -95,9 +95,14 @@ def skips(kind: str, opts: dict) -> bool:
     """Whether these options run the agent without asking: skip itself, or a mode that amounts to it."""
     if opts.get("skip_permissions") is True:
         return True
-    if kind == "claude":  # auto counts as skip until Nicholas decides otherwise
-        return opts.get("permission_mode") in ("bypassPermissions", "auto")
+    if kind == "claude":
+        return opts.get("permission_mode") == "bypassPermissions"
     return opts.get("sandbox") == "danger-full-access"
+
+
+def autos(kind: str, opts: dict) -> bool:
+    """Whether these options run Claude in auto mode: its own mode, not skipping (Nicholas, 2026-11-02)."""
+    return kind == "claude" and opts.get("permission_mode") == "auto"
 
 
 # --------------------------------------------------------------------------- the host's config
@@ -136,6 +141,7 @@ def load_config(path: Path | None = None) -> dict | None:
             kinds[k] = {"options": opts, "bin": b if isinstance(b, str) and b.startswith("/") else ""}
     mr = d.get("max_running")
     return {"roots": roots, "kinds": kinds, "skip_permissions": d.get("skip_permissions") is True,
+            "auto": d.get("auto") is True,
             "max_running": mr if isinstance(mr, int) and not isinstance(mr, bool) and 0 < mr <= 100 else 12}
 
 
@@ -148,7 +154,7 @@ def capabilities(path: Path | None = None) -> dict | None:
     if not cfg or not cfg["roots"] or not cfg["kinds"]:
         return None
     return {"kinds": sorted(cfg["kinds"]), "options": {k: v["options"] for k, v in sorted(cfg["kinds"].items())},
-            "skip": cfg["skip_permissions"]}
+            "skip": cfg["skip_permissions"], "auto": cfg["auto"]}
 
 
 def folders(path: Path | None = None, depth: int = 2, limit: int = 200) -> list[str]:
@@ -379,6 +385,9 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         raise Refused("not_allowed", "options.skip_permissions", "this host does not allow skipping permissions")
     if skip and grant != "skip":
         raise Refused("no_skip_grant", "options.skip_permissions", "this key may not skip permissions")
+    auto = autos(kind, opts)
+    if auto and not cfg["auto"]:
+        raise Refused("not_allowed", "options.permission_mode", "this host does not allow auto mode")
     session = str(item.get("_session") or "") if kind == "claude" and not opts.get("resume") else ""
     if kind == "claude":
         session = opts.get("resume") or session
@@ -387,7 +396,7 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
            **({"TAILSHARE_SQUAD": squad["id"], "TAILSHARE_MEMBER": squad["member"]} if squad else {}),
            "PATH": os.pathsep.join(dict.fromkeys([os.path.dirname(exe), os.path.expanduser("~/.local/bin"),
                                                   "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))}
-    return {"host": host, "kind": kind, "cwd": cwd, "name": name, "options": opts, "skip": skip,
+    return {"host": host, "kind": kind, "cwd": cwd, "name": name, "options": opts, "skip": skip, "auto": auto,
             "argv": argv_for(kind, exe, cwd, name, opts, instructions and INSTRUCTIONS, prompt and PROMPT, session), "env": env,
             "prompt": prompt,
             "tmux": {"session": squad_session(squad["name"]) if squad else SESSION, "window": slug(name)},

@@ -308,14 +308,15 @@ class Squads:
         d = self.squad(sid)
         if d is None:
             return None
-        from .start import skips
+        from .start import autos, skips
 
         d.pop("shares", None)
         for m in d["members"]:
             st = m.get("start") or {}
             # no options: they hold folders (add_dirs), a resume id, models; only whether it runs unasked
             m["start"] = {"prompt": st.get("prompt") or "", "prompt_from": st.get("prompt_from") or "",
-                          "skip": skips(m["kind"], st.get("options") or {})}
+                          "skip": skips(m["kind"], st.get("options") or {}),
+                          "auto": autos(m["kind"], st.get("options") or {})}
             if not share["show_paths"]:
                 m["folder"] = posixpath.basename(m["folder"]) or "/"
         return d

@@ -124,7 +124,8 @@ class Config(Base):
 
     def test_capabilities_and_folders(self):
         self.config(kinds={"claude": {"options": ["model", "nonsense"]}, "grok": {"options": []}})
-        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True})
+        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True,
+                                                       "auto": False})
         (self.root / ".hidden").mkdir()
         (self.root / "app" / "src").mkdir()
         self.assertEqual(start.folders(), [str(self.root / "app"), str(self.root / "lib"), str(self.root / "app" / "src")])
@@ -161,7 +162,6 @@ class Plans(Base):
     def test_skip_and_its_equivalents_need_host_and_grant(self):
         equivalents = [self.item(options={"skip_permissions": True}),
                        self.item(options={"permission_mode": "bypassPermissions"}),
-                       self.item(options={"permission_mode": "auto"}),
                        self.item(kind="codex", options={"sandbox": "danger-full-access"}),
                        self.item(kind="codex", options={"sandbox": "danger-full-access", "approval": "never"}),
                        self.item(kind="codex", options={"skip_permissions": True})]
@@ -175,6 +175,32 @@ class Plans(Base):
         safe = self.dry(self.item(options={"permission_mode": "acceptEdits"}),
                         self.item(kind="codex", options={"approval": "never", "sandbox": "workspace-write"}))
         self.assertEqual([r["plan"]["skip"] for r in safe], [False, False])
+
+    def test_auto_is_its_own_mode(self):
+        """Auto mode is not skipping (Nicholas, 2026-11-02): the host's own `auto` flag, no skip grant."""
+        it = self.item(options={"permission_mode": "auto"})
+        self.config(auto=True, skip_permissions=False)
+        p = self.dry(it)[0]["plan"]  # a start=safe key, a host that never skips
+        self.assertEqual((p["auto"], p["skip"]), (True, False))
+        self.assertIn("--permission-mode=auto", p["argv"])
+        self.assertNotIn("--dangerously-skip-permissions", p["argv"])
+        self.assertEqual((start.capabilities()["auto"], start.capabilities()["skip"]), (True, False))
+        self.config()  # auto not in the config: off, whatever the grant
+        for grant in ("safe", "skip"):
+            self.assertEqual(self.refused(it, grant=grant), ("not_allowed", "options.permission_mode"))
+        self.assertIs(start.capabilities()["auto"], False)
+        self.config(auto="yes")  # only true turns it on
+        self.assertEqual(self.refused(it)[0], "not_allowed")
+        self.config(auto=True, kinds={"claude": {"bin": str(self.bin / "claude"), "options": ["model"]}})
+        self.assertEqual(self.refused(it), ("not_allowed", "options.permission_mode"))  # nor without the option
+        self.config(auto=True)
+        others = self.dry(self.item(options={"permission_mode": "acceptEdits"}),
+                          self.item(kind="codex", options={"approval": "never"}))
+        self.assertEqual([r["plan"]["auto"] for r in others], [False, False])
+        both = self.dry(self.item(options={"permission_mode": "auto", "skip_permissions": True}), grant="skip")[0]["plan"]
+        self.assertEqual((both["auto"], both["skip"]), (True, True))  # skipping still needs its own grant
+        self.assertEqual(self.refused(self.item(options={"permission_mode": "auto", "skip_permissions": True}))[0],
+                         "no_skip_grant")
 
     def test_claude_argv(self):
         p = self.dry(self.item(name="App\x1bDev\u202e", instructions="You are AppDev.\n-x", prompt="--help",

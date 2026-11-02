@@ -54,7 +54,7 @@ check. Your own edit of the text clears the mark; `tailshare squad edit` does th
 
 A share lets another tailnet user see a squad: `{"user": "alex@example.com", "can": ["see"], "show_paths":
 false}`. They get a copy without your share list and without members' start options (which hold folders, a
-resume id and models): of `start` only the prompt and `skip`, whether the member runs without asking. Unless
+resume id and models): of `start` only the prompt, `skip`, whether the member runs without asking, and `auto`, whether it runs in Claude's auto mode. Unless
 `show_paths` is true, each folder is cut down to its last part. They cannot change it, and their machines do not store it. Seeing is all a share allows: it
 grants no messaging, attaching or starting.
 
