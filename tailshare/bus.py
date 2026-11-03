@@ -776,6 +776,8 @@ class Bus:
             for a, f in zip(agents, full):
                 if session_id(f["harness"] or "", f["id"]):
                     a["session_id"] = session_id(f["harness"] or "", f["id"])
+                if f["cwd"]:  # the folder it works in: a squad member's folder is this absolute path
+                    a["cwd"] = f["cwd"]
         out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh,
                "sessions_dead": 1}
         if ip:
