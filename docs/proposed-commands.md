@@ -139,7 +139,7 @@ invalidates the plan. A catalogue/roster/structured-target record is encoded as 
 using this document's canonical encoding, with that array schema pinned by the catalogue revision. Directory,
 agent-session, PR and key targets need a catalogue-defined stable identity snapshot, not just a display name.
 Changing a symlink's resolved target also changes its canonical id. Missing/unreadable/unhashable dependencies
-refuse planning or execution rather than omitting a digest. The exact `agent_restart` rules are below.
+refuse planning or execution rather than omitting a digest. The exact `agent_restart` rules are above.
 
 These descriptors are part of the plan hash and Review's details. Rebuild them at approval and immediately
 before spawn. The executor must execute the verified executable object/immutable content or refuse if its
@@ -233,8 +233,9 @@ approvals, retries, restarts and other devices cannot win a second claim. No exe
 request body; it loads the already committed plan by execution id.
 
 The result records `consumed` as the committed claim time. `started` remains null until dispatch is known to
-have begun. Set `execution_started` false for a confirmed refusal before any spawn, true after confirmed spawn,
-and null when recovery cannot establish whether execution began. Persist one step record per displayed step
+have begun. While a consumed proposal is running but spawn has not yet been confirmed, `execution_started`
+remains null; do not persist false as proof that nothing ran. Set it false only for a confirmed final refusal
+before any spawn, true after confirmed spawn, and null when recovery cannot establish whether execution began. Persist one step record per displayed step
 (or one synthetic step at index 0 for a simple command). Step `status` is `not_started`, `running`, `done`,
 `failed`, `refused` or `interrupted`; indexes are zero-based and refer to the displayed execution order. Persist
 the running claim before each step's dispatch and the exit status before advancing to the next step. Unstarted
