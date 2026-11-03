@@ -540,7 +540,12 @@ class Bus:
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:  # the tag's "no other live holder" and the write that takes it, as one step
-            squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
+            if self.squads and squad:  # started as the member (TAILSHARE_SQUAD/MEMBER): it wins over a join
+                squad = self.squads.check_tag(squad, aid, harness, cwd, evict=True)
+            elif self.squads:  # else a `tailshare squad join` of its own, if it still matches
+                squad = self.squads.check_tag(self.squads.joined(aid), aid, harness, cwd)
+            else:
+                squad = {}
             row = self.store.one("SELECT address FROM agents WHERE id=?", aid)
             if row and row["address"].split(":")[0] == base:
                 address = row["address"]  # keep a collision suffix stable
