@@ -643,10 +643,11 @@ class Squads:
                 ids = self.ids() if own else [i for i in self.ids() if user and self.shared_with(i, user)]
                 return {"squads": [x for x in (self.for_caller(i, user, own) for i in ids) if x]}
             if len(parts) == 2:
-                d = self.for_caller(_id(parts[1], "id"), user, own, tombstones=own and qs.get("tombstones") == "1")
-                if d is None:
-                    raise bus.BusError("no such squad", 404)
-                return {"squad": d, **({"version": self.sum(parts[1])} if own else {})}
+                with self.store.lock:
+                    d = self.for_caller(_id(parts[1], "id"), user, own, tombstones=own and qs.get("tombstones") == "1")
+                    if d is None:
+                        raise bus.BusError("no such squad", 404)
+                    return {"squad": d, **({"version": self.sum(parts[1])} if own else {})}
             raise bus.BusError("not found", 404)
         if not own:  # a sharee's writes, or anyone else's, never land
             raise bus.BusError("only the squad's owner can change it", 403)

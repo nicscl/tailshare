@@ -6,11 +6,12 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
 
-from tailshare import agent, bus, keys, mcp, reports, squads_cli, suggestions
+from tailshare import agent, bus, keys, mcp, reports, squads, squads_cli, suggestions
 from tests.test_bus import reg
 from tests.test_squads import TOKEN, Machine, member
 
@@ -122,7 +123,7 @@ class Writing(Base):
                            "(SELECT rowid FROM squad_suggestions LIMIT 0)")
         for i in range(20):
             self.m.bus.store.x("INSERT INTO squad_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
-                               suggestions.new_id(), "nick@example.com", "sq1", "x", time.time(), "pending", "w",
+                               suggestions.new_id(), "nick@example.com", "sq1", self.version(), time.time(), "pending", "w",
                                "{}", f"other{i}", "[]", "[]", f"k{i}")
         reg(self.m.bus, "fresh", "f", cwd="/u/projects/f")
         self.assertIn("this squad", self.refused(429, "fresh").extra["reason"])
@@ -146,6 +147,68 @@ class Contract(Base):
         other = self.suggest(ops=[{"op": "set", "member": "m1", "field": "name", "value": "Renamed"}])
         self.apply(other)
         self.assertEqual(self.r("GET", f"/suggestions/{sg['id']}")["suggestion"]["by"]["name"], "AppDev")
+
+
+class ReviewRegressions(Base):
+    def test_stale_suggestions_do_not_block_fresh_replacements(self):
+        old = []
+        for value in ("one", "two", "three"):
+            old.append(self.suggest(ops=[{"op": "set", "member": "m1", "field": "role", "value": value}]))
+        self.m.patch("sq1/members/m1", role="new state", base_rev=self.m.squads.squad("sq1")["members"][1]["rev"])
+        fresh = self.suggest(ops=[{"op": "set", "member": "m1", "field": "role", "value": "replacement"}])
+        self.assertEqual(fresh["status"], "pending")
+        self.assertTrue(all(self.r("GET", f"/suggestions/{sg['id']}")["suggestion"]["status"] == "stale" for sg in old))
+        # Hourly new-suggestion limits still count stale proposals.
+        self.assertEqual(self.m.bus.store.one("SELECT COUNT(*) AS n FROM squad_suggestions WHERE agent='pm'")["n"], 4)
+
+    def test_result_size_is_refused_before_storing_and_preview_rolls_back(self):
+        self.m.put("large", name="Large", members=[{"id": f"m{i}", **member(
+            name=f"Member{i}", folder=f"/u/{i}", instructions="x" * squads.INSTRUCTIONS_MAX)} for i in range(13)])
+        before = self.m.squads.squad("large")
+        version = self.m.squads.sum("large")
+        with self.assertRaises(bus.BusError) as c:
+            self.m.squads.route("POST", "/squads/large/suggestions", {
+                "agent": "pm", "base": version, "why": "too large together", "ops": [
+                    {"op": "add_member", "member": {"name": f"New{i}", "host": "air", "kind": "claude",
+                     "folder": f"/new/{i}", "instructions": "y" * squads.INSTRUCTIONS_MAX}} for i in range(2)]},
+                True, "127.0.0.1", {})
+        self.assertEqual(c.exception.code, 400)
+        self.assertIn("over 64 KB", c.exception.extra["reason"])
+        self.assertEqual(self.m.squads.squad("large"), before)
+        self.assertEqual(self.m.squads.sum("large"), version)
+        self.assertEqual(self.m.bus.store.q("SELECT id FROM squad_suggestions"), [])
+
+    def test_get_squad_and_version_are_one_snapshot_during_a_write(self):
+        before = self.r("GET", "")
+        read, attempted, done = threading.Event(), threading.Event(), threading.Event()
+        original = self.m.squads.for_caller
+        failures = []
+        def writer():
+            read.wait(2)
+            attempted.set()
+            try:
+                self.m.patch("sq1/members/m1", role="concurrent", base_rev=before["squad"]["members"][1]["rev"])
+            except BaseException as e:
+                failures.append(e)
+            finally:
+                done.set()
+        def after_read(*args, **kwargs):
+            d = original(*args, **kwargs)
+            read.set()
+            self.assertTrue(attempted.wait(2))
+            done.wait(0.05)  # a writer must not commit between the content read and checksum read
+            return d
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            with mock.patch.object(self.m.squads, "for_caller", side_effect=after_read):
+                during = self.r("GET", "")
+        finally:
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(during, before)
+        self.assertNotEqual(self.version(), before["version"])
 
 
 class Applying(Base):

@@ -209,17 +209,33 @@ class Suggestions:
                 raise bus.BusError("stale", 409, {"version": version})
             tag = json.loads(a["squad"]) if a["squad"] else {}
             member = tag.get("member") if tag.get("id") == sid else None
-            ops, _, diff, _ = self.plan(sq, body.get("ops"), {"harness": a["harness"], "cwd": a["cwd"], "member": member})
+            ops, members, diff, leads = self.plan(sq, body.get("ops"), {"harness": a["harness"], "cwd": a["cwd"], "member": member})
+            # Use the real writer and serialized caps, then roll back: legal individual fields can still
+            # exceed MAX_SQUAD together. The savepoint also works inside a caller's transaction.
+            self.store.db.execute("SAVEPOINT suggestion_plan")
+            try:
+                self._write_plan(sq, members, leads)
+            finally:
+                self.store.db.execute("ROLLBACK TO suggestion_plan")
+                self.store.db.execute("RELEASE suggestion_plan")
             key = hashlib.sha256(json.dumps([sid, version, ops], sort_keys=True).encode()).hexdigest()
             same = self.store.one("SELECT id FROM squad_suggestions WHERE owner=? AND squad=? AND key=? AND status='pending'",
                                   self.squads.owner, sid, key)
             if same:
                 return {"suggestion": self.view(self._row(same["id"]))}
-            pend = lambda col, v: self.store.one(  # noqa: E731
-                f"SELECT COUNT(*) AS n FROM squad_suggestions WHERE {col}=? AND status='pending'", v)["n"]
-            if pend("squad", sid) >= PENDING_PER_SQUAD:
+            squad_pending = self.store.one(
+                "SELECT COUNT(*) AS n FROM squad_suggestions WHERE owner=? AND squad=? AND status='pending' AND base=?",
+                self.squads.owner, sid, version)["n"]
+            versions = {sid: version}
+            agent_pending = 0
+            for r in self.store.q("SELECT squad, base FROM squad_suggestions WHERE owner=? AND agent=? AND status='pending'",
+                                  self.squads.owner, aid):
+                if r["squad"] not in versions:
+                    versions[r["squad"]] = self.squads.sum(r["squad"])
+                agent_pending += r["base"] == versions[r["squad"]]
+            if squad_pending >= PENDING_PER_SQUAD:
                 raise bus.BusError("too_many", 429, {"reason": f"this squad has {PENDING_PER_SQUAD} suggestions waiting"})
-            if pend("agent", aid) >= PENDING_PER_AGENT:
+            if agent_pending >= PENDING_PER_AGENT:
                 raise bus.BusError("too_many", 429, {"reason": f"you have {PENDING_PER_AGENT} suggestions waiting"})
             if self.store.one("SELECT COUNT(*) AS n FROM squad_suggestions WHERE agent=? AND created>?",
                               aid, now - 3600)["n"] >= PER_HOUR:
@@ -248,26 +264,31 @@ class Suggestions:
             a = self.store.one("SELECT harness, cwd FROM agents WHERE id=?", r["agent"])
             me = {"harness": a["harness"], "cwd": a["cwd"], "member": by["member"]} if a else None
             _, members, _, leads = self.plan(sq, json.loads(r["ops"]), me)
-            before = {m["id"] for m in sq["members"] if not m.get("deleted")}
-            ids = {k: ("m_" + secrets.token_urlsafe(9) if k.startswith("new:") else k) for k in members}
-            now = int(time.time())
             self.store.db.execute("BEGIN IMMEDIATE")
             try:
-                for mid in before - set(members):
-                    self.squads._write_member(sid, mid, None, self.squads.tick())
-                old = {m["id"]: m for m in sq["members"]}
-                for k, doc in members.items():
-                    doc = {**doc, "reports_to": ids.get(doc.get("reports_to"), doc.get("reports_to"))}
-                    if k in old and all(doc.get(f) == old[k].get(f) for f in doc if f != "updated"):
-                        continue  # untouched: keep its rev
-                    self.squads._write_member(sid, ids[k], {**doc, "updated": now}, self.squads.tick())
-                self.squads._check_caps(sid, {ids[k]: 1 for k in leads if k in ids})
+                self._write_plan(sq, members, leads)
                 self.store.x("UPDATE squad_suggestions SET status='applied', resolved_at=? WHERE id=?", time.time(), sgid)
             except BaseException:
                 self.store.db.execute("ROLLBACK")
                 raise
             self.store.db.execute("COMMIT")
             return {"suggestion": self.view(self._row(sgid)), "squad": self.squads.squad(sid)}
+
+    def _write_plan(self, sq: dict, members: dict, leads: set) -> None:
+        """Apply already validated members inside the caller's transaction/savepoint, including total caps."""
+        sid = sq["id"]
+        before = {m["id"] for m in sq["members"] if not m.get("deleted")}
+        ids = {k: ("m_" + secrets.token_urlsafe(9) if k.startswith("new:") else k) for k in members}
+        now = int(time.time())
+        for mid in before - set(members):
+            self.squads._write_member(sid, mid, None, self.squads.tick())
+        old = {m["id"]: m for m in sq["members"]}
+        for k, doc in members.items():
+            doc = {**doc, "reports_to": ids.get(doc.get("reports_to"), doc.get("reports_to"))}
+            if k in old and all(doc.get(f) == old[k].get(f) for f in doc if f != "updated"):
+                continue  # untouched: keep its rev
+            self.squads._write_member(sid, ids[k], {**doc, "updated": now}, self.squads.tick())
+        self.squads._check_caps(sid, {ids[k]: 1 for k in leads if k in ids})
 
     def dismiss(self, sid: str, sgid: str) -> dict:
         with self.store.lock:
