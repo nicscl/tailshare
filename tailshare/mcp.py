@@ -16,8 +16,20 @@ TOOLS = [
     {
         "name": "squad",
         "description": ("The squad this session belongs to (its members, their roles and agent addresses), or with "
-                        "`squad` (a name or id) another of the user's squads. Read-only: the person edits squads."),
-        "inputSchema": {"type": "object", "properties": {"squad": {"type": "string"}}},
+                        "`squad` (a name or id) another of the user's squads. action:suggest proposes ops with why; "
+                        "only the owner can apply or dismiss them. Omitting action reads the squad."),
+        "inputSchema": {"type": "object", "properties": {
+            "squad": {"type": "string"}, "action": {"type": "string", "enum": ["show", "suggest"]},
+            "why": {"type": "string", "maxLength": 600},
+            "ops": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
+                "type": "object", "description": "add_member: member object, self bool; remove_member: member id; "
+                "set: member id, field (name, role, icon, instructions, reports_to), value. "
+                "Only add_member may set host/kind/folder. No start or shares.",
+                "properties": {"op": {"type": "string", "enum": ["add_member", "remove_member", "set"]},
+                               "member": {"oneOf": [{"type": "string"}, {"type": "object"}]},
+                               "self": {"type": "boolean"}, "field": {"type": "string", "enum": [
+                                   "name", "role", "icon", "instructions", "reports_to"]}, "value": {}},
+                "required": ["op", "member"], "additionalProperties": False}}}},
     },
     {
         "name": "report",
@@ -164,6 +176,11 @@ def _tool(name: str, args: dict) -> str:
         return json.dumps(agent.call("/report", {"agent": me["id"], **fields})["report"], indent=1)
     if name == "squad":
         ref = str(args.get("squad") or "")
+        action = args.get("action", "show")
+        if action == "suggest":
+            return json.dumps(squads_cli.suggest(ref, args.get("ops"), args.get("why"), me), indent=2)
+        if action != "show":
+            raise ValueError("squad action must be show or suggest")
         if ref:
             return json.dumps(squads_cli._find(ref), indent=2)
         tag = me.get("squad") or agent.squad_tag()

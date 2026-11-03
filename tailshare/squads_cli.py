@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 from . import agent, bus, keys
+from urllib.parse import quote
 
 
 def _get(path: str) -> dict:
@@ -170,6 +171,117 @@ def cmd_edit(args):
     print(f"Saved {len(todo)} change{'s' * (len(todo) != 1)} to {sq['name']}.")
 
 
+def _suggestion_squads(ref: str = "") -> list[dict]:
+    if ref:
+        return [_find(ref)]
+    tag = agent.squad_tag()
+    if tag:
+        return [_get(f"/squads/{tag['id']}")["squad"]]
+    return _get("/squads")["squads"]
+
+
+def cmd_suggestions(args):
+    rows, missing = [], set()
+    for sq in _suggestion_squads(args.ref):
+        d = agent.call(f"/squads/{sq['id']}/suggestions" + ("?all=1" if args.all else ""), timeout=180)
+        rows.extend(d["suggestions"])
+        missing.update(d.get("unreachable") or [])
+    if args.json:
+        print(json.dumps({"suggestions": rows, "unreachable": sorted(missing)}, indent=2))
+        return
+    for sg in rows:
+        print(f"{sg['id']}  {sg['status']}  {sg['host']}  {sg['squad']}  {sg['by']['agent']}")
+        print(sg["why"])
+    if not rows:
+        print("No suggestions.")
+    if missing:
+        print("Unreachable: " + ", ".join(sorted(missing)))
+
+
+def _local_suggestion(sid: str) -> dict:
+    # Fetch by id, including suggestions older than the listing's retention window.
+    for sq in _get("/squads")["squads"]:
+        try:
+            return _get(f"/squads/{sq['id']}/suggestions/{quote(sid, safe='')}")["suggestion"]
+        except bus.BusError as e:
+            if e.code != 404:
+                raise
+    raise ValueError("no such suggestion on this machine; run this on its host, or use Hive")
+
+
+def cmd_apply(args):
+    _human_check()
+    sg = _local_suggestion(args.sid)
+    print(json.dumps(sg, indent=2, ensure_ascii=True))  # full diff, including both instruction texts; no terminal escapes
+    if sg["status"] != "pending":
+        raise ValueError(f"suggestion is {sg['status']}; it cannot be applied")
+    if input("Apply? [y/N] ").strip().lower() != "y":
+        print("No changes.")
+        return
+    _write("POST", f"/squads/{sg['squad']}/suggestions/{sg['id']}/apply", {"base": sg["base"]})
+    print(f"Applied {sg['id']}.")
+
+
+def cmd_dismiss(args):
+    _human_check()
+    sg = _local_suggestion(args.sid)
+    _write("POST", f"/squads/{sg['squad']}/suggestions/{sg['id']}/dismiss", {})
+    print(f"Dismissed {sg['id']}.")
+
+
+def _suggestion_target(ref: str, me: dict) -> dict:
+    tag = me.get("squad") or agent.squad_tag()
+    if ref:
+        sid = _find(ref)["id"]
+    elif tag:
+        sid = tag["id"]
+    else:
+        raise ValueError("name a squad: this session is not a member")
+    return _get(f"/squads/{sid}")
+
+
+def suggest(ref: str, ops: list, why: str, me: dict, snapshot: dict | None = None) -> dict:
+    d = snapshot if snapshot is not None else _suggestion_target(ref, me)
+    return agent.call(f"/squads/{d['squad']['id']}/suggestions",
+                      {"agent": me["id"], "base": d["version"], "why": why, "ops": ops})
+
+
+def cmd_suggest(args):
+    me = agent.register(agent.detect())
+    snapshot = _suggestion_target(args.ref, me)
+    sq = snapshot["squad"]
+
+    def member(ref):
+        hits = [m for m in sq["members"] if m["id"] == ref] or [
+            m for m in sq["members"] if m["name"].lower() == ref.lower()]
+        if len(hits) != 1:
+            raise ValueError(f"member {ref!r} is missing or ambiguous; use its id")
+        return hits[0]["id"]
+
+    ops = []
+    for file in args.add:
+        with open(file) as f:
+            ops.append({"op": "add_member", "member": json.load(f)})
+    if args.join:
+        ops.append({"op": "add_member", "self": True, "member": {"name": args.join, "role": args.role}})
+    elif args.role is not None:
+        raise ValueError("--role needs --join")
+    for assignment in args.set:
+        target, sep, value = assignment.partition("=")
+        ref, dot, field = target.rpartition(".")
+        if not sep or not dot:
+            raise ValueError("--set needs MEMBER.FIELD=VALUE")
+        if field == "reports_to":
+            value = None if value == "null" else value if value.startswith("new:") else member(value)
+        ops.append({"op": "set", "member": member(ref), "field": field, "value": value})
+    for ref, file in args.instructions:
+        with open(file) as f:
+            ops.append({"op": "set", "member": member(ref), "field": "instructions", "value": f.read()})
+    for ref in args.remove:
+        ops.append({"op": "remove_member", "member": member(ref)})
+    print(json.dumps(suggest(sq["id"], ops, args.why, me, snapshot), indent=2))
+
+
 def add_parser(sub) -> None:
     p = sub.add_parser("squad", help="squads: named groups of agents with roles")
     p.add_argument("--json", action="store_true")
@@ -188,3 +300,23 @@ def add_parser(sub) -> None:
     q = s.add_parser("edit", help="edit a squad as JSON in $EDITOR (in your own terminal)")
     q.add_argument("ref", help="the squad's name or id")
     q.set_defaults(fn=cmd_edit)
+
+    q = s.add_parser("suggestions", help="list suggestions (current squad, or all squads if unbound)")
+    q.add_argument("ref", nargs="?", default="")
+    q.add_argument("--all", action="store_true", help="include other owner machines")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_suggestions)
+    for command, fn in (("apply", cmd_apply), ("dismiss", cmd_dismiss)):
+        q = s.add_parser(command, help=f"{command} a local suggestion (in your own terminal)")
+        q.add_argument("sid")
+        q.set_defaults(fn=fn)
+    q = s.add_parser("suggest", help="propose changes for the owner to review")
+    q.add_argument("ref", nargs="?", default="", help="squad name or id; defaults to this session's squad")
+    q.add_argument("--add", action="append", default=[], metavar="FILE")
+    q.add_argument("--join", metavar="NAME")
+    q.add_argument("--role")
+    q.add_argument("--remove", action="append", default=[], metavar="MEMBER")
+    q.add_argument("--set", action="append", default=[], metavar="MEMBER.FIELD=VALUE")
+    q.add_argument("--instructions", action="append", nargs=2, default=[], metavar=("MEMBER", "FILE"))
+    q.add_argument("--why", required=True)
+    q.set_defaults(fn=cmd_suggest)

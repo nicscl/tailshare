@@ -137,7 +137,15 @@ def approval(v: object, field: str) -> dict | None:
         return {"type": "squad_structure", "reports_to": {
             member_ref(k, f"{field}.reports_to"): None if x is None else member_ref(x, f"{field}.reports_to.{k}")
             for k, x in tree.items()}}
-    raise Bad(f"{field}.type", "key_enroll or squad_structure")
+    if v.get("type") == "squad_change":
+        if set(v) - {"type", "host", "suggestion"} or not isinstance(v.get("host"), str) \
+                or not squads.HOST_RE.fullmatch(v["host"]):
+            raise Bad(f"{field}.host", "the machine the suggestion is on")
+        s = v.get("suggestion")
+        if not isinstance(s, str) or len(s) != 25 or not s.startswith("sg_") or not s[3:].isalnum() or not s.isascii():
+            raise Bad(f"{field}.suggestion", "a suggestion id, sg_…")
+        return {"type": "squad_change", "host": v["host"], "suggestion": s}
+    raise Bad(f"{field}.type", "key_enroll, squad_change or squad_structure")
 
 
 def blocker(v: object, field: str) -> dict:
