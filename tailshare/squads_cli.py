@@ -97,7 +97,7 @@ def cmd_new(args):
 
 
 EDITABLE = ("name", "color", "icon", "shares")
-MEMBER_EDITABLE = ("name", "role", "icon", "host", "kind", "folder", "instructions", "instructions_from", "start")
+MEMBER_EDITABLE = ("name", "role", "icon", "host", "kind", "folder", "instructions", "instructions_from", "start", "reports_to")
 
 
 def _editable(sq: dict) -> dict:

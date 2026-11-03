@@ -31,12 +31,14 @@ PROMPT_MAX = 8 * 1024
 FOLDER_MAX = 1024
 MAX_SQUAD = 64 * 1024  # the whole squad, as JSON
 MAX_MEMBERS = 32
+LEVELS = 3  # a squad's tree: a top member, its reports, and theirs
 MAX_SQUADS = 50  # per owner
 MAX_SHARES = 32
 FUTURE = 120_000  # ms: a rev further ahead of this machine's clock is refused
 TOMBSTONE_DAYS = 30
 HEADER_FIELDS = ("name", "color", "icon", "shares")
-MEMBER_FIELDS = ("order", "name", "role", "icon", "host", "kind", "folder", "instructions", "instructions_from", "start")
+MEMBER_FIELDS = ("order", "name", "role", "icon", "host", "kind", "folder", "instructions", "instructions_from", "start",
+                 "reports_to")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS squads(owner TEXT NOT NULL, id TEXT NOT NULL, doc TEXT NOT NULL, hlc INTEGER NOT NULL,
@@ -146,7 +148,10 @@ def clean_member(d: dict) -> dict:
     st = d.get("start") or {}
     if not isinstance(st, dict) or set(st) - {"options", "prompt", "prompt_from"}:
         raise Bad("start")
-    return {"order": order, "name": _text(d.get("name"), "name", NAME_MAX, required=True),
+    lead = d.get("reports_to")
+    if lead is not None:
+        _id(lead, "reports_to")
+    return {"reports_to": lead, "order": order, "name": _text(d.get("name"), "name", NAME_MAX, required=True),
             "role": _text(d.get("role"), "role", ROLE_MAX), "icon": _icon(d.get("icon"), "icon"), "host": host,
             "kind": d["kind"], "folder": posixpath.normpath(folder),
             "instructions": _text(d.get("instructions"), "instructions", INSTRUCTIONS_MAX, oneline=False),
@@ -154,6 +159,56 @@ def clean_member(d: dict) -> dict:
             "start": {"options": _options(st.get("options"), "start.options"),
                       "prompt": _text(st.get("prompt"), "start.prompt", PROMPT_MAX, oneline=False),
                       "prompt_from": _from(st.get("prompt_from"), "start.prompt_from")}}
+
+
+def leads(members: list) -> dict[str, str | None]:
+    """Each live member's lead as the tree reads it. Edits from two machines can merge into a loop, a tree deeper
+    than LEVELS or a lead that was removed: a member whose chain up does any of that reads as top-level."""
+    raw = {m["id"]: m.get("reports_to") for m in members if not m.get("deleted")}
+    out: dict[str, str | None] = {}
+    for mid in raw:
+        chain, cur = [mid], raw[mid]
+        while cur in raw and cur not in chain:
+            chain.append(cur)
+            cur = raw[cur]
+        out[mid] = chain[1] if 1 < len(chain) <= LEVELS and cur not in chain else None
+    return out
+
+
+def branch(members: list, mid: str) -> set[str]:
+    """`mid` and everyone under it, as the tree reads."""
+    up = leads(members)
+    out = {mid}
+    for _ in range(LEVELS):
+        out |= {m for m, lead in up.items() if lead in out}
+    return out
+
+
+def check_lead(members: list, mid: str) -> None:
+    """What the owner writes for `mid` must be a tree: its lead a live member of the squad, no loop, and at most
+    LEVELS levels from the top to the deepest member under it."""
+    raw = {m["id"]: m.get("reports_to") for m in members if not m.get("deleted")}
+    lead = raw.get(mid)
+    if lead is None:
+        below = 0
+    elif lead == mid:
+        raise Bad("reports_to", "a member can't report to itself")
+    elif lead not in raw:
+        raise Bad("reports_to", "not a member of this squad")
+    chain, cur = [mid], lead
+    while cur in raw and cur not in chain:
+        chain.append(cur)
+        cur = raw[cur]
+    if cur == mid:
+        raise Bad("reports_to", "that makes a loop")
+    depth, level = 0, {mid}  # how far down its reports go, as written: the new lead may push them past LEVELS
+    while depth <= LEVELS:
+        level = {m for m, x in raw.items() if x in level and m != mid}
+        if not level:
+            break
+        depth += 1
+    if len(chain) + depth > LEVELS:
+        raise Bad("reports_to", f"more than {LEVELS} levels")
 
 
 def member_key(m: dict) -> tuple:
@@ -337,11 +392,13 @@ class Squads:
         return {"squads": {i: self.max_rev(i) for i in ids}, "squad_sums": {i: self.sum(i) for i in ids}} if ids else {}
 
     # -- writing -------------------------------------------------------------------------
-    def _check_caps(self, sid: str) -> None:
+    def _check_caps(self, sid: str, written: dict | None = None) -> None:
         d = self.squad(sid)
         if d is None:
             return
         live = d["members"]
+        for mid in written or {}:  # only what this write set: an old merged-in knot doesn't block other edits
+            check_lead(live, mid)
         if len(live) > MAX_MEMBERS:
             raise Bad("members", f"at most {MAX_MEMBERS}")
         seen: dict[tuple, str] = {}
@@ -395,7 +452,7 @@ class Squads:
                 self._write_header(sid, {**head, "updated": now}, self.tick())
                 for mid, m in clean:
                     self._write_member(sid, mid, {**m, "updated": now}, self.tick())
-                self._check_caps(sid)
+                self._check_caps(sid, {mid: m for mid, m in clean if m["reports_to"] is not None})
             except BaseException:
                 self.store.db.execute("ROLLBACK")
                 raise
@@ -466,7 +523,7 @@ class Squads:
                 self.store.db.execute("BEGIN IMMEDIATE")
                 try:
                     self._write_member(sid, mid, {**doc, "updated": int(time.time())}, self.tick())
-                    self._check_caps(sid)
+                    self._check_caps(sid, {mid: body} if "reports_to" in body else {})
                 except BaseException:
                     self.store.db.execute("ROLLBACK")
                     raise

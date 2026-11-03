@@ -37,6 +37,12 @@ Each member: `name`, `role` (up to 40 each), `icon`, `host` (the machine it runs
 gets them as Claude's appended system prompt or Codex's developer instructions), and `start`: `options` (as in start.md) and `prompt` (up to 8 KB,
 the first message).
 
+**The tree.** A member's `reports_to` is the id of another member of the same squad, or null. A member that
+someone reports to is a lead. The owner writes it like any member field, and the write is refused (`400`, `field:
+"reports_to"`) if it names itself or no live member, makes a loop, or puts anyone more than 3 levels down (the
+member's own reports count). Edits on two machines can still merge into a knot, or a lead can be removed: a member
+whose chain up loops, runs past 3 levels or ends at a removed member reads as top-level, everywhere.
+
 Up to 32 members, 50 squads per owner and 64 KB per squad. Names and roles lose control and bidi characters.
 
 **Icons** are a small SVG subset, the same one the Hive app draws: `svg`, `g`, `path`, `circle`, `ellipse`,
