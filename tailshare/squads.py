@@ -389,7 +389,9 @@ class Squads:
                                aid, time.time() - bus.LIVE)
             if a is None:
                 raise bus.BusError("this session is not running on the bus", 404)
-            if a["squad"] and json.loads(a["squad"]) != tag:
+            if a["squad"] and json.loads(a["squad"]) == tag:  # already that member (started as it, or joined): no-op
+                return {"agent": self.bus.agent(aid)}
+            if a["squad"]:
                 raise bus.BusError("already_a_member", 409, {"reason": "this session is already another member: "
                                                                         "`tailshare squad leave` first"})
             if self._held(tag, aid):

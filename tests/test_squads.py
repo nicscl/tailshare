@@ -601,6 +601,16 @@ class Joining(unittest.TestCase):
         self.assertIsNone(child["squad"])
         self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
 
+    def test_joining_the_member_it_was_started_as_changes_nothing(self):
+        real = reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.assertEqual(self.join("s1", "m1")["agent"]["squad"], {"id": "sq1", "member": "m1"})
+        self.assertEqual(self.m.squads.joined("s1"), {})  # no join stored: it stays a started member
+        child = reg(self.m.bus, "s2", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})  # claude -p
+        self.assertIsNone(child["squad"])
+        self.assertEqual(reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})["squad"],
+                         {"id": "sq1", "member": "m1"})
+        self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
+
     def test_leave(self):
         reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
         self.join("s1", "m1")
