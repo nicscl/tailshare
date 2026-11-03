@@ -73,8 +73,8 @@ class Writing(Base):
             self.write("m2", bio="gone")  # a session that stopped isn't anyone
 
     def test_cleaning_and_caps(self):
-        r = self.write("m2", bio="ok‮\x07\nline", now=["a‏\tb"])
-        self.assertEqual((r["bio"], r["now"][0]["title"]), ("ok\nline", "ab"))
+        r = self.write("m2", bio="ok\u202e\x07\nline\u2028two", now=["a\u200f\tb\u2028c\u2029d\u3000e"])
+        self.assertEqual((r["bio"], r["now"][0]["title"]), ("ok\nline\ntwo", "abcd\u3000e"))
         for f in [{"bio": "x" * 601}, {"now": ["a"] * 4}, {"next": ["a"] * 6}, {"now": [""]}, {"now": ["x" * 81]},
                   {"now": [{"title": "a", "extra": 1}]}, {"bio": 3}, {"notes": "x" * 8193},
                   {"waiting_on": {"member": "m0"}}, {"waiting_on": {"member": "../x", "text": "t"}},
@@ -89,7 +89,7 @@ class Writing(Base):
             self.write("m2", now=[{"title": "t", "url": u}])
         for u in ["http://github.com/x", "javascript:alert(1)", "https://user@github.com/", "https://a:b@github.com/",
                   "https://github.com:8443/", "https://аpple.com/", "https://1.2.3.4/", "https://localhost/",
-                  "https:///x", "https://github.com/a b", "https://github.com/‮", "//github.com/x",
+                  "https:///x", "https://github.com/a b", "https://github.com/\u202e", "//github.com/x",
                   "https://github.com\\@evil.com/", "https://" + "a" * 600 + ".com/"]:
             self.assertEqual(self.bad("m2", now=[{"title": "t", "url": u}])["field"], "now.0.url", u)
 
@@ -124,7 +124,7 @@ class Blockers(Base):
             self.bad("m0", blockers=[b])
         self.bad("m0", blockers=[self.q(), self.q()])  # the same id twice
         self.bad("m0", blockers=[self.q(id=f"b{i}") for i in range(reports.OPEN_MAX + 1)])
-        r = self.write("m0", blockers=[self.q(why="line 1\nline‮ 2", options=["Use ⌥⌘N", "/clear"])])
+        r = self.write("m0", blockers=[self.q(why="line 1\nline\u202e 2", options=["Use ⌥⌘N", "/clear"])])
         self.assertEqual((r["blockers"][0]["why"], r["blockers"][0]["options"]), ("line 1\nline 2", ["Use ⌥⌘N", "/clear"]))
 
     def test_resolving(self):

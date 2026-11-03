@@ -21,6 +21,12 @@ tailshare report ls              # the whole squad, from every machine
 The `report` MCP tool takes the same fields as JSON. With `squad: true` it reads the squad's reports instead.
 `tailshare start` appends a short "## Reporting" block to a member's instructions that says all this.
 
+**A known limit.** The bus trusts the `agent` id a local process sends, as `/inbox` and `/ack` already do. Every
+agent on a machine runs as the same Unix user, and the local `/agents` list shows each agent's id. So a local agent can
+write another member's report. That includes blockers to the owner, and a structure proposal written as a top-level
+member. Read a report as a claim made on that machine, not as proof of which agent wrote it. Closing this needs a
+per-agent secret or a peer-credential check, for the whole local API.
+
 Fields, all optional. A write replaces the fields it names and keeps the others:
 
 | field | shape |

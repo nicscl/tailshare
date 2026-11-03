@@ -48,14 +48,15 @@ class Bad(squads.Bad):
 
 
 def text(v: object, field: str, cap: int, lines: bool = False, required: bool = False) -> str:
-    """Display text: no control, format (bidi) or private characters; newlines only where `lines`."""
+    """Display text: no control, format (bidi), private or line/paragraph-separator characters; newlines only where
+    `lines`."""
     if v is None:
         v = ""
     if not isinstance(v, str):
         raise Bad(field, "a string")
     if lines:
-        v = v.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
-    v = "".join(c for c in v if (lines and c == "\n") or unicodedata.category(c)[0] != "C").strip()
+        v = v.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ").replace("\u2028", "\n").replace("\u2029", "\n")
+    v = "".join(c for c in v if (lines and c == "\n") or unicodedata.category(c)[0] != "C" and unicodedata.category(c) not in ("Zl", "Zp")).strip()
     if len(v) > cap or len(v.encode()) > 4 * cap:
         raise Bad(field, f"at most {cap} characters")
     if required and not v:
