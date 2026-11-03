@@ -187,7 +187,7 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 | `expired` / `unknown_plan` / `changed` | dry run again |
 | `root` | tailshare runs as root here |
 | `failed` | tmux refused; `reason` says why |
-| `no_bus` | the bus is not running on this host, so nothing was launched |
+| `no_bus` | the bus is not running on this host (or did not say its name), so nothing was planned or launched |
 
 ## Reopening a dead session
 
