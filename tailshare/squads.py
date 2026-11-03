@@ -211,6 +211,22 @@ def check_lead(members: list, mid: str) -> None:
         raise Bad("reports_to", f"more than {LEVELS} levels")
 
 
+def check_members(live: list, written) -> None:
+    """The squad's live members after a write: a tree for each member whose lead it set, at most MAX_MEMBERS,
+    and no two that would get the same address."""
+    for mid in written:  # only what this write set: an old merged-in knot doesn't block other edits
+        check_lead(live, mid)
+    if len(live) > MAX_MEMBERS:
+        raise Bad("members", f"at most {MAX_MEMBERS}")
+    seen: dict[tuple, str] = {}
+    for m in live:
+        k = member_key(m)
+        if k in seen:
+            raise Bad(f"members.{m['id']}", f"same host, kind, folder name and name as {seen[k]}: "
+                                            "they would get the same address")
+        seen[k] = m["id"]
+
+
 def member_key(m: dict) -> tuple:
     """Two members that would get the same agent address."""
     return m["host"], m["kind"], bus.slug(posixpath.basename(m["folder"]) or "root"), bus.slug(m["name"])
@@ -238,6 +254,9 @@ class Squads:
         self._hlc = int(row["h"] or 0) if row else 0
         self._hlc_lock = threading.Lock()
         self._pulled: dict[tuple[str, str], str] = {}  # (host, squad) -> the sum we last pulled for
+        from .suggestions import Suggestions
+
+        self.suggestions = Suggestions(self)
 
     # -- clock ---------------------------------------------------------------------------
     def tick(self) -> list:
@@ -396,18 +415,7 @@ class Squads:
         d = self.squad(sid)
         if d is None:
             return
-        live = d["members"]
-        for mid in written or {}:  # only what this write set: an old merged-in knot doesn't block other edits
-            check_lead(live, mid)
-        if len(live) > MAX_MEMBERS:
-            raise Bad("members", f"at most {MAX_MEMBERS}")
-        seen: dict[tuple, str] = {}
-        for m in live:
-            k = member_key(m)
-            if k in seen:
-                raise Bad(f"members.{m['id']}", f"same host, kind, folder name and name as {seen[k]}: "
-                                                "they would get the same address")
-            seen[k] = m["id"]
+        check_members(d["members"], written or {})
         if len(json.dumps(d)) > MAX_SQUAD:
             raise Bad("members", f"the squad is over {MAX_SQUAD // 1024} KB")
 
@@ -608,6 +616,7 @@ class Squads:
         self.store.x("DELETE FROM squad_members WHERE deleted=1 AND at<?", cutoff)
         self.store.x("DELETE FROM squads WHERE deleted=1 AND at<? AND NOT EXISTS (SELECT 1 FROM squad_members m "
                      "WHERE m.owner=squads.owner AND m.squad=squads.id)", cutoff)
+        self.suggestions.prune()
 
     # -- HTTP ----------------------------------------------------------------------------
     def route(self, method: str, path: str, body: dict, local: bool, ip: str, qs: dict, token: str = "",
@@ -620,6 +629,15 @@ class Squads:
                 self.bus.net.refresh()
             user = self.bus.net.user_for_ip(ip) or ""
             own = bool(user) and user != "tagged-devices" and user == self.bus.net.user
+        sugg = len(parts) in (3, 4, 5) and parts[2] == "suggestions"
+        if sugg and not own:  # suggestions are the owner's: a sharee sees the squad, not what agents proposed
+            raise bus.BusError("only the squad's owner sees its suggestions", 403)
+        if sugg and method == "GET" and len(parts) in (3, 4):
+            return self.suggestions.read(parts, local, qs)
+        if sugg and method == "POST" and len(parts) == 3:
+            if not local:  # agents suggest through their own machine's local API
+                raise bus.BusError("not found", 404)
+            return self.suggestions.suggest(_id(parts[1], "id"), body)
         if method == "GET":
             if parts == ["squads"]:
                 ids = self.ids() if own else [i for i in self.ids() if user and self.shared_with(i, user)]
@@ -628,7 +646,7 @@ class Squads:
                 d = self.for_caller(_id(parts[1], "id"), user, own, tombstones=own and qs.get("tombstones") == "1")
                 if d is None:
                     raise bus.BusError("no such squad", 404)
-                return {"squad": d}
+                return {"squad": d, **({"version": self.sum(parts[1])} if own else {})}
             raise bus.BusError("not found", 404)
         if not own:  # a sharee's writes, or anyone else's, never land
             raise bus.BusError("only the squad's owner can change it", 403)
@@ -649,6 +667,10 @@ class Squads:
             return self.patch_header(parts[1], body)
         if method == "PATCH" and len(parts) == 4 and parts[2] == "members":
             return self.patch_member(parts[1], parts[3], body)
+        if sugg and method == "POST" and len(parts) == 5 and parts[4] in ("apply", "dismiss"):
+            sid = _id(parts[1], "id")
+            return self.suggestions.apply(sid, parts[3], body) if parts[4] == "apply" else \
+                self.suggestions.dismiss(sid, parts[3])
         raise bus.BusError("not found", 404)
 
 
