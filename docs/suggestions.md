@@ -40,6 +40,9 @@ An op is one of:
 | `remove_member` | `member: <id>` |
 | `set` | `member: <id>`, `field: "name" \| "role" \| "icon" \| "instructions" \| "reports_to"`, `value` |
 
+- An `add_member` that isn't a self-join may only place the new member on one of the owner's own machines: its
+  `host` must be a machine of the squad's owner (the same tailnet user, not tagged). Otherwise 400 with
+  `field: "host"`.
 - Each op is cleaned with the same rules as a write (`clean_member`, the 3-level tree, 32 members, unique names).
   A suggestion that would be refused as a write is refused when suggested, with the same `field`/`reason`.
 - `reports_to` in an op may name a member added earlier in the same suggestion, as `"new:<index>"`.
@@ -68,6 +71,9 @@ Answer: `201 {suggestion}`.
  diff: [change, …],
  resolved: null | {at, how: "applied" | "dismissed" | "expired"}}
 ```
+
+`by.member` is the suggester's member **id** (or null), not its name. The app shows the name from the squad at
+`base`. A member that was removed or renamed since then is shown as it was at `base`.
 
 `status` is `pending`, `stale`, `applied`, `dismissed` or `expired`. It is `stale` whenever `base` is not the current
 version. That is worked out when the suggestion is read, so a suggestion goes stale as soon as anything changes the
@@ -127,10 +133,15 @@ Agents: `tailshare squad suggest` (with `--add FILE`, `--join NAME --role ROLE`,
 The owner applies a self-join, or adds a member by hand that matches a running session. In both cases the session
 can bind without a restart:
 
-- `tailshare squad join <squad> <member>` stores a join for this session (by its session id).
+- `tailshare squad join <squad> <member>` stores a join for this session, by its session id (built: #41, see
+  squads.md "Joining").
 - Later registrations that carry no `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER` use the stored join.
 - `check_tag` still decides every time: same host, kind and folder, and no other live holder. A join that no
-  longer matches is ignored.
+  longer matches is ignored. A member that already has a live holder is refused (409 `not_that_member`).
+- A join is for **this session**: the CLI sends the id of the session it runs in. The API can't prove who calls
+  it: like reports, every agent on a machine runs as the same Unix user, so a local process could name another
+  session's id. `check_tag` bounds what that can do: it only works for a member that session matches (its
+  machine, kind and folder) and that nobody else holds. It changes no squad.
 - A self-join that is applied stores the join for the suggester, so it binds on its next registration.
 - ts-agents sets the env on `up`, which covers sessions it restarts.
 
