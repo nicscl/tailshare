@@ -24,7 +24,7 @@ KEY = "k0123456789ab"
 OTHER = "kba9876543210"
 TMUX = shutil.which("tmux")
 FAKE = """#!/bin/sh
-case "$TMUX" in "$FAKE_AGENT_TMUX",*) ;; *) echo "not on the test's tmux socket" >&2; exit 1 ;; esac
+case "$TMUX" in "$(cat "$(dirname "$0")/tmux_prefix")"/*) ;; *) echo "not on the test's tmux servers" >&2; exit 1 ;; esac
 env > "$(dirname "$0")/env.$$"
 printf '%s\\0' "$@" > "$(dirname "$0")/argv.$$"
 sleep 30
@@ -44,11 +44,13 @@ class Base(unittest.TestCase):
         for k in ("claude", "codex"):
             (self.bin / k).write_text(FAKE)
             (self.bin / k).chmod(0o755)
+        # read by the fake agent: it refuses to run on any tmux server outside this test's folder. A file, not the
+        # environment: an agent's server starts with a clean one (start.server_env)
+        (self.bin / "tmux_prefix").write_text(str(self.tmp))
         patches = [mock.patch.object(bus, "STATE_DIR", self.state),
-                   mock.patch.object(start, "TMUX_SOCKET", str(self.tmp / "sock")),
                    # and in every gate this test runs as a subprocess: never the user's own tmux server
-                   # read by the fake agent only: it refuses to run anywhere but the test's tmux server
-                   mock.patch.dict(os.environ, {"FAKE_AGENT_TMUX": str(self.tmp / "sock")})]
+                   mock.patch.object(start, "TMUX_SOCKET", str(self.tmp / "sock")),
+                   mock.patch.object(start, "TMUX_DIR", str(self.tmp / "tmux"))]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -266,6 +268,89 @@ class Plans(Base):
 
 
 @unittest.skipUnless(TMUX, "needs tmux")
+class Isolated(Base):
+    """Each started agent on its own tmux server, <TMUX_DIR>/ts-<name> (here under the test's folder)."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("TMUX_SOCKET", ""), ("LEGACY_SOCKET", str(self.tmp / "legacy"))):
+            p = mock.patch.object(start, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._kill_servers)
+
+    def _kill_servers(self):
+        """Each by its own socket: never a bare kill-server, which would reach the user's default server."""
+        for sock in [*(self.tmp / "tmux").glob("ts-*"), self.tmp / "legacy"]:
+            subprocess.run([TMUX, "-S", str(sock), "kill-server"], capture_output=True)
+
+    def run_one(self, **kw):
+        return self.confirm(self.dry(self.item(**kw))[0]["plan_id"])["results"][0]
+
+    def sessions(self, sock):
+        r = subprocess.run([TMUX, "-S", str(sock), "list-windows", "-a", "-F", "#{session_name}:#{window_name}"],
+                           capture_output=True, text=True)
+        return r.stdout.split()
+
+    def test_each_agent_gets_its_own_server(self):
+        a, b = self.run_one(), self.run_one(name="Other")
+        self.assertEqual((a["tmux"]["socket"], b["tmux"]["socket"]),
+                         (str(self.tmp / "tmux" / "ts-appdev"), str(self.tmp / "tmux" / "ts-other")))
+        self.assertEqual(self.sessions(a["tmux"]["socket"]), ["tailshare-start:appdev"])
+        self.assertEqual(self.sessions(b["tmux"]["socket"]), ["tailshare-start:other"])
+        self.assertEqual((self.tmp / "tmux").stat().st_mode & 0o777, 0o700)
+        end = time.time() + 5
+        while len(self.argvs()) < 2 and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(len(self.argvs()), 2)
+        # one server going down leaves the other agent running
+        subprocess.run([TMUX, "-S", a["tmux"]["socket"], "kill-server"], check=True)
+        self.assertEqual(self.sessions(b["tmux"]["socket"]), ["tailshare-start:other"])
+        self.assertNotIn("error", self.run_one())  # and the name is free again
+
+    def test_squad_members_too(self):
+        self.assertEqual(start.socket_for("Lead Dev"), str(self.tmp / "tmux" / "ts-lead-dev"))
+
+    def test_never_into_a_server_it_did_not_start(self):
+        """ts-agents runs the manager on `tmux -L ts-<name>`: a start of the same name must not land inside it."""
+        (self.tmp / "tmux").mkdir(mode=0o700)
+        sock = self.tmp / "tmux" / "ts-appdev"
+        subprocess.run([TMUX, "-S", str(sock), "new-session", "-d", "-s", "AppDev", "-n", "mgr", "sleep 30"],
+                       check=True)
+        r = self.run_one()
+        self.assertEqual((r["error"], r["field"]), ("running", "name"))
+        self.assertEqual(self.sessions(sock), ["AppDev:mgr"])
+        self.assertEqual(self.argvs(0.3), [])
+
+    def test_the_limit_counts_every_server_and_the_old_one(self):
+        self.config(max_running=3)
+        subprocess.run([TMUX, "-S", str(self.tmp / "legacy"), "new-session", "-d", "-s", start.SESSION, "-n", "old",
+                        "sleep 30"], check=True)
+        r = self.run_one(name="old")
+        self.assertEqual(r["error"], "running")  # a window of that name on the old shared server
+        self.assertNotIn("error", self.run_one(name="a"))
+        self.assertNotIn("error", self.run_one(name="b"))
+        self.assertEqual(self.run_one(name="c")["error"], "limit")
+
+    def test_the_agent_gets_a_clean_environment(self):
+        with mock.patch.dict(os.environ, {"SSH_CONNECTION": "100.64.0.9 5 100.64.0.1 22", "LD_PRELOAD": "/x.so",
+                                          "TMUX_TMPDIR": "/tmp/elsewhere"}):
+            self.assertNotIn("error", self.run_one())
+        self.argvs()
+        env = dict(line.split("=", 1) for line in next(self.bin.glob("env.*")).read_text().splitlines() if "=" in line)
+        for k in ("SSH_CONNECTION", "LD_PRELOAD", "TMUX_TMPDIR"):
+            self.assertNotIn(k, env)
+        self.assertEqual(env["TAILSHARE_AGENT_NAME"], "AppDev")
+        self.assertTrue(env["TMUX"].startswith(str(self.tmp / "tmux" / "ts-appdev") + ","))
+
+    def test_a_folder_others_can_use_is_refused(self):
+        (self.tmp / "tmux").mkdir(mode=0o755)
+        (self.tmp / "tmux").chmod(0o755)
+        self.assertEqual(self.run_one()["error"], "no_tmux")
+        self.assertEqual(self.argvs(0.3), [])
+
+
+@unittest.skipUnless(TMUX, "needs tmux")
 class Confirm(Base):
     def test_start_runs_once(self):
         plan = self.dry(self.item(instructions='Role "x"\n-y', prompt="hello"))[0]
@@ -432,7 +517,7 @@ class OverSSH(Base):
         py.write_text(f"""#!/bin/sh
 [ "$1 $2 $3" = "-I -m tailshare" ] || exit 9
 shift 3
-exec env FAKE_AGENT_TMUX={self.tmp / 'sock'} {sys.executable} -I -c 'import runpy, sys; sys.path.insert(0, "{Path(__file__).parents[1]}"); \\
+exec {sys.executable} -I -c 'import runpy, sys; sys.path.insert(0, "{Path(__file__).parents[1]}"); \\
 runpy.run_module("tailshare", run_name="__main__", alter_sys=True)' "$@"
 """)
         py.chmod(0o755)

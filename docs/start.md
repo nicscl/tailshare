@@ -1,7 +1,7 @@
 # Starting sessions from a device
 
 A device of yours (the Hive app on a phone or iPad) can start a Claude Code or Codex session on one of your
-machines, in a new tmux window there, and then attach to it like any other agent. It is **off** on every
+machines, on a tmux server of its own there, and then attach to it like any other agent. It is **off** on every
 machine until that machine's own config turns it on, and it needs a separate key that a person approves.
 
 ## Turning it on
@@ -29,7 +29,7 @@ machine that should accept starts.
 - `kinds`: which agents may be started, and which options a device may set for each. A kind or option missing
   here is refused. `bin` is optional: by default the agent is looked up in `~/.local/bin`, `~/.claude/local`,
   `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and must not be writable by others.
-- `max_running`: how many windows tailshare-started sessions may have open at once (1 to 100, default 12).
+- `max_running`: how many tailshare-started agents may run at once (1 to 100, default 12).
 - `skip_permissions`: whether a session may run with permissions skipped at all (see below). Default false.
 - `auto`: whether a Claude session may run in auto mode (`permission_mode: auto`, see below). Default false.
 
@@ -114,7 +114,16 @@ never attaches to the returned pane directly.
 
 ### How the session is started
 
-- In a new window of tmux session `tailshare-start` on your default tmux server, named after the session.
+- On its own tmux server, `/tmp/tmux-<uid>/ts-<name>` (the one `tmux -L ts-<name>` reaches), never your
+  default server: a crash or `kill-server` there takes down one agent, not all of them. The server holds one
+  session, `tailshare-start` (or `squad-<squad>` for a squad member), with one window named after the agent.
+  The folder must be this user's and closed to others (0700), or the start is refused (`no_tmux`).
+- If a server of that name already has any session, the start is refused (`running`), so a start never lands
+  inside a server it did not make (such as one `ts-agents` runs).
+- The server, and so the agent, starts with a clean environment: HOME, USER, LOGNAME, SHELL, a fixed PATH,
+  LANG and TERM, plus the variables below. Nothing from the ssh login or the gate's own process.
+- Its pane is (socket, pane) everywhere, in the answer, in `/hello` and at the gate: `%N` alone is never enough,
+  since every server numbers its panes from `%0`.
 - As argv, never through a shell. Every option is one `--flag=value` element, so a value can never be read as
   another flag. The prompt is one element after `--`. Names lose control and format characters and must then
   be 1 to 64 characters; model and effort must match `[A-Za-z0-9._-]{1,64}`; `resume` must be a UUID; `add_dirs`
@@ -152,7 +161,8 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 
 - 32 items per request; 6 confirms a minute per key; 128 open (unconfirmed) plans per key (`rate`, with
   `retry_after` in seconds).
-- `max_running` windows across tailshare's sessions (`limit`).
+- `max_running` started agents at once, counted over every `ts-*` server plus windows that older versions
+  started on the default server (`limit`).
 
 | error | meaning |
 |---|---|

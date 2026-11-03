@@ -46,9 +46,16 @@ PROMPT_MAX = 8 * 1024
 INSTRUCTIONS_MAX = 4 * 1024
 NAME_MAX = 64
 MAX_DIRS = 8
-# "": the user's default tmux server, the one /hello's panes are on. Tests use a private one, set in-process or by
-# `ssh-gate --tmux-socket` on the key's command= line: never from the environment, which an ssh client may send
+# Each started agent runs on its own tmux server, <TMUX_DIR>/ts-<name> (what `tmux -L ts-<name>` names), never
+# the user's default one: a crash or `kill-server` there takes one agent down, not all. "": tmux's own per-user
+# folder, /tmp/tmux-<uid>. TMUX_SOCKET pins every start to one server instead (tests: in-process or by
+# `ssh-gate --tmux-socket` on the key's command= line). Neither comes from the environment, which an ssh client
+# may send.
 TMUX_SOCKET = ""
+TMUX_DIR = ""
+LABEL = "ts-"
+# where starts went before each agent had its own server: "" is the default server (tests: a private one)
+LEGACY_SOCKET = ""
 SESSION = "tailshare-start"
 INSTRUCTIONS = "<instructions>"  # stands for the instructions in a plan's argv
 PROMPT = "<prompt>"  # and the prompt
@@ -414,47 +421,112 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
 # --------------------------------------------------------------------------- tmux
 
 
-def _tmux() -> list[str]:
+def _tmux_bin() -> str:
     from .keys import tmux_binary
 
     t = tmux_binary("")
     if not t:
         raise Refused("no_tmux", reason="no tmux binary that only this user or root can change")
-    return [t, *(["-S", TMUX_SOCKET] if TMUX_SOCKET else [])]
+    return t
 
 
-def _windows(tmux: list[str]) -> list[tuple[str, str]]:
-    """(session, window name) of every window tailshare started, on the server it starts them on."""
-    r = subprocess.run([*tmux, "list-windows", "-a", "-F", "#{session_name}\t#{window_name}"],
-                       capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
-    rows = [tuple(line.split("\t", 1)) for line in r.stdout.splitlines() if "\t" in line] if r.returncode == 0 else []
-    return [(s, w) for s, w in rows if s == SESSION or s.startswith("squad-")]
+def tmux_dir() -> Path:
+    """The folder of the agents' own servers: this user's, and nobody else may write to it."""
+    d = Path(TMUX_DIR or f"/tmp/tmux-{os.getuid()}")
+    try:
+        d.mkdir(mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+    except OSError as e:
+        raise Refused("no_tmux", reason=f"cannot use {d}: {e.strerror}") from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refused("no_tmux", reason=f"{d} must be a folder only this user can use (0700)")
+    return d
+
+
+def socket_for(name: str) -> str:
+    """The server a started agent called `name` runs on."""
+    return TMUX_SOCKET or str(tmux_dir() / (LABEL + slug(name)))
+
+
+def _servers() -> list[str]:
+    """Every server started agents may be on: the pinned one, or the default (older starts) and each ts-* one."""
+    if TMUX_SOCKET:
+        return [TMUX_SOCKET]
+    own = []
+    for p in sorted(tmux_dir().iterdir()):
+        try:
+            st = os.lstat(p)
+        except OSError:  # gone in between
+            continue
+        if p.name.startswith(LABEL) and stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            own.append(str(p))
+    return [LEGACY_SOCKET, *own]
+
+
+def _windows(t: str) -> list[tuple[str, str, str]]:
+    """(socket, session, window name) of every window tailshare started, on any server it starts them on."""
+    out = []
+    for sock in _servers():
+        try:
+            r = subprocess.run([t, *(["-S", sock] if sock else []), "list-windows", "-a", "-F",
+                                "#{session_name}\t#{window_name}"],
+                               capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        rows = [line.split("\t", 1) for line in r.stdout.splitlines() if "\t" in line] if r.returncode == 0 else []
+        out += [(sock, s, w) for s, w in rows if s == SESSION or s.startswith("squad-")]
+    return out
+
+
+def _sessions(t: str, sock: str) -> list[str]:
+    try:
+        r = subprocess.run([t, "-S", sock, "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True,
+                           timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def server_env() -> dict:
+    """What a new agent server starts with, and so every agent on it: who this user is, and nothing an ssh client
+    or the gate's own process sent (SSH_CONNECTION would make the bus take the agent for the device's user)."""
+    import pwd
+
+    pw = pwd.getpwuid(os.getuid())
+    return {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "SHELL": pw.pw_shell or "/bin/sh",
+            "PATH": SAFE_PATH, "LANG": "en_US.UTF-8", "TERM": "xterm-256color"}
 
 
 def launch(plan: dict, max_running: int) -> dict:
-    tmux = _tmux()
-    wins = _windows(tmux)
-    t = plan["tmux"]
-    if (t["session"], t["window"]) in wins:
-        raise Refused("running", "name", "a session with this name that tailshare started is still running")
+    t = _tmux_bin()
+    sock = socket_for(plan["name"])
+    wins = _windows(t)
+    w = plan["tmux"]
+    if any((s, n) == (w["session"], w["window"]) for _, s, n in wins) or (not TMUX_SOCKET and _sessions(t, sock)):
+        raise Refused("running", "name", "a session with this name is still running here")
     if len(wins) >= max_running:
         raise Refused("limit", reason=f"{len(wins)} started sessions are running here (at most {max_running})")
     env = [x for k, v in sorted(plan["env"].items()) for x in ("-e", f"{k}={v}")]
     fmt = ["-P", "-F", "#{pane_id}\t#{socket_path}"]
     argv = argv_for(plan["kind"], plan["argv"][0], plan["cwd"], plan["name"], plan["options"], plan["instructions"],
                     plan["prompt"], plan["session"])
-    common = ["-n", t["window"], "-c", plan["cwd"], *env, *fmt, "--", *argv]
-    has = subprocess.run([*tmux, "has-session", "-t", "=" + t["session"]], capture_output=True, timeout=10,
-                         stdin=subprocess.DEVNULL).returncode == 0
-    cmd = ["new-window", "-d", "-t", f"={t['session']}:"] if has else ["new-session", "-d", "-s", t["session"]]
-    r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
-    if r.returncode != 0 and not has:  # another start made the session in between
-        cmd = ["new-window", "-d", "-t", f"={t['session']}:"]
-        r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
-    pane, _, sock = r.stdout.strip().partition("\t")
+    common = ["-n", w["window"], "-c", plan["cwd"], *env, *fmt, "--", *argv]
+    tmux = [t, "-S", sock]
+    has = bool(TMUX_SOCKET) and subprocess.run([*tmux, "has-session", "-t", "=" + w["session"]], capture_output=True,
+                                               timeout=10, stdin=subprocess.DEVNULL).returncode == 0
+    cmd = ["new-window", "-d", "-t", f"={w['session']}:"] if has else ["new-session", "-d", "-s", w["session"]]
+    r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                       env=server_env())
+    if r.returncode != 0 and not has and TMUX_SOCKET:  # another start made the session in between
+        cmd = ["new-window", "-d", "-t", f"={w['session']}:"]
+        r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                       env=server_env())
+    pane, _, got = r.stdout.strip().partition("\t")
+    if r.returncode != 0 and not TMUX_SOCKET and "duplicate session" in r.stderr:  # the same name, started just now
+        raise Refused("running", "name", "a session with this name is still running here")
     if r.returncode != 0 or not re.fullmatch(r"%[0-9]+", pane):
         raise Refused("failed", reason=(r.stderr.strip() or "tmux did not start the window")[:200])
-    return {"session": plan["session"], "tmux": {"socket": sock, "pane": pane, "bin": tmux[0]}}
+    return {"session": plan["session"], "tmux": {"socket": got, "pane": pane, "bin": t}}
 
 
 # --------------------------------------------------------------------------- plan store
