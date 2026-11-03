@@ -61,8 +61,8 @@ An op is one of:
 Answer: `200 {suggestion}`.
 
 **Limits.**
-- Per squad: 20 pending.
-- Per agent: 3 pending, and 10 new suggestions an hour.
+- Per squad: 20 pending. Stale suggestions do not consume pending quotas.
+- Per agent: 3 pending across squads, and 10 new suggestions an hour (including ones now stale).
 - A suggestion expires 7 days after it is made.
 - A second suggestion with the same `base` and `ops` as a pending one returns that pending one.
 
