@@ -23,10 +23,12 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -534,7 +536,7 @@ def launch(plan: dict, max_running: int) -> dict:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, key TEXT NOT NULL, item TEXT NOT NULL, plan TEXT NOT NULL,
-  created REAL NOT NULL, expires REAL NOT NULL, used REAL, result TEXT);
+  created REAL NOT NULL, expires REAL NOT NULL, used REAL, result TEXT, approved REAL, launched REAL);
 CREATE TABLE IF NOT EXISTS confirms(key TEXT NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS member_starts(squad TEXT NOT NULL, member TEXT NOT NULL, instructions_sha256 TEXT NOT NULL,
   at REAL NOT NULL, PRIMARY KEY(squad, member));
@@ -549,6 +551,10 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
         con = sqlite3.connect(str(path), timeout=10, isolation_level=None)
         con.row_factory = sqlite3.Row
         con.executescript(SCHEMA)
+        have = {r["name"] for r in con.execute("PRAGMA table_info(plans)")}
+        for col in ("approved", "launched"):  # a start.db from before the bus launched plans
+            if col not in have:
+                con.execute(f"ALTER TABLE plans ADD COLUMN {col} REAL")
     finally:
         os.umask(old)
     now = time.time()
@@ -653,7 +659,8 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
                           + str(e.out.get("reason") or e.out["error"])) from None
         if _canon(plan) != row["plan"]:
             raise Refused("changed", reason="the plan is no longer what was shown; dry-run again")
-        result = launch(plan, cfg["max_running"])
+        con.execute("UPDATE plans SET approved=? WHERE id=?", (time.time(), pid))
+        result = via_bus(pid)
     except Refused as e:
         con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(e.out), pid))
         raise
@@ -691,6 +698,146 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             con.close()
     except Refused as e:
         return {"v": 1, **e.out}
+
+
+# --------------------------------------------------------------------------- launching, in the bus
+#
+# The gate runs under sshd, in an audit session of its own: an agent server started there could not reach the
+# login keychain (Claude's sign-in). So the gate only approves a plan, and asks the bus, which runs in the user's
+# GUI session, to launch it: one line, {"v":1,"launch":"<plan id>"}, over a unix socket in a 0700 folder of the
+# state dir, from this user only. The bus takes nothing else from the request. It loads the plan from start.db
+# itself and launches it only if the gate approved it moments ago and it was never launched, so whatever
+# reaches the socket can launch no more than a plan a device signed and confirmed, once.
+
+APPROVED_FOR = 30  # seconds the bus takes to launch a plan the gate approved
+LAUNCH_WAIT = 30
+
+
+def launch_socket() -> Path:
+    return bus.STATE_DIR / "launch" / "sock"
+
+
+def _peer_uid(conn: socket.socket) -> int | None:
+    try:
+        if sys.platform == "darwin":  # SOL_LOCAL, LOCAL_PEERCRED: struct xucred {u_int version; uid_t uid; ...}
+            raw = conn.getsockopt(0, 0x001, 76)
+            return int.from_bytes(raw[4:8], sys.byteorder)
+        raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)  # struct ucred {pid; uid; gid}
+        return int.from_bytes(raw[4:8], sys.byteorder)
+    except OSError:
+        return None
+
+
+def launch_approved(pid: object) -> dict:
+    """In the bus: launch the plan `pid` if the gate approved it just now and nobody launched it yet."""
+    try:
+        if not isinstance(pid, str) or not _PLAN_ID.fullmatch(pid):
+            raise Refused("unknown_plan")
+        con = _db()
+        try:
+            now = time.time()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
+                if (row is None or row["used"] is None or row["approved"] is None or row["launched"] is not None
+                        or row["result"] is not None or row["approved"] < now - APPROVED_FOR):
+                    raise Refused("unknown_plan")  # forged, replayed, or never confirmed
+                con.execute("UPDATE plans SET launched=? WHERE id=?", (now, pid))
+            finally:
+                con.execute("COMMIT")
+        finally:
+            con.close()
+        cfg = load_config()
+        if not cfg or not cfg["roots"] or not cfg["kinds"]:
+            raise Refused("off", reason="starting sessions is off on this host")
+        return launch(json.loads(row["plan"]), cfg["max_running"])
+    except Refused as e:
+        return e.out
+
+
+def _serve_one(conn: socket.socket) -> None:
+    with conn:
+        conn.settimeout(10)
+        try:
+            if _peer_uid(conn) != os.getuid():
+                return
+            raw = b""
+            while b"\n" not in raw and len(raw) <= 256:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                raw += chunk
+            try:
+                req = json.loads(raw.split(b"\n", 1)[0])
+            except ValueError:
+                req = None
+            if not isinstance(req, dict) or req.get("v") != 1 or set(req) != {"v", "launch"}:
+                out = {"error": "bad_request"}
+            else:
+                out = launch_approved(req["launch"])
+            conn.sendall(json.dumps(out).encode() + b"\n")
+        except OSError:
+            pass
+
+
+def serve_launches() -> socket.socket:
+    """In the bus: listen for launches. Returns the listening socket (close it to stop)."""
+    path = launch_socket()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path.parent)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise OSError(f"{path.parent} must be a folder only this user can use (0700)")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o177)
+    try:
+        srv.bind(str(path))
+    finally:
+        os.umask(old)
+    srv.listen(16)
+
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return  # closed
+            threading.Thread(target=_serve_one, args=(conn,), daemon=True, name="start-launch").start()
+
+    threading.Thread(target=loop, daemon=True, name="start-launches").start()
+    return srv
+
+
+def via_bus(pid: str) -> dict:
+    """In the gate: have the bus launch the approved plan `pid`. Never launches it here."""
+    path = launch_socket()
+    try:
+        st = os.lstat(path.parent)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise Refused("no_bus", reason="the bus's launch folder is not this user's alone")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(LAUNCH_WAIT)
+            c.connect(str(path))
+            c.sendall(json.dumps({"v": 1, "launch": pid}).encode() + b"\n")
+            raw = b""
+            while b"\n" not in raw and len(raw) < 65536:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+        out = json.loads(raw.split(b"\n", 1)[0])
+    except (OSError, ValueError):
+        raise Refused("no_bus", reason="the bus is not running here; start it with `tailshare serve`") from None
+    if not isinstance(out, dict):
+        raise Refused("no_bus", reason="the bus gave no answer")
+    if "error" in out:
+        e = Refused("x")
+        e.out = out
+        raise e
+    return out
 
 
 SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"

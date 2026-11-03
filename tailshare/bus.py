@@ -1240,6 +1240,12 @@ def start_bus() -> Bus | None:
     except Exception as e:  # noqa: BLE001
         log(f"not started: {e!r}")
         return None
+    try:  # sessions a device starts are launched here, in the user's GUI session (start.via_bus)
+        from . import start as start_mod
+
+        start_mod.serve_launches()
+    except Exception as e:  # noqa: BLE001
+        log(f"start: cannot take launches: {e!r}")
     try:
         from . import sessions
 

@@ -8,9 +8,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -58,6 +60,9 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(self._kill_tmux)
         self.config()
+        # the bus's side: confirms are launched there (start.via_bus)
+        self.launcher = start.serve_launches()
+        self.addCleanup(self.launcher.close)
 
     def _kill_tmux(self):
         if TMUX:
@@ -265,6 +270,96 @@ class Plans(Base):
     def test_store_is_private(self):
         self.dry(self.item())
         self.assertEqual((self.state / "start.db").stat().st_mode & 0o777, 0o600)
+
+
+@unittest.skipUnless(TMUX, "needs tmux")
+class InTheBus(Base):
+    """The gate approves; the bus launches. The socket says only which plan, and the bus checks it."""
+
+    def ask(self, req: bytes) -> dict:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(10)
+            c.connect(str(start.launch_socket()))
+            c.sendall(req)
+            return json.loads(c.makefile("rb").readline())
+
+    def test_launched_by_the_bus_not_the_gate(self):
+        where, real = [], start.launch
+        def launch(plan, max_running):
+            where.append(threading.current_thread().name)
+            return real(plan, max_running)
+        with mock.patch.object(start, "launch", launch):
+            got = self.confirm(self.dry(self.item())[0]["plan_id"])["results"][0]
+        self.assertNotIn("error", got, got)
+        self.assertEqual(where, ["start-launch"])  # the bus's thread, never the gate's
+        self.assertEqual(len(self.argvs()), 1)
+
+    def test_forged_and_replayed_ids_are_refused(self):
+        pid = self.dry(self.item())[0]["plan_id"]
+        self.assertEqual(self.ask(json.dumps({"v": 1, "launch": pid}).encode() + b"\n")["error"], "unknown_plan")
+        self.assertEqual(self.ask(b'{"v":1,"launch":"' + b"0" * 32 + b'"}\n')["error"], "unknown_plan")
+        self.assertEqual(self.ask(b'{"v":1,"launch":"../x"}\n')["error"], "unknown_plan")
+        self.assertEqual(self.ask(b'{"v":1,"launch":"%s","argv":["sh"]}\n' % pid.encode())["error"], "bad_request")
+        self.assertEqual(self.ask(b"nonsense\n")["error"], "bad_request")
+        self.assertEqual(self.argvs(0.3), [])
+        self.assertNotIn("error", self.confirm(pid)["results"][0])  # the real confirm still works
+        self.assertEqual(self.ask(json.dumps({"v": 1, "launch": pid}).encode() + b"\n")["error"], "unknown_plan")
+        time.sleep(0.3)
+        self.assertEqual(len(self.argvs()), 1)  # launched once
+
+    def mark(self, pid, **cols):
+        con = start._db()
+        for k, v in cols.items():
+            con.execute(f"UPDATE plans SET {k}=? WHERE id=?", (v, pid))
+        con.close()
+
+    def launch_req(self, pid):
+        return json.dumps({"v": 1, "launch": pid}).encode() + b"\n"
+
+    def test_confirmed_but_not_approved_is_refused(self):
+        """used is set before the gate's checks (rebuild, changed): only approved says they passed."""
+        pid = self.dry(self.item())[0]["plan_id"]
+        self.mark(pid, used=time.time())
+        self.assertEqual(self.ask(self.launch_req(pid))["error"], "unknown_plan")
+        self.assertEqual(self.argvs(0.3), [])
+
+    def test_replayed_before_the_result_is_written(self):
+        """The gate writes the result only after the bus answers: a replay in between still launches nothing."""
+        pid = self.dry(self.item())[0]["plan_id"]
+        self.mark(pid, used=time.time(), approved=time.time())
+        self.assertNotIn("error", self.ask(self.launch_req(pid)))
+        self.assertEqual(self.ask(self.launch_req(pid))["error"], "unknown_plan")
+        time.sleep(0.3)
+        self.assertEqual(len(self.argvs()), 1)
+
+    def test_an_approval_goes_stale(self):
+        pid = self.dry(self.item())[0]["plan_id"]
+        con = start._db()
+        con.execute("UPDATE plans SET used=?, approved=? WHERE id=?",
+                    (time.time(), time.time() - start.APPROVED_FOR - 1, pid))
+        con.close()
+        self.assertEqual(self.ask(json.dumps({"v": 1, "launch": pid}).encode() + b"\n")["error"], "unknown_plan")
+        self.assertEqual(self.argvs(0.3), [])
+
+    def test_only_this_user(self):
+        with mock.patch.object(start, "_peer_uid", return_value=os.getuid() + 1):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(10)
+                c.connect(str(start.launch_socket()))
+                c.sendall(b'{"v":1,"launch":"' + b"0" * 32 + b'"}\n')
+                self.assertEqual(c.recv(100), b"")  # hung up on, unanswered
+        self.assertEqual(self.argvs(0.3), [])
+        a, b = socket.socketpair()
+        with a, b:
+            self.assertEqual(start._peer_uid(a), os.getuid())
+        self.assertEqual(os.stat(start.launch_socket().parent).st_mode & 0o777, 0o700)
+
+    def test_no_bus_no_start(self):
+        self.launcher.close()
+        start.launch_socket().unlink()
+        r = self.confirm(self.dry(self.item())[0]["plan_id"])["results"][0]
+        self.assertEqual(r["error"], "no_bus")
+        self.assertEqual(self.argvs(0.3), [])
 
 
 @unittest.skipUnless(TMUX, "needs tmux")

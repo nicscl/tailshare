@@ -114,6 +114,14 @@ never attaches to the returned pane directly.
 
 ### How the session is started
 
+- By the bus (`tailshare serve`), not by the ssh gate. The gate runs under sshd, in an audit session of its own,
+  and an agent started there could not reach the login keychain, where Claude keeps its sign-in. So the gate
+  checks the confirm and approves the plan, then asks the bus, which runs in your GUI session, over a unix
+  socket in `~/.tailshare/launch/` (0700, this user only) to launch it. The request names only the plan. The
+  bus loads it from `start.db` itself and launches it only if the gate approved it in the last 30 seconds and
+  nobody launched it before, so nothing that reaches the socket can launch more than a plan a device signed
+  and confirmed, once. Without the bus running, the start is refused (`no_bus`); it never falls back to
+  launching under sshd.
 - On its own tmux server, `/tmp/tmux-<uid>/ts-<name>` (the one `tmux -L ts-<name>` reaches), never your
   default server: a crash or `kill-server` there takes down one agent, not all of them. The server holds one
   session, `tailshare-start` (or `squad-<squad>` for a squad member), with one window named after the agent.
@@ -176,6 +184,7 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 | `expired` / `unknown_plan` / `changed` | dry run again |
 | `root` | tailshare runs as root here |
 | `failed` | tmux refused; `reason` says why |
+| `no_bus` | the bus is not running on this host, so nothing was launched |
 
 ## What a device can see
 
