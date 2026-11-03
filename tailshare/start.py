@@ -23,10 +23,12 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -46,9 +48,16 @@ PROMPT_MAX = 8 * 1024
 INSTRUCTIONS_MAX = 4 * 1024
 NAME_MAX = 64
 MAX_DIRS = 8
-# "": the user's default tmux server, the one /hello's panes are on. Tests use a private one, set in-process or by
-# `ssh-gate --tmux-socket` on the key's command= line: never from the environment, which an ssh client may send
+# Each started agent runs on its own tmux server, <TMUX_DIR>/ts-<name> (what `tmux -L ts-<name>` names), never
+# the user's default one: a crash or `kill-server` there takes one agent down, not all. "": tmux's own per-user
+# folder, /tmp/tmux-<uid>. TMUX_SOCKET pins every start to one server instead (tests: in-process or by
+# `ssh-gate --tmux-socket` on the key's command= line). Neither comes from the environment, which an ssh client
+# may send.
 TMUX_SOCKET = ""
+TMUX_DIR = ""
+LABEL = "ts-"
+# where starts went before each agent had its own server: "" is the default server (tests: a private one)
+LEGACY_SOCKET = ""
 SESSION = "tailshare-start"
 INSTRUCTIONS = "<instructions>"  # stands for the instructions in a plan's argv
 PROMPT = "<prompt>"  # and the prompt
@@ -414,47 +423,112 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
 # --------------------------------------------------------------------------- tmux
 
 
-def _tmux() -> list[str]:
+def _tmux_bin() -> str:
     from .keys import tmux_binary
 
     t = tmux_binary("")
     if not t:
         raise Refused("no_tmux", reason="no tmux binary that only this user or root can change")
-    return [t, *(["-S", TMUX_SOCKET] if TMUX_SOCKET else [])]
+    return t
 
 
-def _windows(tmux: list[str]) -> list[tuple[str, str]]:
-    """(session, window name) of every window tailshare started, on the server it starts them on."""
-    r = subprocess.run([*tmux, "list-windows", "-a", "-F", "#{session_name}\t#{window_name}"],
-                       capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
-    rows = [tuple(line.split("\t", 1)) for line in r.stdout.splitlines() if "\t" in line] if r.returncode == 0 else []
-    return [(s, w) for s, w in rows if s == SESSION or s.startswith("squad-")]
+def tmux_dir() -> Path:
+    """The folder of the agents' own servers: this user's, and nobody else may write to it."""
+    d = Path(TMUX_DIR or f"/tmp/tmux-{os.getuid()}")
+    try:
+        d.mkdir(mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+    except OSError as e:
+        raise Refused("no_tmux", reason=f"cannot use {d}: {e.strerror}") from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refused("no_tmux", reason=f"{d} must be a folder only this user can use (0700)")
+    return d
+
+
+def socket_for(name: str) -> str:
+    """The server a started agent called `name` runs on."""
+    return TMUX_SOCKET or str(tmux_dir() / (LABEL + slug(name)))
+
+
+def _servers() -> list[str]:
+    """Every server started agents may be on: the pinned one, or the default (older starts) and each ts-* one."""
+    if TMUX_SOCKET:
+        return [TMUX_SOCKET]
+    own = []
+    for p in sorted(tmux_dir().iterdir()):
+        try:
+            st = os.lstat(p)
+        except OSError:  # gone in between
+            continue
+        if p.name.startswith(LABEL) and stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            own.append(str(p))
+    return [LEGACY_SOCKET, *own]
+
+
+def _windows(t: str) -> list[tuple[str, str, str]]:
+    """(socket, session, window name) of every window tailshare started, on any server it starts them on."""
+    out = []
+    for sock in _servers():
+        try:
+            r = subprocess.run([t, *(["-S", sock] if sock else []), "list-windows", "-a", "-F",
+                                "#{session_name}\t#{window_name}"],
+                               capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        rows = [line.split("\t", 1) for line in r.stdout.splitlines() if "\t" in line] if r.returncode == 0 else []
+        out += [(sock, s, w) for s, w in rows if s == SESSION or s.startswith("squad-")]
+    return out
+
+
+def _sessions(t: str, sock: str) -> list[str]:
+    try:
+        r = subprocess.run([t, "-S", sock, "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True,
+                           timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def server_env() -> dict:
+    """What a new agent server starts with, and so every agent on it: who this user is, and nothing an ssh client
+    or the gate's own process sent (SSH_CONNECTION would make the bus take the agent for the device's user)."""
+    import pwd
+
+    pw = pwd.getpwuid(os.getuid())
+    return {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "SHELL": pw.pw_shell or "/bin/sh",
+            "PATH": SAFE_PATH, "LANG": "en_US.UTF-8", "TERM": "xterm-256color"}
 
 
 def launch(plan: dict, max_running: int) -> dict:
-    tmux = _tmux()
-    wins = _windows(tmux)
-    t = plan["tmux"]
-    if (t["session"], t["window"]) in wins:
-        raise Refused("running", "name", "a session with this name that tailshare started is still running")
+    t = _tmux_bin()
+    sock = socket_for(plan["name"])
+    wins = _windows(t)
+    w = plan["tmux"]
+    if any((s, n) == (w["session"], w["window"]) for _, s, n in wins) or (not TMUX_SOCKET and _sessions(t, sock)):
+        raise Refused("running", "name", "a session with this name is still running here")
     if len(wins) >= max_running:
         raise Refused("limit", reason=f"{len(wins)} started sessions are running here (at most {max_running})")
     env = [x for k, v in sorted(plan["env"].items()) for x in ("-e", f"{k}={v}")]
     fmt = ["-P", "-F", "#{pane_id}\t#{socket_path}"]
     argv = argv_for(plan["kind"], plan["argv"][0], plan["cwd"], plan["name"], plan["options"], plan["instructions"],
                     plan["prompt"], plan["session"])
-    common = ["-n", t["window"], "-c", plan["cwd"], *env, *fmt, "--", *argv]
-    has = subprocess.run([*tmux, "has-session", "-t", "=" + t["session"]], capture_output=True, timeout=10,
-                         stdin=subprocess.DEVNULL).returncode == 0
-    cmd = ["new-window", "-d", "-t", f"={t['session']}:"] if has else ["new-session", "-d", "-s", t["session"]]
-    r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
-    if r.returncode != 0 and not has:  # another start made the session in between
-        cmd = ["new-window", "-d", "-t", f"={t['session']}:"]
-        r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
-    pane, _, sock = r.stdout.strip().partition("\t")
+    common = ["-n", w["window"], "-c", plan["cwd"], *env, *fmt, "--", *argv]
+    tmux = [t, "-S", sock]
+    has = bool(TMUX_SOCKET) and subprocess.run([*tmux, "has-session", "-t", "=" + w["session"]], capture_output=True,
+                                               timeout=10, stdin=subprocess.DEVNULL).returncode == 0
+    cmd = ["new-window", "-d", "-t", f"={w['session']}:"] if has else ["new-session", "-d", "-s", w["session"]]
+    r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                       env=server_env())
+    if r.returncode != 0 and not has and TMUX_SOCKET:  # another start made the session in between
+        cmd = ["new-window", "-d", "-t", f"={w['session']}:"]
+        r = subprocess.run([*tmux, *cmd, *common], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                       env=server_env())
+    pane, _, got = r.stdout.strip().partition("\t")
+    if r.returncode != 0 and not TMUX_SOCKET and "duplicate session" in r.stderr:  # the same name, started just now
+        raise Refused("running", "name", "a session with this name is still running here")
     if r.returncode != 0 or not re.fullmatch(r"%[0-9]+", pane):
         raise Refused("failed", reason=(r.stderr.strip() or "tmux did not start the window")[:200])
-    return {"session": plan["session"], "tmux": {"socket": sock, "pane": pane, "bin": tmux[0]}}
+    return {"session": plan["session"], "tmux": {"socket": got, "pane": pane, "bin": t}}
 
 
 # --------------------------------------------------------------------------- plan store
@@ -462,7 +536,7 @@ def launch(plan: dict, max_running: int) -> dict:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, key TEXT NOT NULL, item TEXT NOT NULL, plan TEXT NOT NULL,
-  created REAL NOT NULL, expires REAL NOT NULL, used REAL, result TEXT);
+  created REAL NOT NULL, expires REAL NOT NULL, used REAL, result TEXT, approved REAL, launched REAL);
 CREATE TABLE IF NOT EXISTS confirms(key TEXT NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS member_starts(squad TEXT NOT NULL, member TEXT NOT NULL, instructions_sha256 TEXT NOT NULL,
   at REAL NOT NULL, PRIMARY KEY(squad, member));
@@ -477,6 +551,10 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
         con = sqlite3.connect(str(path), timeout=10, isolation_level=None)
         con.row_factory = sqlite3.Row
         con.executescript(SCHEMA)
+        have = {r["name"] for r in con.execute("PRAGMA table_info(plans)")}
+        for col in ("approved", "launched"):  # a start.db from before the bus launched plans
+            if col not in have:
+                con.execute(f"ALTER TABLE plans ADD COLUMN {col} REAL")
     finally:
         os.umask(old)
     now = time.time()
@@ -581,7 +659,8 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
                           + str(e.out.get("reason") or e.out["error"])) from None
         if _canon(plan) != row["plan"]:
             raise Refused("changed", reason="the plan is no longer what was shown; dry-run again")
-        result = launch(plan, cfg["max_running"])
+        con.execute("UPDATE plans SET approved=? WHERE id=?", (time.time(), pid))
+        result = via_bus(pid)
     except Refused as e:
         con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(e.out), pid))
         raise
@@ -619,6 +698,146 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             con.close()
     except Refused as e:
         return {"v": 1, **e.out}
+
+
+# --------------------------------------------------------------------------- launching, in the bus
+#
+# The gate runs under sshd, in an audit session of its own: an agent server started there could not reach the
+# login keychain (Claude's sign-in). So the gate only approves a plan, and asks the bus, which runs in the user's
+# GUI session, to launch it: one line, {"v":1,"launch":"<plan id>"}, over a unix socket in a 0700 folder of the
+# state dir, from this user only. The bus takes nothing else from the request. It loads the plan from start.db
+# itself and launches it only if the gate approved it moments ago and it was never launched, so whatever
+# reaches the socket can launch no more than a plan a device signed and confirmed, once.
+
+APPROVED_FOR = 30  # seconds the bus takes to launch a plan the gate approved
+LAUNCH_WAIT = 30
+
+
+def launch_socket() -> Path:
+    return bus.STATE_DIR / "launch" / "sock"
+
+
+def _peer_uid(conn: socket.socket) -> int | None:
+    try:
+        if sys.platform == "darwin":  # SOL_LOCAL, LOCAL_PEERCRED: struct xucred {u_int version; uid_t uid; ...}
+            raw = conn.getsockopt(0, 0x001, 76)
+            return int.from_bytes(raw[4:8], sys.byteorder)
+        raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)  # struct ucred {pid; uid; gid}
+        return int.from_bytes(raw[4:8], sys.byteorder)
+    except OSError:
+        return None
+
+
+def launch_approved(pid: object) -> dict:
+    """In the bus: launch the plan `pid` if the gate approved it just now and nobody launched it yet."""
+    try:
+        if not isinstance(pid, str) or not _PLAN_ID.fullmatch(pid):
+            raise Refused("unknown_plan")
+        con = _db()
+        try:
+            now = time.time()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
+                if (row is None or row["used"] is None or row["approved"] is None or row["launched"] is not None
+                        or row["result"] is not None or row["approved"] < now - APPROVED_FOR):
+                    raise Refused("unknown_plan")  # forged, replayed, or never confirmed
+                con.execute("UPDATE plans SET launched=? WHERE id=?", (now, pid))
+            finally:
+                con.execute("COMMIT")
+        finally:
+            con.close()
+        cfg = load_config()
+        if not cfg or not cfg["roots"] or not cfg["kinds"]:
+            raise Refused("off", reason="starting sessions is off on this host")
+        return launch(json.loads(row["plan"]), cfg["max_running"])
+    except Refused as e:
+        return e.out
+
+
+def _serve_one(conn: socket.socket) -> None:
+    with conn:
+        conn.settimeout(10)
+        try:
+            if _peer_uid(conn) != os.getuid():
+                return
+            raw = b""
+            while b"\n" not in raw and len(raw) <= 256:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                raw += chunk
+            try:
+                req = json.loads(raw.split(b"\n", 1)[0])
+            except ValueError:
+                req = None
+            if not isinstance(req, dict) or req.get("v") != 1 or set(req) != {"v", "launch"}:
+                out = {"error": "bad_request"}
+            else:
+                out = launch_approved(req["launch"])
+            conn.sendall(json.dumps(out).encode() + b"\n")
+        except OSError:
+            pass
+
+
+def serve_launches() -> socket.socket:
+    """In the bus: listen for launches. Returns the listening socket (close it to stop)."""
+    path = launch_socket()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path.parent)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise OSError(f"{path.parent} must be a folder only this user can use (0700)")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o177)
+    try:
+        srv.bind(str(path))
+    finally:
+        os.umask(old)
+    srv.listen(16)
+
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return  # closed
+            threading.Thread(target=_serve_one, args=(conn,), daemon=True, name="start-launch").start()
+
+    threading.Thread(target=loop, daemon=True, name="start-launches").start()
+    return srv
+
+
+def via_bus(pid: str) -> dict:
+    """In the gate: have the bus launch the approved plan `pid`. Never launches it here."""
+    path = launch_socket()
+    try:
+        st = os.lstat(path.parent)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise Refused("no_bus", reason="the bus's launch folder is not this user's alone")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(LAUNCH_WAIT)
+            c.connect(str(path))
+            c.sendall(json.dumps({"v": 1, "launch": pid}).encode() + b"\n")
+            raw = b""
+            while b"\n" not in raw and len(raw) < 65536:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+        out = json.loads(raw.split(b"\n", 1)[0])
+    except (OSError, ValueError):
+        raise Refused("no_bus", reason="the bus is not running here; start it with `tailshare serve`") from None
+    if not isinstance(out, dict):
+        raise Refused("no_bus", reason="the bus gave no answer")
+    if "error" in out:
+        e = Refused("x")
+        e.out = out
+        raise e
+    return out
 
 
 SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"

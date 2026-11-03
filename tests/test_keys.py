@@ -835,6 +835,22 @@ class GateEndToEnd(unittest.TestCase):
         self.gate(f"tmux -S {self.sock} attach -r -t {self.pane}")
         self.assertEqual(self.execs, [[self.tmux, "-S", self.sock, "attach", "-r", "-t", self.pane]])
 
+    def test_a_pane_is_its_socket_and_id(self):
+        """Every server numbers panes from %0: a live, own %N on another agent's server is not this agent's."""
+        other = str(Path(tempfile.mkdtemp(dir="/tmp")) / "s")
+        self.addCleanup(subprocess.run, [self.tmux, "-S", other, "kill-server"], capture_output=True)
+        subprocess.run([self.tmux, "-S", other, "new-session", "-d", "sleep 60"], check=True)
+        twin = subprocess.run([self.tmux, "-S", other, "display", "-p", "#{pane_id}"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(twin, self.pane)
+        self.assertTrue(keys.own_socket(other))
+        for cmd in (f"tmux -S {other} attach -t {twin}", f"tmux -S {other} -C attach -r -t {twin}"):
+            with self.assertRaises(SystemExit, msg=cmd):
+                self.gate(cmd)
+        self.assertEqual(self.execs, [])
+        self.gate(f"tmux -S {self.sock} attach -t {self.pane}")
+        self.assertEqual(len(self.execs), 1)
+
     def test_control_mode_goes_through_the_filter(self):
         with mock.patch("tailshare.gate_control.run", return_value=0) as run:
             with self.assertRaises(SystemExit) as cm:
