@@ -452,6 +452,80 @@ class Edit(unittest.TestCase):
             squads_cli._human_check()
 
 
+class Tree(unittest.TestCase):
+    """reports_to: the owner writes a tree of at most 3 levels; a merged-in knot reads as top-level members."""
+
+    def setUp(self):
+        self.m = Machine(self, "air")
+        names = ["Manager", "Lead", "Dev", "Tester"]
+        self.m.put("sq", name="S", members=[{"id": f"m{i}", **member(name=n, folder=f"/u/{n}", order=i)} for i, n in enumerate(names)])
+
+    def set(self, mid, lead):
+        rev = next(x for x in self.m.squads.squad("sq")["members"] if x["id"] == mid)["rev"]
+        return self.m.patch(f"sq/members/{mid}", reports_to=lead, base_rev=rev)["member"]
+
+    def reason(self, mid, lead):
+        with self.assertRaises(squads.Bad) as c:
+            self.set(mid, lead)
+        self.assertEqual(c.exception.extra["field"], "reports_to")
+        return c.exception.extra["reason"]
+
+    def test_three_levels(self):
+        self.assertEqual(self.set("m1", "m0")["reports_to"], "m0")
+        self.set("m2", "m1")
+        self.assertIn("levels", self.reason("m3", "m2"))  # a 4th level
+        self.set("m3", "m1")
+        ms = self.m.squads.squad("sq")["members"]
+        self.assertEqual(squads.leads(ms), {"m0": None, "m1": "m0", "m2": "m1", "m3": "m1"})
+        self.assertEqual(squads.branch(ms, "m1"), {"m1", "m2", "m3"})
+        self.assertEqual(squads.branch(ms, "m0"), {"m0", "m1", "m2", "m3"})
+        self.assertIsNone(self.set("m1", None)["reports_to"])
+
+    def test_moving_a_lead_counts_its_reports(self):
+        self.set("m2", "m1")  # Lead has a report
+        self.set("m0", "m3")  # Manager under Tester
+        self.assertIn("levels", self.reason("m1", "m0"))  # Tester > Manager > Lead > Dev
+
+    def test_refusals(self):
+        self.assertIn("itself", self.reason("m1", "m1"))
+        self.assertIn("not a member", self.reason("m1", "nobody"))
+        self.reason("m1", "../x")
+        self.set("m1", "m0")
+        self.assertIn("loop", self.reason("m0", "m1"))
+        rev = next(x for x in self.m.squads.squad("sq")["members"] if x["id"] == "m1")["rev"]
+        self.m.patch("sq/members/m1", deleted=True, base_rev=rev)
+        self.assertIn("not a member", self.reason("m2", "m1"))  # a removed member leads no one
+        with self.assertRaises(squads.Bad):
+            self.m.put("new", name="N", members=[{"id": "a", **member(reports_to="b")}])
+        self.assertIsNone(self.m.squads.squad("new"))
+
+    def test_create_with_a_tree(self):
+        sq = self.m.put("new", name="N", members=[{"id": "a", **member(reports_to="b")},
+                                                   {"id": "b", **member(name="B")}])["squad"]
+        self.assertEqual({x["id"]: x["reports_to"] for x in sq["members"]}, {"a": "b", "b": None})
+
+    def test_merged_knots_read_as_top_level(self):
+        ms = [{"id": "a", "reports_to": "b"}, {"id": "b", "reports_to": "a"}, {"id": "c", "reports_to": "gone"},
+              {"id": "d", "reports_to": "c"}, {"id": "e", "reports_to": "d"}, {"id": "f", "reports_to": "e"},
+              {"id": "g", "reports_to": "a"}, {"id": "x", "deleted": True}]
+        self.assertEqual(squads.leads(ms), {"a": None, "b": None, "c": None, "d": "c", "e": "d", "f": None, "g": None})
+        # the owner can still edit another member of a squad with a knot in it
+        sq = self.m.squads.squad("sq")
+        self.m.squads.merge({**sq, "members": [{**x, "reports_to": "m1" if x["id"] == "m0" else "m0" if x["id"] == "m1"
+                                                else None, "rev": [x["rev"][0] + 1, "pro"]} for x in sq["members"]]})
+        self.assertEqual(squads.leads(self.m.squads.squad("sq")["members"])["m0"], None)
+        self.set("m2", "m3")
+        rev = next(x for x in self.m.squads.squad("sq")["members"] if x["id"] == "m0")["rev"]
+        self.m.patch("sq/members/m0", role="boss", base_rev=rev)
+
+    def test_editor_round_trip(self):
+        sq = self.m.squads.squad("sq")
+        new = squads_cli._editable(sq)
+        new["members"][1]["reports_to"] = "m0"
+        todo = squads_cli.changes(sq, new)
+        self.assertEqual([(p.rsplit("/", 1)[-1], sorted(b)) for _, p, b in todo], [("m1", ["base_rev", "reports_to"])])
+
+
 class Starting(unittest.TestCase):
     """A start item naming a squad member takes everything from this machine's copy of the squad."""
 
