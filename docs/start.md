@@ -209,7 +209,8 @@ sessions this machine ran in the last 7 days whose tmux pane is gone (or taken b
 - `resumable: false` comes with a `reason`: `kind` (only Claude sessions reopen), `off` (starting is off here, or
   claude's options do not include `resume`), `cwd` (its folder is gone or outside the roots), `name`.
 - `/hello` has `"sessions_dead": 1` where the route exists, and for the owner's devices each Claude or Codex agent
-  carries `session_id`, so a device can tell a live session from a dead one and a started tab from its agent.
+  carries `session_id`, so a device can tell a live session from a dead one and a started tab from its agent, and
+  `cwd`, the absolute folder it works in (a squad member's `folder`). Other users' devices get neither.
 
 To reopen one, a device sends an ordinary start item with `options.resume` set to the id, `cwd` the recorded
 `cwd` and `name` the recorded `name`; it is signed, dry-run and confirmed like any start and runs on its own server.

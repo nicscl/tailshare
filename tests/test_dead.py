@@ -133,6 +133,13 @@ class Hello(Base):
             self.m.bus.dead_sessions("100.2.2.2")
         self.assertEqual(c.exception.code, 403)
 
+    def test_cwd_for_the_owner_only(self):
+        self.agent(S1, ago=5)
+        self.m.net.usermap = {"100.1.1.1": "nick@example.com", "100.2.2.2": "ana@other.org", "100.3.3.3": "tagged-devices"}
+        self.assertEqual([a.get("cwd") for a in self.m.bus.hello("100.1.1.1")["agents"]], [self.app])
+        for ip in ("100.2.2.2", "100.3.3.3", ""):  # another user, a tagged device, no caller
+            self.assertFalse(any("cwd" in a for a in self.m.bus.hello(ip)["agents"]))
+
 
 class Reopen(Base):
     def item(self, sid=S1, **kw):
