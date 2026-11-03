@@ -10,7 +10,7 @@ import json
 import os
 import sys
 
-from . import __version__, agent, bus, sessions, sessions_cli, squads_cli
+from . import __version__, agent, bus, reports, sessions, sessions_cli, squads_cli
 
 TOOLS = [
     {
@@ -18,6 +18,25 @@ TOOLS = [
         "description": ("The squad this session belongs to (its members, their roles and agent addresses), or with "
                         "`squad` (a name or id) another of the user's squads. Read-only: the person edits squads."),
         "inputSchema": {"type": "object", "properties": {"squad": {"type": "string"}}},
+    },
+    {
+        "name": "report",
+        "description": ("Your own report on your squad's page, which its owner reads instead of your session. With no "
+                        "fields it returns your report. The fields you pass replace those fields: bio, now (≤3 tasks), "
+                        "next (≤5), done (today's), waiting_on, blockers (the whole list; keep an id to keep a "
+                        "blocker, resolved:true once you have the answer), notes (leads only, Markdown). A task is "
+                        "{title, url?}. A blocker is {id, kind: question|approval, title, why, options[≤4], to: "
+                        "lead|owner, for?: {member, blocker}, approval?}. With squad:true, every squadmate's report "
+                        "instead (how a lead sees its branch's blockers)."),
+        "inputSchema": {"type": "object", "properties": {
+            "bio": {"type": "string"},
+            "now": {"type": "array", "items": {"type": "object"}},
+            "next": {"type": "array", "items": {"type": "object"}},
+            "done": {"type": "array", "items": {"type": "object"}},
+            "waiting_on": {"type": ["object", "null"]},
+            "blockers": {"type": "array", "items": {"type": "object"}},
+            "notes": {"type": "string"},
+            "squad": {"type": "boolean"}}},
     },
     {
         "name": "whoami",
@@ -132,6 +151,17 @@ def _tool(name: str, args: dict) -> str:
         r = agent.call("/sessions/ask", {"ref": args["session"], "question": args["question"], "from": me["address"]},
                        timeout=sessions.ASK_TIMEOUT + 60)
         return f"{r['host']}:{r['id'][:8]} {r.get('name') or ''} answered:\n\n{r['answer']}\n\n({agent.NOTE})"
+    if name == "report":
+        if args.get("squad"):
+            tag = me.get("squad") or {}
+            if not tag:
+                return "This session is not part of a squad, so it has no report."
+            d = agent.call(f"/reports?squad={tag['id']}&all=1", timeout=30)
+            return json.dumps(d, indent=1) + f"\n\n({agent.NOTE})"
+        fields = {k: args[k] for k in reports.FIELDS if k in args}
+        if not fields:
+            return json.dumps(agent.call(f"/report?agent={me['id']}"), indent=1)
+        return json.dumps(agent.call("/report", {"agent": me["id"], **fields})["report"], indent=1)
     if name == "squad":
         ref = str(args.get("squad") or "")
         if ref:

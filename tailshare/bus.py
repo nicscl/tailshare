@@ -516,6 +516,7 @@ class Bus:
         self.sessions = None  # set by start_bus: sessions.Sessions (index, search, ask, launch)
         self.keys = None  # set by start_bus: keys.Keys (SSH keys devices ask for)
         self.squads = None  # set by start_bus: squads.Squads (docs/squads.md)
+        self.reports = None  # set by start_bus: reports.Reports (docs/reports.md)
         self.battery = power.Battery()
 
     # -- agents ---------------------------------------------------------------
@@ -1051,6 +1052,8 @@ class Bus:
             self.store.x("DELETE FROM agents WHERE last_seen<?", time.time() - 30 * 86400)
         if self.squads is not None:
             self.squads.prune()
+        if self.reports is not None:
+            self.reports.prune()
 
     # -- running --------------------------------------------------------------
     def _loop(self) -> None:
@@ -1196,6 +1199,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._reply(200, b.squads.route(method, path, body, local, ip, qs,
                                                        self.headers.get("X-Tailshare-Keys", ""),
                                                        (getattr(self, "raw", b""), signed)))
+            if path in ("/report", "/reports"):
+                if b.reports is None:
+                    raise BusError("reports are not available on this machine", 409)
+                return self._reply(200, b.reports.route(method, path, body, local, ip, qs))
             if path.startswith("/keys/"):
                 if b.keys is None:
                     raise BusError("SSH keys are not available on this machine", 409)
@@ -1284,6 +1291,12 @@ def start_bus() -> Bus | None:
         b.squads = squads.start(b)
     except Exception as e:  # noqa: BLE001
         log(f"squads not started: {e!r}")
+    try:
+        from . import reports
+
+        b.reports = reports.start(b) if b.squads is not None else None
+    except Exception as e:  # noqa: BLE001
+        log(f"reports not started: {e!r}")
     try:
         from . import agent
 

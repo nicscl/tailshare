@@ -412,6 +412,10 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
     name = clean_name(item.get("name"))
     opts = _options(kind, item.get("options"), cfg["kinds"][kind]["options"], cfg["roots"])
     instructions = _text(item.get("instructions"), "instructions", INSTRUCTIONS_MAX)
+    if squad:  # a member keeps its report current for the squad page; the owner's instructions stay within their cap
+        from .reports_cli import HOW
+
+        instructions = f"{instructions}\n\n{HOW}" if instructions else HOW
     prompt = _text(item.get("prompt"), "prompt", PROMPT_MAX)
     device = "".join(c for c in _text(item.get("device_name"), "device_name", 256)
                      if unicodedata.category(c)[0] != "C")[:64]

@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tailshare import bus, keys, squads, squads_cli, start, svg
+from tailshare import bus, keys, reports_cli, squads, squads_cli, start, svg
 
 from tests.test_bus import StaticNet, free_port, reg
 
@@ -549,7 +549,7 @@ class Starting(unittest.TestCase):
     def test_plan_from_the_squad(self):
         plan = start.build({"squad": {"id": "sq1", "member": "m1"}, "device_name": "iPhone"}, self.cfg, "safe", "air")
         self.assertEqual((plan["name"], plan["instructions"], plan["prompt"], plan["options"]),
-                         ("AppDev", "Be AppDev.", "go", {"model": "opus"}))
+                         ("AppDev", "Be AppDev.\n\n" + reports_cli.HOW, "go", {"model": "opus"}))
         self.assertEqual((plan["env"]["TAILSHARE_SQUAD"], plan["env"]["TAILSHARE_MEMBER"]), ("sq1", "m1"))
         self.assertEqual(plan["tmux"], {"session": "squad-tail-share", "window": "appdev"})
         self.assertEqual(plan["squad"], {"id": "sq1", "name": "Tail Share", "member": "m1"})
