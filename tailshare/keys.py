@@ -1187,8 +1187,8 @@ class Keys:
         if row is None or not owner or row["user"] != owner:
             raise no("unknown_key", f"no key {key_id} of {owner or 'the owner'} is installed on {self.host}")
         if not row["squads"] or not row["plan_pubkey"]:
-            raise no("no_grant", f"key {key_id} was not granted squad edits on {self.host}: approve its start key "
-                     "again with `tailshare keys approve --squads`")
+            raise no("no_grant", f"key {key_id} was not granted squad edits on {self.host}: grant it there with "
+                     f"`tailshare keys grant-squads {key_id}`")
         with self.store.lock:
             recent = [t for t in self._verified.get(ip, []) if t > now - 60]
             if len(recent) >= VERIFY_PER_MINUTE:
@@ -1227,6 +1227,25 @@ class Keys:
         if n:
             log(f"removed {key_id}")
         return bool(n)
+
+    def grant_squads(self, body: dict) -> dict:
+        """`tailshare keys grant-squads`: give an installed start key's plan key squad edits here (or take them back
+        with on=false), for a key approved without them. Granting takes the same code as approving: the end of the
+        pair fingerprint the device shows. This machine only; each machine keeps its own grant."""
+        key_id, on = str(body.get("key_id") or ""), body.get("on", True)
+        if not _KEY_ID_RE.fullmatch(key_id) or not isinstance(on, bool):
+            raise bus.BusError("bad key id")
+        k = self.store.one("SELECT * FROM ssh_keys WHERE id=?", key_id)
+        if k is None:
+            raise bus.BusError(f"no key {key_id} is installed on {self.host}", 404)
+        if on:
+            if k["mode"] not in ("start", "start-skip") or not k["plan_pubkey"]:
+                raise bus.BusError("squad edits are only a start key's grant: its plan key signs them", 409)
+            if str(body.get("confirm") or "") != confirm_code(k):
+                raise bus.BusError(f"confirm must be the last {CONFIRM_CHARS} characters of the pair fingerprint", 403)
+        self.store.x("UPDATE ssh_keys SET squads=? WHERE id=?", int(on), key_id)
+        log(f"{'granted' if on else 'took back'} squad edits for {key_id} ({k['device']}, {k['fingerprint']})")
+        return {"host": self.host, "key_id": key_id, "squads": on}
 
     def rm(self, body: dict) -> dict:
         """Called by `tailshare keys rm`: remove here, then on the owner's other machines."""
@@ -1296,6 +1315,7 @@ class Keys:
             routes = {("GET", "/keys/pending"): lambda: self.pending(), ("GET", "/keys/ls"): lambda: self.ls(),
                       ("POST", "/keys/approve"): lambda: self.approve(body),
                       ("POST", "/keys/deny"): lambda: self.deny(body), ("POST", "/keys/rm"): lambda: self.rm(body),
+                      ("POST", "/keys/grant-squads"): lambda: self.grant_squads(body),
                       ("GET", "/keys/trusted"): lambda: self.trusted_view(),
                       ("POST", "/keys/peer-machine"): lambda: self.peer_machine(body),
                       ("POST", "/keys/trust"): lambda: self.trust(body),
@@ -1579,6 +1599,34 @@ def cmd_ls(args):
 
 
 @_run
+@_run
+def cmd_grant_squads(args):
+    if args.off:
+        r = _call("/keys/grant-squads", {"key_id": args.key_id, "on": False})
+        print(f"✓ {r['key_id']} may no longer edit squads on {r['host']}")
+        return
+    _human_check()
+    d = _call("/keys/ls")
+    k = next((k for k in d["keys"] if k["id"] == args.key_id), None)
+    if k is None:
+        raise ValueError(f"no key {args.key_id} is installed on {d['host']} (`tailshare keys ls` lists them)")
+    if k["mode"] not in ("start", "start-skip") or not k.get("plan_pubkey"):
+        raise ValueError("squad edits are only a start key's grant: its plan key signs them")
+    if k.get("squads"):
+        print(f"{k['id']} may already edit squads on {d['host']}")
+        return
+    print(f"You are letting a start key's plan key edit your squads on {d['host']}:")
+    print(f"  device       {k['device']!r} on {k['node']} ({k['user']})")
+    print(f"  pair         {pair_fingerprint(k['pubkey'], k['plan_pubkey'])} (the device shows this one)")
+    print("  means        the plan key, which signs without Face ID, may add, change and delete squads and their members")
+    print(f"  only         {d['host']}: run this on each machine the squads should be edited on")
+    got = input(f"Type the last {CONFIRM_CHARS} characters of the pair fingerprint shown on the device (Enter to cancel): ").strip()
+    if not got:
+        raise ValueError("cancelled: nothing changed")
+    r = _call("/keys/grant-squads", {"key_id": k["id"], "confirm": got})
+    print(f"✓ {r['key_id']} may edit squads on {r['host']} (undo: tailshare keys grant-squads --off {r['key_id']})")
+
+
 def cmd_rm(args):
     r = _call("/keys/rm", {"key_id": args.key_id})
     print(f"{'✓ removed here' if r['removed_here'] else 'not installed here'}")
@@ -1609,6 +1657,10 @@ def add_parser(sub) -> None:
     p = s.add_parser("ls", help="keys installed here by tailshare")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_ls)
+    p = s.add_parser("grant-squads", help="let an installed start key's plan key edit your squads here")
+    p.add_argument("key_id")
+    p.add_argument("--off", action="store_true", help="take the grant back")
+    p.set_defaults(fn=cmd_grant_squads)
     p = s.add_parser("rm", help="remove a key here and on your other machines")
     p.add_argument("key_id")
     p.set_defaults(fn=cmd_rm)

@@ -325,6 +325,57 @@ class Flow(unittest.TestCase):
         self.assertNotIn("squads", gone)
         self.assertIs(self.air_keys.status(PHONE, rs[1]["request_id"])["squads"], False)
 
+    def test_grant_squads_later_takes_the_pair_code_and_stays_on_this_machine(self):
+        """A start key approved without squad edits gets them afterwards with the code the device shows, here only."""
+        r = self.air_keys.enroll(PHONE, {"pubkey": self.p256("start"), "plan_pubkey": self.p256("plan"),
+                                         "purpose": "start", "device_name": "iPad"})
+        p = self.air_keys.pending()["pending"][0]
+        kid = "k" + "a" * 12
+        payload = keys.approval_doc("nick", "air", p, kid, "start", ["air", "pro"])
+        self.air_keys.approve({"confirm": r["pair_fingerprint"][-6:], "id": r["request_id"], "mode": "start",
+                               "payload": payload, "signature": sessions.sign(payload, self.signing_key,
+                                                                              sessions.KEYS_NAMESPACE)})
+
+        def grant(body, local=True, token=None):
+            return self.air_keys.route("POST", "/keys/grant-squads", body, local, "127.0.0.1" if local else PHONE,
+                                       self.air_keys.token if token is None else token)
+
+        def code(body, **kw):
+            with self.assertRaises(bus.BusError) as cm:
+                grant(body, **kw)
+            return cm.exception.code
+
+        good = {"key_id": kid, "confirm": r["pair_fingerprint"][-6:]}
+        self.assertEqual(code(good, token="x" * 64), 403)  # only the login's own CLI
+        self.assertEqual(code(good, local=False), 404)  # no such route for devices
+        self.assertEqual(code({"key_id": kid, "confirm": r["fingerprint"][-6:]}), 403)  # the start key's alone: no
+        self.assertEqual(code({"key_id": kid}), 403)
+        self.assertEqual(code({"key_id": "k" + "f" * 12, "confirm": "x"}), 404)
+        self.assertEqual(code({"key_id": "nope"}), 400)
+        self.assertEqual(code({"key_id": kid, "on": "yes"}), 400)
+        self.assertIs(self.air_keys.status(PHONE, r["request_id"])["squads"], False)
+        self.assertEqual(grant(good), {"host": "air", "key_id": kid, "squads": True})
+        self.assertIs(self.air_keys.status(PHONE, r["request_id"])["squads"], True)
+        self.assertEqual([k["squads"] for k in self.pro_keys.ls()["keys"]], [0])  # pro keeps its own
+        grant({"key_id": kid, "on": False})  # taking it back needs no code
+        self.assertIs(self.air_keys.status(PHONE, r["request_id"])["squads"], False)
+        # a pane key never gets it
+        r2 = self.enroll()
+        k2 = self.air_keys.approve({"confirm": r2["fingerprint"][-6:], "id": r2["request_id"], "mode": "pane"})["key_id"]
+        self.assertEqual(code({"key_id": k2, "confirm": r2["fingerprint"][-6:]}), 409)
+
+    def test_grant_squads_cli_refuses_an_agent_shell(self):
+        import argparse
+        import io
+        from contextlib import redirect_stderr
+
+        args = argparse.Namespace(key_id="k" + "a" * 12, off=False)
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}), mock.patch.object(keys, "_call") as call, \
+                redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            keys.cmd_grant_squads(args)
+        call.assert_not_called()
+        self.assertIn("AI agent", err.getvalue())
+
     def test_device_revokes_its_own_key(self):
         r = self.enroll()
         payload, sig = self.signed(r)
