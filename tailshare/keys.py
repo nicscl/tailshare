@@ -1457,8 +1457,15 @@ def cmd_pending(args):
         other = "" if p["user"] == d["owner"] else "   ⚠ not your device"
         kind = "" if p.get("purpose", "pane") == "pane" else "   start key" + (", wants skip" if "skip" in p.get("want", []) else "")
         print(f"{p['id'][:8]}  {p['device']!r} on {p['node']} ({who}){other}{kind}")
+        print(f"          {_requested(p)}")
         print(f"          {p['fingerprint']}  expires in {max(0, int(p['expires'] - time.time())) // 60} min")
     print("\napprove: tailshare keys approve <id>     deny: tailshare keys deny <id>")
+
+
+def _requested(p: dict) -> str:
+    """When and from where a request came, so the person can match it to the device in their hand."""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["created"])) if p.get("created") else "at an unknown time"
+    return f"{when} from {p.get('ip') or 'an unknown address'}, by {p.get('user') or 'an unknown tailnet user'}"
 
 
 @_run
@@ -1508,6 +1515,7 @@ def approve_interactive(rid: str, shell: bool = False, here: bool = False, key_a
     print("You are approving an SSH key:")
     print(f"  device       {p['device']!r} (the name the device gave itself)")
     print(f"  tailnet      {p['node']}, owned by {p['user'] or 'unknown'}" + ("" if mine else "   ⚠ NOT one of your devices"))
+    print(f"  requested    {_requested(p)}")
     print(f"  fingerprint  {p['fingerprint']}")
     if p.get("plan_fingerprint"):
         print(f"  plan key     {p['plan_fingerprint']} (dry runs only, without Face ID; installed with it)")

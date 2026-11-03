@@ -1041,3 +1041,13 @@ class GateJustStarted(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Requested(unittest.TestCase):
+    """`keys pending` and `keys approve` say when, from which address and by whom a request came."""
+
+    def test_requested_line(self):
+        t = time.mktime((2026, 11, 3, 17, 5, 0, 0, 0, -1))
+        self.assertEqual(keys._requested({"created": t, "ip": "100.64.0.9", "user": "nick@example.com"}),
+                         "2026-11-03 17:05 from 100.64.0.9, by nick@example.com")
+        self.assertEqual(keys._requested({}), "at an unknown time from an unknown address, by an unknown tailnet user")
