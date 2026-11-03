@@ -530,6 +530,8 @@ class Bus:
         user = self._user_for(a)
         tmux = clean_tmux(a.get("tmux"))
         squad = clean_squad_tag(a.get("squad"))
+        if not squad and self.squads:  # started without TAILSHARE_SQUAD/MEMBER: a `tailshare squad join` of its own
+            squad = self.squads.joined(aid)
         pid = int(a.get("pid") or 0)
         was = self.store.one("SELECT pid, skip, mode FROM agents WHERE id=?", aid)
         # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's

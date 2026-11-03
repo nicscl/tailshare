@@ -56,7 +56,10 @@ def _print(sq: dict) -> None:
 
 
 def cmd_squad(args):
-    tag = agent.squad_tag()
+    try:
+        tag = agent.register(agent.detect()).get("squad") or {}  # started as a member, or joined one
+    except (agent.Offline, bus.BusError):
+        tag = agent.squad_tag()
     if not tag:
         print("This session is not part of a squad. `tailshare squad ls` lists your squads.")
         return
@@ -170,6 +173,46 @@ def cmd_edit(args):
     print(f"Saved {len(todo)} change{'s' * (len(todo) != 1)} to {sq['name']}.")
 
 
+def _member(sq: dict, ref: str) -> dict:
+    hit = [m for m in sq["members"] if m["id"] == ref] or [m for m in sq["members"] if m["name"].lower() == ref.lower()]
+    if len(hit) != 1:
+        raise ValueError(f"no member {ref!r} in {sq['name']}" if not hit else f"{len(hit)} members are called {ref!r}")
+    return hit[0]
+
+
+def _fail(e: Exception) -> None:
+    extra = getattr(e, "extra", {}) or {}
+    print(f"✗ {e}" + (f": {extra['reason']}" if extra.get("reason") else ""), file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_join(args):
+    """This session becomes a member it matches (its machine, kind and folder), without a restart."""
+    try:
+        me = agent.register(agent.detect())
+        sq = _find(args.ref)
+        m = _member(sq, args.member)
+        a = agent.call(f"/squads/{sq['id']}/join", {"agent": me["id"], "member": m["id"]})["agent"]
+    except (agent.Offline, bus.BusError, ValueError) as e:
+        _fail(e)
+    print(f"You are {m['name']} in squad {sq['name']} now ({a['address']}). Your role: {m.get('role') or '-'}.")
+    if m.get("instructions"):
+        print(f"\nThe member's instructions (a session started from the squad gets them as its system prompt):\n\n"
+              f"{m['instructions']}")
+
+
+def cmd_leave(args):
+    try:
+        me = agent.register(agent.detect())
+        tag = me.get("squad") or {}
+        if not tag:
+            raise ValueError("this session is not part of a squad")
+        agent.call(f"/squads/{tag['id']}/leave", {"agent": me["id"]})
+    except (agent.Offline, bus.BusError, ValueError) as e:
+        _fail(e)
+    print("This session left its squad.")
+
+
 def add_parser(sub) -> None:
     p = sub.add_parser("squad", help="squads: named groups of agents with roles")
     p.add_argument("--json", action="store_true")
@@ -185,6 +228,12 @@ def add_parser(sub) -> None:
     q = s.add_parser("new", help="make a squad (in your own terminal)")
     q.add_argument("name")
     q.set_defaults(fn=cmd_new)
+    q = s.add_parser("join", help="make this running session a member it matches (its machine, kind and folder)")
+    q.add_argument("ref", help="the squad's name or id")
+    q.add_argument("member", help="the member's name or id")
+    q.set_defaults(fn=cmd_join)
+    q = s.add_parser("leave", help="undo `squad join` for this session")
+    q.set_defaults(fn=cmd_leave)
     q = s.add_parser("edit", help="edit a squad as JSON in $EDITOR (in your own terminal)")
     q.add_argument("ref", help="the squad's name or id")
     q.set_defaults(fn=cmd_edit)

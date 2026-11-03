@@ -16,6 +16,8 @@ tailshare squad ls               # your squads, and how many of each are running
 tailshare squad show Tailshare   # one squad by name or id: members, where they run, their addresses
 tailshare squad new Tailshare    # make one
 tailshare squad edit Tailshare   # edit it as JSON in $VISUAL / $EDITOR
+tailshare squad join Tailshare AppDev   # make this running session that member (below)
+tailshare squad leave            # undo a join
 ```
 
 All of them take `--json`. `new` and `edit` refuse to run in an AI agent's shell and need a terminal: a squad
@@ -85,6 +87,25 @@ as live for 90 s after it was last heard from: a member that crashed and is star
 runs without its tag, as the gate also says `running` until then. A member that already has a live agent is
 refused (`running`). The plan says `changed` when the member's instructions differ from the last time it was
 started here.
+
+## Joining
+
+A session that was not started from the squad (one already running, or started by ts-agents) can become a member
+without a restart: `tailshare squad join <squad> <member>` (squad and member by name or id). The bus checks it
+the same way as a tag from the environment: the member runs on this machine, is of the session's kind and has
+its folder, and no other live agent holds it. Otherwise it says why (`409 not_that_member` with a `reason`). A
+session that is already another member is refused (`409 already_a_member`); `tailshare squad leave` first. A
+session started as a member stays that member.
+
+The join is stored for the session's id, so later registrations without `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER`
+keep it; `check_tag` still decides each time, and a join that no longer matches is not used. Variables from the
+environment are tried first. Joins of sessions the bus no longer knows are dropped when it prunes.
+
+A join only labels a session: it changes no squad and needs no keys token. It is `POST
+/bus/v1/squads/<id>/join` `{agent, member}` and `POST /bus/v1/squads/<id>/leave` `{agent}`, on the local API
+only (the peer API answers 404). As with reports (reports.md), every agent on a machine runs as the same Unix
+user, so the API can't tell which session asks. A process could name another session's id, but only for a member
+that session matches and nobody else holds. Run it for your own session only.
 
 ## How it syncs
 

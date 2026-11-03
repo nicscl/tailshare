@@ -526,6 +526,80 @@ class Tree(unittest.TestCase):
         self.assertEqual([(p.rsplit("/", 1)[-1], sorted(b)) for _, p, b in todo], [("m1", ["base_rev", "reports_to"])])
 
 
+class Joining(unittest.TestCase):
+    """`tailshare squad join`: a running session binds to a member it matches, without a restart."""
+
+    def setUp(self):
+        self.m = Machine(self, "air")
+        self.m.put("sq1", name="Tailshare", members=[{"id": "m1", **member()}, {"id": "m2", **member(name="Pro", host="pro")},
+                                                     {"id": "m3", **member(name="Cx", kind="codex")}])
+
+    def join(self, aid, member, local=True, sid="sq1"):
+        return self.m.squads.route("POST", f"/squads/{sid}/join", {"agent": aid, "member": member}, local, "127.0.0.1", {})
+
+    def refused(self, aid, member, code=409):
+        with self.assertRaises(bus.BusError) as c:
+            self.join(aid, member)
+        self.assertEqual(c.exception.code, code)
+        return c.exception
+
+    def test_join_binds_and_survives_registering_again(self):
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
+        a = self.join("s1", "m1")["agent"]
+        self.assertEqual(a["squad"], {"id": "sq1", "member": "m1"})
+        self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], a["address"])
+        self.assertEqual(reg(self.m.bus, "s1", "app", cwd="/u/projects/app")["squad"], {"id": "sq1", "member": "m1"})
+        self.assertEqual(self.join("s1", "m1")["agent"]["squad"], {"id": "sq1", "member": "m1"})  # again: no-op
+
+    def test_refusals_say_why(self):
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
+        reg(self.m.bus, "s2", "app", cwd="/tmp/elsewhere")
+        for aid, mid, why in [("s1", "m2", "runs on pro"), ("s1", "m3", "codex"), ("s2", "m1", "works in"),
+                              ("s1", "zz", "no such member")]:
+            self.assertIn(why, self.refused(aid, mid).extra["reason"], (aid, mid))
+        self.assertEqual(self.refused("nobody", "m1", 404).code, 404)  # not a live session
+        self.assertEqual(self.refused("s1", "../", 400).code, 400)
+        self.join("s1", "m1")
+        reg(self.m.bus, "s3", "app", cwd="/u/projects/app")
+        self.assertIn("another running session", self.refused("s3", "m1").extra["reason"])
+
+    def test_a_member_already_is_refused_and_env_wins(self):
+        self.m.put("sq2", name="B", members=[{"id": "b1", **member(name="B1")}])
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        with self.assertRaises(bus.BusError) as c:
+            self.join("s1", "b1", sid="sq2")
+        self.assertEqual((c.exception.code, str(c.exception)), (409, "already_a_member"))
+        reg(self.m.bus, "s2", "app", cwd="/u/projects/app")
+        self.join("s2", "b1", sid="sq2")
+        a = reg(self.m.bus, "s2", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.assertIsNone(a["squad"])  # s1 holds m1; the env tag is still tried first, not the join
+        self.assertEqual(reg(self.m.bus, "s2", "app", cwd="/u/projects/app")["squad"], {"id": "sq2", "member": "b1"})
+
+    def test_leave(self):
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
+        self.join("s1", "m1")
+        out = self.m.squads.route("POST", "/squads/sq1/leave", {"agent": "s1"}, True, "127.0.0.1", {})
+        self.assertIsNone(out["agent"]["squad"])
+        self.assertIsNone(reg(self.m.bus, "s1", "app", cwd="/u/projects/app")["squad"])
+        with self.assertRaises(bus.BusError) as c:
+            self.m.squads.route("POST", "/squads/sq1/leave", {"agent": "s1"}, True, "127.0.0.1", {})
+        self.assertEqual(c.exception.code, 409)
+
+    def test_only_on_the_local_api(self):
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
+        with self.assertRaises(bus.BusError) as c:
+            self.join("s1", "m1", local=False)
+        self.assertEqual(c.exception.code, 404)
+        self.assertIsNone(reg(self.m.bus, "s1", "app", cwd="/u/projects/app")["squad"])
+
+    def test_prune_drops_joins_of_gone_sessions(self):
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
+        self.join("s1", "m1")
+        self.m.bus.store.x("DELETE FROM agents WHERE id='s1'")
+        self.m.squads.prune()
+        self.assertEqual(self.m.squads.joined("s1"), {})
+
+
 class Starting(unittest.TestCase):
     """A start item naming a squad member takes everything from this machine's copy of the squad."""
 

@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS squads(owner TEXT NOT NULL, id TEXT NOT NULL, doc TEX
 CREATE TABLE IF NOT EXISTS squad_members(owner TEXT NOT NULL, squad TEXT NOT NULL, id TEXT NOT NULL,
   doc TEXT NOT NULL, hlc INTEGER NOT NULL, rhost TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, at REAL NOT NULL,
   PRIMARY KEY(owner, squad, id));
+CREATE TABLE IF NOT EXISTS squad_joins(agent TEXT PRIMARY KEY, squad TEXT NOT NULL, member TEXT NOT NULL, at REAL NOT NULL);
 """
 
 
@@ -324,6 +325,56 @@ class Squads:
         other = self.store.one("SELECT 1 FROM agents WHERE squad=? AND id!=? AND last_seen>?",
                                json.dumps(tag, sort_keys=True), aid, time.time() - bus.LIVE)
         return {} if other else tag
+
+    def joined(self, aid: str) -> dict:
+        """The member a running session joined with `tailshare squad join`, for a registration without
+        TAILSHARE_SQUAD/MEMBER; check_tag still decides."""
+        r = self.store.one("SELECT squad, member FROM squad_joins WHERE agent=?", aid)
+        return {"id": r["squad"], "member": r["member"]} if r else {}
+
+    def _why_not(self, tag: dict, aid: str, a) -> str:
+        d = self.squad(tag["id"])
+        m = next((x for x in (d or {}).get("members", []) if x["id"] == tag["member"]), None)
+        if d is None or m is None:
+            return "no such member"
+        if m["host"] != self.bus.net.host:
+            return f"that member runs on {m['host']}, not here"
+        if m["kind"] != a["harness"]:
+            return f"that member is a {m['kind']} session, this is {a['harness']}"
+        if not a["cwd"] or os.path.realpath(a["cwd"]) != os.path.realpath(m["folder"]):
+            return f"that member works in {m['folder']}, this session in {a['cwd'] or 'no folder'}"
+        return "another running session is that member"
+
+    def join(self, sid: str, body: dict) -> dict:
+        """Bind a running session to a member it matches, without a restart (docs/squads.md "Joining")."""
+        aid = str(body.get("agent") or "")
+        tag = bus.clean_squad_tag({"id": sid, "member": body.get("member")})
+        if not tag:
+            raise Bad("member")
+        with self.store.lock:
+            a = self.store.one("SELECT harness, cwd, squad FROM agents WHERE id=? AND last_seen>?",
+                               aid, time.time() - bus.LIVE)
+            if a is None:
+                raise bus.BusError("this session is not running on the bus", 404)
+            if a["squad"] and json.loads(a["squad"]) != tag:
+                raise bus.BusError("already_a_member", 409, {"reason": "this session is already another member: "
+                                                                        "`tailshare squad leave` first"})
+            if not self.check_tag(tag, aid, a["harness"], a["cwd"]):
+                raise bus.BusError("not_that_member", 409, {"reason": self._why_not(tag, aid, a)})
+            self.store.x("INSERT INTO squad_joins VALUES(?,?,?,?) ON CONFLICT(agent) DO UPDATE SET squad=excluded.squad,"
+                         " member=excluded.member, at=excluded.at", aid, tag["id"], tag["member"], time.time())
+            self.store.x("UPDATE agents SET squad=? WHERE id=?", json.dumps(tag, sort_keys=True), aid)
+        return {"agent": self.bus.agent(aid)}
+
+    def leave(self, body: dict) -> dict:
+        aid = str(body.get("agent") or "")
+        with self.store.lock:
+            r = self.joined(aid)
+            if not r:
+                raise bus.BusError("this session did not join a squad (one started as a member stays it)", 409)
+            self.store.x("DELETE FROM squad_joins WHERE agent=?", aid)
+            self.store.x("UPDATE agents SET squad='' WHERE id=? AND squad=?", aid, json.dumps(r, sort_keys=True))
+        return {"agent": self.bus.agent(aid)}
 
     def ids(self, deleted: bool = False) -> list[str]:
         try:
@@ -608,6 +659,7 @@ class Squads:
         self.store.x("DELETE FROM squad_members WHERE deleted=1 AND at<?", cutoff)
         self.store.x("DELETE FROM squads WHERE deleted=1 AND at<? AND NOT EXISTS (SELECT 1 FROM squad_members m "
                      "WHERE m.owner=squads.owner AND m.squad=squads.id)", cutoff)
+        self.store.x("DELETE FROM squad_joins WHERE agent NOT IN (SELECT id FROM agents)")
 
     # -- HTTP ----------------------------------------------------------------------------
     def route(self, method: str, path: str, body: dict, local: bool, ip: str, qs: dict, token: str = "",
@@ -630,6 +682,10 @@ class Squads:
                     raise bus.BusError("no such squad", 404)
                 return {"squad": d}
             raise bus.BusError("not found", 404)
+        if method == "POST" and len(parts) == 3 and parts[2] in ("join", "leave"):
+            if not local:  # a session joins on its own machine; it labels the session, it changes no squad
+                raise bus.BusError("not found", 404)
+            return self.join(_id(parts[1], "id"), body) if parts[2] == "join" else self.leave(body)
         if not own:  # a sharee's writes, or anyone else's, never land
             raise bus.BusError("only the squad's owner can change it", 403)
         if not local and not any(signed[1].values()) and self._machine(ip):
