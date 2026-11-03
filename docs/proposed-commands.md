@@ -43,6 +43,24 @@ identity; no replacement target or changed command is authorized by an old hash.
 tmux server. If a restart includes the proposing agent or the service processing proposals, the durable execution
 record still precedes dispatch. The contract never authorizes a peer to restart a host outside its approved list.
 
+Key Review must render the full hashed lookup: requesting device and request id, both public-key fingerprints
+when paired (computed locally from the hashed public keys), pair fingerprint/confirmation code, purpose/mode,
+squad grant and the complete target-host list. Showing only one fingerprint while signing a pair or broader grant
+is insufficient. The card may summarize, but no approval is enabled until Review includes all those values.
+
+For `agent_restart`, the only parameter is `{member: <exact roster id>}`: ASCII `[A-Za-z0-9._-]{1,64}`,
+not an address, command or prefix. Resolve exactly one row of the local roster under its owner-controlled
+canonical path; refuse missing, duplicate, foreign-host or unconfigured entries. The captured ordered roster
+record is `[id, host, name, folder, harness, launcher_path, tmux_server]`; strings are canonical stored values.
+Its digest and raw roster/config/executable file digests are dependencies. `target` is the ordered array
+`[host, id, tmux_server]`. The configured launcher must be an absolute verified executable and supply a fixed
+argv template equivalent to `[launcher_path, "restart", id]`, with no extra flags from the proposer. Resolve its
+interpreter as an executable dependency too when it is a script. `folder` must be absolute, owned by the service
+account, and the roster's own folder; `account` is the running service account, never a parameter. The isolated
+server must map to that one roster row and must not be the default server, wildcard or another member's server.
+A launcher must offer a reviewed one-member restart implementation: a generic launcher without that guarantee
+is `not_in_catalogue`. These are proposed planning bounds, not permission to edit today's roster or launcher.
+
 For `keys_approve`, the lookup must use the host's owner-only request lookup (`GET /bus/v1/keys/request/<prefix>`),
 not another device's enrollment poll. Resolve the full request id, all public keys in a pair, complete fingerprint
 and displayed confirmation code, requested/granted purpose and mode, squad grant, and every target host. These
@@ -89,14 +107,18 @@ text. Empty optional values use the specified empty string, empty array or null,
     catalogue, revision, account, folder, argv: [string, ...], description,
     steps: [{description, account, folder, argv: [string, ...]}, ...],
     risks: ["keys"|"permissions"|"launchd"|"delete", ...],
+    dependencies: [{kind, id, sha256}, ...],
     key: null | {
       request, device_name, fingerprint, confirm, created, expires, purpose, mode,
       pubkey, plan_pubkey, squads: boolean, targets: [host, ...]
     }
   },
   plan_sha256: <64 lowercase hex>,
-  result: null | {started, finished: seconds|null, exit_status: integer|null,
-                  outcome: "running"|"done"|"failed"|"interrupted",
+  result: null | {consumed, started: seconds|null, finished: seconds|null,
+                  execution_started: boolean|null, exit_status: integer|null,
+                  outcome: "running"|"done"|"failed"|"refused"|"interrupted", reason: text|null,
+                  steps: [{index, status, started: seconds|null, finished: seconds|null,
+                           exit_status: integer|null, reason: text|null}, ...],
                   output, output_bytes, dropped_bytes, truncated: boolean}
 }
 ```
@@ -107,9 +129,28 @@ the catalogue entry's concrete invocation, not a shell-joined multi-command stri
 only the displayed steps in order; a changed step requires a new plan. For a simple entry `steps` is empty.
 Every nested step is checked against its catalogue just like the top-level invocation.
 
-A proposal is `pending`, `stale`, `running`, `done`, `failed`, `interrupted`, `expired` or `declined`. A dependency
+`dependencies` is a nonempty host-generated immutable snapshot, sorted by `(kind, id)` in UTF-8 byte order,
+with no duplicate pair. Each `sha256` is lowercase SHA-256 of the dependency's exact captured bytes. `kind` is
+`catalogue`, `roster`, `config`, `executable` or `target`. `id` is the canonical catalogue revision identifier,
+absolute resolved file path or stable target identifier, never an agent's alias. Include the catalogue definition,
+applicable roster record and config, and every actual executable/launcher used by the entry or its steps.
+For files hash raw file bytes, not path, mtime, inode or file size alone: replacing the contents at the same path
+invalidates the plan. A catalogue/roster/structured-target record is encoded as a fixed-schema ordered array
+using this document's canonical encoding, with that array schema pinned by the catalogue revision. Directory,
+agent-session, PR and key targets need a catalogue-defined stable identity snapshot, not just a display name.
+Changing a symlink's resolved target also changes its canonical id. Missing/unreadable/unhashable dependencies
+refuse planning or execution rather than omitting a digest. The exact `agent_restart` rules are below.
+
+These descriptors are part of the plan hash and Review's details. Rebuild them at approval and immediately
+before spawn. The executor must execute the verified executable object/immutable content or refuse if its
+platform cannot prevent substitution between verification and spawn; a digest checked once and an unchecked
+path executed later is insufficient. This binds the approval to the dependency snapshot rather than promising
+that the path alone identifies code.
+
+A proposal is `pending`, `stale`, `running`, `done`, `failed`, `refused`, `interrupted`, `expired` or `declined`. A dependency
 change makes it stale. Do not mutate its hashed fields in place: the agent proposes a new plan and the owner
-reviews it again. More proposers/reasons or a run result do not change the plan. The app refreshes while Review
+reviews it again. **Review Again** on a stale card reads that original proposal and explains that the agent must
+submit a replacement; it never swaps a new hash into the same id or enables approval of the stale plan. More proposers/reasons or a run result do not change the plan. The app refreshes while Review
 is open, shows full instructions/argv where applicable, and disables approval whenever its displayed hash fails.
 
 ## Exact plan hash
@@ -120,6 +161,7 @@ To avoid JSON object ordering differences, hash a fixed ordered array. Let `P` b
 ["tailshare-proposal-plan/1", id, host, created, expires,
  plan.catalogue, plan.revision, plan.account, plan.folder, plan.argv, plan.description,
  [[step.description, step.account, step.folder, step.argv], ...], plan.risks,
+ [[dependency.kind, dependency.id, dependency.sha256], ...],
  null | [key.request, key.device_name, key.fingerprint, key.confirm, key.created, key.expires,
          key.purpose, key.mode, key.pubkey, key.plan_pubkey, key.squads, key.targets]]
 ```
@@ -190,14 +232,25 @@ constraint/CAS and a durable SQLite transaction (`synchronous=FULL` or equivalen
 approvals, retries, restarts and other devices cannot win a second claim. No executor accepts an argv from the
 request body; it loads the already committed plan by execution id.
 
+The result records `consumed` as the committed claim time. `started` remains null until dispatch is known to
+have begun. Set `execution_started` false for a confirmed refusal before any spawn, true after confirmed spawn,
+and null when recovery cannot establish whether execution began. Persist one step record per displayed step
+(or one synthetic step at index 0 for a simple command). Step `status` is `not_started`, `running`, `done`,
+`failed`, `refused` or `interrupted`; indexes are zero-based and refer to the displayed execution order. Persist
+the running claim before each step's dispatch and the exit status before advancing to the next step. Unstarted
+steps remain `not_started`; no step is automatically resumed after restart.
+
 The worker runs only the committed catalogue plan. Recheck authorization/plan dependencies after claiming and
-before spawn; if they changed, finish the consumed record as a refusal/failure and do not retry it automatically.
+before spawn; if they changed, finish the consumed record as `refused` with a reason and do not retry it
+automatically. When no step spawned, `execution_started` is false and the app may say "Refused before starting."
+If an earlier step ran, preserve its result, mark the refused step and never claim that nothing ran.
 A multi-step run stops on the first failing step, records which steps completed, and is never silently resumed.
 
 On restart, a consumed record with no known completed result becomes `interrupted` with null exit status and the
 output retained so far. Do not spawn it again, reattach by a reused PID or infer success. A crash between commit
 and spawn can therefore mean nothing ran; a crash after spawn can leave an unknown result. This is **at most
-once**, not guaranteed execution. The card must say the outcome is unknown, not that nothing ran. A new proposal
+once**, not guaranteed execution. The card must say "Execution outcome unknown on <host>. Check the host before proposing again.", not that
+nothing ran. Review/RECENT show completed, failed, refused and interrupted step records without offering Resume. A new proposal
 requires fresh host lookups and a new owner decision. Service restarts need this same recovery treatment.
 
 Results are persisted on the origin host and survive app/service restart. A timeout or lost response never
@@ -251,6 +304,7 @@ nothing ran. Expiry/stale/decline may transition only an unconsumed proposal, ne
   app fetches that proposal only from that owner host and checks its key lookup matches the blocker. Legacy key
   blockers and hosts without this protocol keep their current behavior. A missing proposal never approves a key.
 
-Before implementation, Manager review must settle catalogue entries' exact parameter/executable lookup rules,
-restart recovery/UI copy, and the shared hash/signature fixtures. Nicholas's two owner decisions above stay
+Before implementation, Manager review must approve each entry's concrete configured paths and planner/executor,
+restart recovery/UI copy, and shared cross-language hash/signature fixtures. Fixtures are still a required
+implementation gate, not supplied by this prose draft. Nicholas's two owner decisions above stay
 explicitly pending regardless of that review.
