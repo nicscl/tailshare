@@ -539,7 +539,7 @@ class Gate(Base):
         env = {**os.environ, "SSH_ORIGINAL_COMMAND": cmd}
         return subprocess.run([sys.executable, "-m", "tailshare", "ssh-gate", f"--start={grant}", f"--key={KEY}",
                                f"--tmux-socket={self.tmp / 'sock'}", f"--state={self.state}",
-                               f"--bus-port={free_port()}"],  # never the real bus
+                               f"--bus-port={fake_bus(self, 'testhost')}"],  # never the real bus
                               input=stdin, capture_output=True, env=env, cwd=str(Path(__file__).parents[1]), timeout=30)
 
     def test_only_tailshare_start(self):
@@ -625,7 +625,8 @@ runpy.run_module("tailshare", run_name="__main__", alter_sys=True)' "$@"
 """)
         py.chmod(0o755)
         pub = {n: " ".join((d / f"{n}.pub").read_text().split()[:2]) for n in ("client", "plan")}
-        rest = f' --tmux-socket={self.tmp / "sock"} --state={self.state} --bus-port={free_port()}'
+        bus_port = fake_bus(self, "testhost")
+        rest = f' --tmux-socket={self.tmp / "sock"} --state={self.state} --bus-port={bus_port}'
         lines = [x.replace(f'--key={KEY}"', f'--key={KEY}{rest}"').replace(" --plan\"", f'{rest} --plan"')
                  for x in keys.key_lines({"id": KEY, "mode": "start", "pubkey": pub["client"], "plan_pubkey": pub["plan"],
                                           "device": "test"}, "/unused", str(py))]
@@ -671,6 +672,7 @@ runpy.run_module("tailshare", run_name="__main__", alter_sys=True)' "$@"
     def test_dry_run_then_confirm(self):
         rc, out, err = self.send("tailshare-start", {"v": 1, "dry_run": True, "starts": [self.item(prompt="hi")]})
         self.assertEqual(rc, 0, out + err)
+        self.assertEqual(json.loads(out)["results"][0]["plan"]["host"], "testhost")  # the bus's name, as devices check it
         pid = json.loads(out)["results"][0]["plan_id"]
         rc, out, err = self.send("tailshare-start", {"v": 1, "confirm": [pid]})
         self.assertEqual(rc, 0, out + err)
@@ -692,6 +694,63 @@ def free_port() -> int:
     from tests.test_bus import free_port as fp
 
     return fp()
+
+
+def fake_bus(test, host, machines=None) -> int:
+    """A stand-in bus on a free loopback port that answers only GET /bus/v1/machines, as the real one does locally."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    body = json.dumps({"machines": [{"host": host, "self": True}] if machines is None else machines}).encode()
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            ok = self.path == "/bus/v1/machines"
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body if ok else b'{"error": "not found"}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    test.addCleanup(srv.server_close)
+    test.addCleanup(srv.shutdown)
+    return srv.server_address[1]
+
+
+class HostName(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(bus, "BUS_PORT", bus.BUS_PORT)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_from_the_local_machines_route(self):
+        bus.BUS_PORT = fake_bus(self, "macbook-air", [{"host": "pro", "self": False}, {"host": "macbook-air", "self": True}])
+        self.assertEqual(start.host_name(), "macbook-air")
+
+    def test_no_guess_without_the_bus(self):
+        for machines in ([], [{"host": "bad name!", "self": True}], [{"host": "x", "self": 1}]):
+            bus.BUS_PORT = fake_bus(self, "", machines)
+            with self.assertRaises(start.Refused) as c:
+                start.host_name()
+            self.assertEqual(c.exception.out["error"], "no_bus", machines)
+        bus.BUS_PORT = free_port()  # nothing listening
+        with self.assertRaises(start.Refused):
+            start.host_name()
+
+    def test_gate_answers_no_bus(self):
+        import io
+
+        bus.BUS_PORT = free_port()
+        stdin = mock.Mock(buffer=io.BytesIO(json.dumps({"v": 1, "dry_run": True, "starts": []}).encode()))
+        with mock.patch.object(start.sys, "stdin", stdin), mock.patch.object(start.sys, "stdout", io.StringIO()) as out, \
+                mock.patch.object(start, "handle") as handle:
+            self.assertEqual(start.gate("safe", KEY), 1)
+        handle.assert_not_called()
+        self.assertEqual(json.loads(out.getvalue())["error"], "no_bus")
 
 
 class Keys(unittest.TestCase):

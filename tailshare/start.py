@@ -912,7 +912,12 @@ def gate(grant: str, key: str, plan_only: bool = False) -> int:
             doc = json.loads(raw.decode())
         except (ValueError, UnicodeDecodeError):
             doc = None
-        out = handle(doc, grant, key, host_name(), plan_only=plan_only)
+        try:
+            host = host_name()
+        except Refused as e:
+            out = {"v": 1, **e.out}
+        else:
+            out = handle(doc, grant, key, host, plan_only=plan_only)
     line = json.dumps(out, separators=(",", ":"))
     if len(line) > MAX_OUTPUT:
         line = json.dumps({"v": 1, "error": "too_large", "reason": "the reply is too large; send fewer starts"})
@@ -922,10 +927,15 @@ def gate(grant: str, key: str, plan_only: bool = False) -> int:
 
 
 def host_name() -> str:
-    """This machine's tailnet name, as the bus knows it; the hostname if the bus does not answer."""
+    """This machine's tailnet name, as the bus knows it (its local /machines: /hello is served on the tailnet only).
+    No guess when the bus does not say: devices check a plan's host against the machine they reached, so a wrong
+    name would only be refused there, after the person had looked at it."""
     try:
-        return str(bus.request(f"http://127.0.0.1:{bus.BUS_PORT}/bus/v1/hello", None, timeout=3)["host"])
+        rows = bus.request(f"http://127.0.0.1:{bus.BUS_PORT}/bus/v1/machines", None, timeout=3)["machines"]
+        host = next(str(m["host"]) for m in rows if m.get("self") is True)
     except Exception:  # noqa: BLE001
-        import socket
-
-        return bus.slug(socket.gethostname().split(".")[0])
+        raise Refused("no_bus", reason="the bus is not running here, so this machine's name is unknown; start it "
+                      "with `tailshare serve`") from None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", host):
+        raise Refused("no_bus", reason="the bus gave no usable machine name")
+    return host
