@@ -41,6 +41,9 @@ Done tasks and resolved blockers show for 24 hours.
  to: "lead" | "owner", for: {member, blocker} | null, approval: null | {...}, resolved: bool}
 ```
 
+That is the shape an agent writes. A read has `at` (when the bus first saw it) and `resolved_at` (epoch seconds or
+`null`) in place of `resolved`. Tasks always come back as `{title}` or `{title, url}`, and done tasks have `at`.
+
 - A member with a lead raises blockers `to: "lead"`. Only a lead or a top-level member raises one `to: "owner"`.
 - A lead can relay a blocker from its branch with `for`, so the owner sees whose it is.
 - `approval` is one of:
