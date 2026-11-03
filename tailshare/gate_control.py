@@ -372,7 +372,9 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
                     continue
             if session and line and line.startswith(b"%layout-change ") and line.split(b" ")[1:2] == [window.encode()]:
                 z = b"Z" in (line.split(b" ")[4:5] or [b""])[0]
-                if zoomed and not z:  # unzoomed by someone: a zoom after this is theirs, not the gates'
+                # unzoomed by someone: a zoom after this is theirs, not the gates'. Asked of the server, not taken
+                # from the line: tmux 3.8 sends one without Z while it resizes a window that stays zoomed
+                if zoomed and not z and _display(binary, sock, pane, "#{window_zoomed_flag}#{pane_active}") != "11":
                     forget_zoom(binary, sock, pane, window)
                 zoomed = z
             if line is not None and out.allowed(line):
