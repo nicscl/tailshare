@@ -265,8 +265,8 @@ class Views(unittest.TestCase):
         real = self.m.squads.check_tag
         barrier = threading.Barrier(2, timeout=2)
 
-        def slow(*a):  # both check before either writes, unless the check is under the lock
-            out = real(*a)
+        def slow(*a, **kw):  # both check before either writes, unless the check is under the lock
+            out = real(*a, **kw)
             try:
                 barrier.wait()
             except threading.BrokenBarrierError:
@@ -574,6 +574,22 @@ class Joining(unittest.TestCase):
         a = reg(self.m.bus, "s2", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
         self.assertIsNone(a["squad"])  # s1 holds m1; the env tag is still tried first, not the join
         self.assertEqual(reg(self.m.bus, "s2", "app", cwd="/u/projects/app")["squad"], {"id": "sq2", "member": "b1"})
+
+    def test_the_member_started_as_it_takes_it_back_from_a_joiner(self):
+        real = reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.m.bus.store.x("UPDATE agents SET last_seen=0 WHERE id='s1'")  # quiet for more than 90 s
+        reg(self.m.bus, "s2", "app", cwd="/u/projects/app")
+        self.join("s2", "m1")
+        a = reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.assertEqual(a["squad"], {"id": "sq1", "member": "m1"})
+        self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
+        self.assertIsNone(reg(self.m.bus, "s2", "app", cwd="/u/projects/app")["squad"])
+        self.assertEqual(self.m.squads.joined("s2"), {})
+        # an env tag that doesn't match the member evicts nobody; nor does one when the holder was started as it
+        reg(self.m.bus, "s3", "app", cwd="/tmp/elsewhere", squad={"id": "sq1", "member": "m1"})
+        child = reg(self.m.bus, "s4", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.assertIsNone(child["squad"])
+        self.assertEqual(self.m.squads.squad("sq1")["members"][0]["agent"], real["address"])
 
     def test_leave(self):
         reg(self.m.bus, "s1", "app", cwd="/u/projects/app")

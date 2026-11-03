@@ -308,7 +308,7 @@ class Squads:
             return True
         return bool(self.store.one("SELECT 1 FROM peers WHERE ip=?", ip))
 
-    def check_tag(self, tag: dict, aid: str, harness: str, cwd: str) -> dict:
+    def check_tag(self, tag: dict, aid: str, harness: str, cwd: str, evict: bool = False) -> dict:
         """The squad tag an agent registers with, if it is that member: on this machine, of its kind, in its
         folder, and no other live agent is it already (a `claude -p` inside a member's shell inherits the env).
         Else {}: a tag decides who squadmates and the app talk to, and whether the member may be started."""
@@ -322,9 +322,18 @@ class Squads:
         if m is None or m["host"] != self.bus.net.host or m["kind"] != harness \
                 or not cwd or os.path.realpath(cwd) != os.path.realpath(m["folder"]):
             return {}
-        other = self.store.one("SELECT 1 FROM agents WHERE squad=? AND id!=? AND last_seen>?",
-                               json.dumps(tag, sort_keys=True), aid, time.time() - bus.LIVE)
-        return {} if other else tag
+        js = json.dumps(tag, sort_keys=True)
+        others = self.store.q("SELECT id FROM agents WHERE squad=? AND id!=? AND last_seen>?",
+                              js, aid, time.time() - bus.LIVE)
+        if others and evict:  # a session started as the member takes it back from one that only joined it
+            joiners = {r["agent"] for r in self.store.q("SELECT agent FROM squad_joins WHERE squad=? AND member=?",
+                                                         tag["id"], tag["member"])}
+            if all(r["id"] in joiners for r in others):
+                for r in others:
+                    self.store.x("DELETE FROM squad_joins WHERE agent=?", r["id"])
+                    self.store.x("UPDATE agents SET squad='' WHERE id=? AND squad=?", r["id"], js)
+                return tag
+        return {} if others else tag
 
     def joined(self, aid: str) -> dict:
         """The member a running session joined with `tailshare squad join`, for a registration without

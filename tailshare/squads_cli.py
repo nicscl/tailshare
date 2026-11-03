@@ -204,6 +204,8 @@ def cmd_join(args):
 def cmd_leave(args):
     try:
         me = agent.register(agent.detect())
+        if agent.squad_tag():
+            raise ValueError("this session was started as a squad member; it stays that member")
         tag = me.get("squad") or {}
         if not tag:
             raise ValueError("this session is not part of a squad")

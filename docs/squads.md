@@ -99,7 +99,9 @@ session started as a member stays that member.
 
 The join is stored for the session's id, so later registrations without `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER`
 keep it; `check_tag` still decides each time, and a join that no longer matches is not used. Variables from the
-environment are tried first. Joins of sessions the bus no longer knows are dropped when it prunes.
+environment are tried first, and they win: when the session started as the member registers while one that only
+joined it holds it (the real one was quiet for more than 90 s), the joiner's join is dropped and the member goes
+back to the started session. `leave` doesn't undo a member a session was started as. Joins of sessions the bus no longer knows are dropped when it prunes.
 
 A join only labels a session: it changes no squad and needs no keys token. It is `POST
 /bus/v1/squads/<id>/join` `{agent, member}` and `POST /bus/v1/squads/<id>/leave` `{agent}`, on the local API
