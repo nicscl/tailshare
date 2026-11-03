@@ -177,6 +177,12 @@ class Suggestions:
             else:
                 raise Bad(f"{f}.op", "add_member, remove_member or set")
         live = [{"id": k, **v} for k, v in members.items()]
+        seen_names = {}
+        for m in live:
+            name = " ".join(m["name"].split()).lower()
+            if name in seen_names:
+                raise Bad(f"ops.members.{m['id']}.name", f"same name as {seen_names[name]} (case-insensitive)")
+            seen_names[name] = m["id"]
         try:
             squads.check_members(live, leads)
         except Bad as e:
@@ -220,6 +226,10 @@ class Suggestions:
                 raise bus.BusError("too_many", 429, {"reason": f"at most {PER_HOUR} suggestions an hour"})
             sgid = new_id()
             by = {"agent": a["address"], "host": self.bus.net.host, "member": member}
+            if member:
+                author = next((m for m in sq["members"] if m["id"] == member), None)
+                if author:
+                    by["name"] = reports.text(author["name"], "by.name", 200)
             self.store.x("INSERT INTO squad_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)", sgid, self.squads.owner,
                          sid, version, now, "pending", why, json.dumps(by), aid, json.dumps(ops), json.dumps(diff), key)
             return {"suggestion": self.view(self._row(sgid))}

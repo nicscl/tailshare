@@ -1,9 +1,16 @@
 """Squad change suggestions (docs/suggestions.md): agents propose, the owner applies."""
 
+import argparse
+import contextlib
+import io
+import json
+import os
+import tempfile
 import time
 import unittest
+from unittest import mock
 
-from tailshare import bus, reports, suggestions
+from tailshare import agent, bus, keys, mcp, reports, squads_cli, suggestions
 from tests.test_bus import reg
 from tests.test_squads import TOKEN, Machine, member
 
@@ -77,7 +84,7 @@ class Writing(Base):
             (add(host="elsewhere"), "ops.0.member.host"),  # not one of the owner's machines
             (add(reports_to="new:0"), "ops.0.member.reports_to"),  # only earlier ones
             ([{"op": "set", "member": "lead", "field": "reports_to", "value": "m1"}], "ops.reports_to"),  # a loop
-            (add(name="AppDev", folder=APP), "ops.members.new:0"),  # same address as m1
+            (add(name="AppDev", folder=APP), "ops.members.new:0.name"),  # same address as m1
             ([{"op": "add_member", "self": True, "member": {"name": "PM", "folder": "/tmp"}}], "ops.0.member.folder"),
         ]:
             e = self.refused(400, ops=ops)
@@ -119,6 +126,26 @@ class Writing(Base):
                                "{}", f"other{i}", "[]", "[]", f"k{i}")
         reg(self.m.bus, "fresh", "f", cwd="/u/projects/f")
         self.assertIn("this squad", self.refused(429, "fresh").extra["reason"])
+
+
+class Contract(Base):
+    def test_names_are_unique_across_hosts_and_folders(self):
+        self.refused(400, ops=[{"op": "add_member", "member": {
+            "name": "APPDEV", "host": "air", "kind": "codex", "folder": "/different"}}])
+        self.refused(400, ops=[{"op": "set", "member": "lead", "field": "name", "value": "appdev"}])
+        self.suggest(ops=[{"op": "set", "member": "lead", "field": "name", "value": "App Dev"}])
+        self.m.patch("sq1/members/lead", name="App Dev", base_rev=self.m.squads.squad("sq1")["members"][0]["rev"])
+        self.refused(400, ops=[{"op": "set", "member": "m1", "field": "name", "value": "APP   DEV"}])
+
+    def test_author_label_and_sequential_diff_survive_rename(self):
+        sg = self.suggest("s1", ops=[
+            {"op": "set", "member": "m1", "field": "role", "value": "first"},
+            {"op": "set", "member": "m1", "field": "role", "value": "second"}])
+        self.assertEqual(sg["by"]["name"], "AppDev")
+        self.assertEqual(sg["diff"][1]["before"], "first")
+        other = self.suggest(ops=[{"op": "set", "member": "m1", "field": "name", "value": "Renamed"}])
+        self.apply(other)
+        self.assertEqual(self.r("GET", f"/suggestions/{sg['id']}")["suggestion"]["by"]["name"], "AppDev")
 
 
 class Applying(Base):
@@ -208,6 +235,94 @@ class Approval(unittest.TestCase):
                     {"type": "squad_change", "host": "air", "suggestion": sid, "ops": []}):
             with self.assertRaises(bus.BusError):
                 reports.approval(bad, "a")
+
+
+class Cli(Base):
+    def parse(self, *args):
+        p = argparse.ArgumentParser()
+        squads_cli.add_parser(p.add_subparsers())
+        return p.parse_args(["squad", *args])
+
+    def call(self, path, body=None, timeout=15):
+        from urllib.parse import urlsplit, parse_qsl
+        url = urlsplit(path)
+        return self.m.squads.route("GET" if body is None else "POST", url.path, body or {}, True,
+                                  "127.0.0.1", dict(parse_qsl(url.query)))
+
+    def setUp(self):
+        super().setUp()
+        self.me = {"id": "pm", "squad": {"id": "sq1", "member": "lead"}}
+        for name, patch in [
+            ("call", mock.patch.object(agent, "call", side_effect=self.call)),
+            ("tag", mock.patch.object(agent, "squad_tag", return_value={})),
+            ("register", mock.patch.object(agent, "register", return_value=self.me)),
+            ("detect", mock.patch.object(agent, "detect")),
+        ]:
+            setattr(self, name + "_mock", patch.start())
+            self.addCleanup(patch.stop)
+
+    def run_cmd(self, *args):
+        parsed = self.parse(*args)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            parsed.fn(parsed)
+        return out.getvalue()
+
+    def test_suggest_resolves_names_and_reparents_before_removing(self):
+        out = self.run_cmd("suggest", "Tailshare", "--set", "AppDev.reports_to=null", "--remove", "Lead",
+                           "--why", "new structure")
+        sg = json.loads(out)["suggestion"]
+        self.assertEqual(sg["ops"], [{"op": "set", "member": "m1", "field": "reports_to", "value": None},
+                                     {"op": "remove_member", "member": "lead"}])
+        self.assertEqual(sg["base"], self.version())
+        self.assertIn(sg["id"], self.run_cmd("suggestions", "--json"))
+
+    def test_files_and_join(self):
+        with tempfile.TemporaryDirectory() as td:
+            add, instructions = td + "/member.json", td + "/instructions.txt"
+            with open(add, "w") as f:
+                json.dump({"name": "Helper", "host": "air", "kind": "codex", "folder": "/helper"}, f)
+            with open(instructions, "w") as f:
+                f.write("Whole instructions.\nSecond line.")
+            sg = json.loads(self.run_cmd("suggest", "--add", add, "--join", "PM", "--role", "planner",
+                                         "--instructions", "AppDev", instructions, "--why", "help"))["suggestion"]
+        self.assertEqual([o["op"] for o in sg["ops"]], ["add_member", "add_member", "set"])
+        self.assertTrue(sg["ops"][1]["self"])
+        self.assertEqual(sg["ops"][2]["value"], "Whole instructions.\nSecond line.")
+
+    def test_apply_displays_whole_diff_and_uses_displayed_base(self):
+        sg = self.suggest(ops=[{"op": "set", "member": "m1", "field": "instructions", "value": "All of it.\nEnd."}])
+        with mock.patch.object(squads_cli, "_human_check"), mock.patch("builtins.input", return_value="n"), \
+                mock.patch.object(squads_cli, "_write") as write:
+            out = self.run_cmd("apply", sg["id"])
+            write.assert_not_called()
+            self.assertIn("You are AppDev.", out)
+            self.assertIn("All of it.\\nEnd.", out)
+        def changed(*args):
+            self.m.patch("sq1/members/m1", role="changed elsewhere", base_rev=self.m.squads.squad("sq1")["members"][1]["rev"])
+            return "y"
+        with mock.patch.object(squads_cli, "_human_check"), mock.patch("builtins.input", side_effect=changed), \
+                mock.patch.object(squads_cli, "_write", side_effect=lambda method, path, body:
+                    self.m.squads.route(method, path, body, True, "127.0.0.1", {}, TOKEN)):
+            with self.assertRaises(bus.BusError) as c:
+                self.run_cmd("apply", sg["id"])
+        self.assertEqual(str(c.exception), "stale")
+
+    def test_agents_cannot_apply_or_dismiss(self):
+        with mock.patch.dict(os.environ, {keys.AGENT_ENV[0]: "yes"}), \
+                mock.patch.object(squads_cli, "_write") as write:
+            for cmd in ("apply", "dismiss"):
+                with self.assertRaises(ValueError):
+                    self.run_cmd(cmd, "sg_" + "a" * 22)
+            write.assert_not_called()
+
+    def test_mcp_proposes_but_never_applies(self):
+        ops = [{"op": "set", "member": "m1", "field": "role", "value": "MCP"}]
+        with mock.patch.object(mcp, "_identity"):
+            out = json.loads(mcp._tool("squad", {"action": "suggest", "ops": ops, "why": "help"}))
+            self.assertEqual(out["suggestion"]["ops"], ops)
+            self.assertEqual(out["suggestion"]["status"], "pending")
+            with self.assertRaises(ValueError):
+                mcp._tool("squad", {"action": "apply"})
 
 
 if __name__ == "__main__":
