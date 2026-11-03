@@ -380,7 +380,8 @@ class Isolated(Base):
             subprocess.run([TMUX, "-S", str(sock), "kill-server"], capture_output=True)
 
     def run_one(self, **kw):
-        return self.confirm(self.dry(self.item(**kw))[0]["plan_id"])["results"][0]
+        d = self.dry(self.item(**kw))[0]
+        return self.confirm(d["plan_id"])["results"][0] if "plan_id" in d else d
 
     def sessions(self, sock):
         r = subprocess.run([TMUX, "-S", str(sock), "list-windows", "-a", "-F", "#{session_name}:#{window_name}"],
@@ -485,6 +486,7 @@ class Confirm(Base):
         self.assertNotIn("error", self.confirm(pid)["results"][0])  # the pair's start key does
 
     def test_open_plans_are_capped(self):
+        self.config(max_running=100)
         for _ in range(start.MAX_OPEN_PLANS // start.MAX_ITEMS):
             self.assertNotIn("error", self.dry(*[self.item()] * start.MAX_ITEMS)[-1])
         r = self.call({"v": 1, "dry_run": True, "starts": [self.item()]})
@@ -513,9 +515,15 @@ class Confirm(Base):
         r = self.confirm(*(x["plan_id"] for x in first))["results"]
         self.assertNotIn("error", r[0])
         self.assertEqual(r[1]["error"], "running")
-        names = [self.item(name=f"m{i}") for i in range(4)]
-        r = self.confirm(*(x["plan_id"] for x in self.dry(*names)))["results"]
-        self.assertEqual([x.get("error") for x in r], [None, None, None, "limit"])
+        late = self.dry(self.item(name="late"))[0]["plan_id"]  # fits now, not once the others run
+        d = self.call({"v": 1, "dry_run": True, "starts": [self.item(name=f"m{i}") for i in range(4)]})
+        self.assertEqual((d["running"], d["max_running"]), (1, 4))
+        self.assertEqual([x.get("error") for x in d["results"]], [None, None, None, "limit"])
+        self.assertEqual(d["results"][3]["max_running"], 4)
+        r = self.confirm(*(x["plan_id"] for x in d["results"][:3]))["results"]
+        self.assertEqual([x.get("error") for x in r], [None, None, None])
+        r = self.confirm(late)["results"][0]
+        self.assertEqual((r["error"], r["max_running"]), ("limit", 4))  # the confirm checks again
 
     def test_rate_counts_confirms(self):
         for _ in range(start.CONFIRMS_PER_MIN):

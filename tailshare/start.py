@@ -376,6 +376,26 @@ def _from_squad(item: dict, host: str) -> tuple[dict, dict]:
     return out, {"id": head["id"], "name": head["name"], "member": m["id"]}
 
 
+def _reopen(sid: str, cwd: str, name: str, host: str) -> dict | None:
+    """A start that resumes session `sid`: only one this host lists as dead, in its own folder under its own name.
+    Returns the squad it was a member of (it reopens as that member), or None."""
+    from . import dead
+
+    r, live = dead.find(sid)
+    if live:
+        raise Refused("running", "options.resume", "this session is running")
+    if r is None or r["kind"] != "claude":
+        raise Refused("not_dead", "options.resume", "not a session this host lists as dead")
+    if os.path.realpath(r["cwd"]) != cwd:
+        raise Refused("cwd", "cwd", "a session reopens in its own folder")
+    if r["name"] != name:
+        raise Refused("bad_request", "name", "a session reopens under its own name")
+    if not r["squad"]:
+        return None
+    head, m = squad_member(r["squad"], host)
+    return {"id": head["id"], "name": head["name"], "member": m["id"]}
+
+
 def build(item: object, cfg: dict, grant: str, host: str) -> dict:
     """The plan for one start, or Refused. Deterministic for the same item, config, grant and squad."""
     if not isinstance(item, dict):
@@ -403,6 +423,8 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
     auto = autos(kind, opts)
     if auto and not cfg["auto"]:
         raise Refused("not_allowed", "options.permission_mode", "this host does not allow auto mode")
+    if opts.get("resume") and not squad:  # a squad member's resume comes from the squad, signed by its owner
+        squad = _reopen(opts["resume"], cwd, name, host)
     session = str(item.get("_session") or "") if kind == "claude" and not opts.get("resume") else ""
     if kind == "claude":
         session = opts.get("resume") or session
@@ -507,7 +529,8 @@ def launch(plan: dict, max_running: int) -> dict:
     if any((s, n) == (w["session"], w["window"]) for _, s, n in wins) or (not TMUX_SOCKET and _sessions(t, sock)):
         raise Refused("running", "name", "a session with this name is still running here")
     if len(wins) >= max_running:
-        raise Refused("limit", reason=f"{len(wins)} started sessions are running here (at most {max_running})")
+        raise Refused("limit", reason=f"{len(wins)} started sessions are running here (at most {max_running})",
+                      max_running=max_running)
     env = [x for k, v in sorted(plan["env"].items()) for x in ("-e", f"{k}={v}")]
     fmt = ["-P", "-F", "#{pane_id}\t#{socket_path}"]
     argv = argv_for(plan["kind"], plan["argv"][0], plan["cwd"], plan["name"], plan["options"], plan["instructions"],
@@ -584,18 +607,29 @@ def _changed(con: sqlite3.Connection, plan: dict) -> str:
     return f"instructions changed since this member last started ({time.strftime('%Y-%m-%d %H:%M', time.localtime(r['at']))})"
 
 
-def dry_run(con: sqlite3.Connection, starts: object, cfg: dict, grant: str, key: str, host: str) -> list[dict]:
+def running() -> int | None:
+    """How many started sessions run here now, or None if tmux cannot say."""
+    try:
+        return len(_windows(_tmux_bin()))
+    except Refused:
+        return None
+
+
+def dry_run(con: sqlite3.Connection, starts: object, cfg: dict, grant: str, key: str, host: str,
+            fit: int | None = None) -> list[dict]:
     if not isinstance(starts, list) or not 0 < len(starts) <= MAX_ITEMS:
         raise Refused("bad_request", "starts", f"1 to {MAX_ITEMS} starts")
     con.execute("BEGIN IMMEDIATE")
     try:
         n = con.execute("SELECT COUNT(*) FROM plans WHERE key=? AND used IS NULL", (key,)).fetchone()[0]
-        return _dry_run(con, starts, cfg, grant, key, host, MAX_OPEN_PLANS - n)
+        return _dry_run(con, starts, cfg, grant, key, host, MAX_OPEN_PLANS - n, fit)
     finally:
         con.execute("COMMIT")
 
 
-def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: str, host: str, room: int) -> list[dict]:
+def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: str, host: str, room: int,
+             fit: int | None = None) -> list[dict]:
+    """A plan or a refusal per item. With `fit`, how many more may run here: the items past it get "limit"."""
     if len(starts) > room:
         oldest = con.execute("SELECT MIN(expires) FROM plans WHERE key=? AND used IS NULL", (key,)).fetchone()[0]
         raise Refused("rate", retry_after=max(1, int((oldest or time.time()) + 1 - time.time())))
@@ -610,6 +644,12 @@ def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: 
         except Refused as e:
             out.append(e.out)
             continue
+        if fit is not None:
+            if fit <= 0:
+                out.append(Refused("limit", reason=f"at most {cfg['max_running']} started sessions run here",
+                                   max_running=cfg["max_running"]).out)
+                continue
+            fit -= 1
         pid, now = secrets.token_hex(16), time.time()
         con.execute("INSERT INTO plans(id, key, item, plan, created, expires) VALUES(?,?,?,?,?,?)",
                     (pid, key, json.dumps(item), _canon(plan), now, now + PLAN_TTL))
@@ -688,7 +728,10 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
         con = _db(db)
         try:
             if doc.get("dry_run") is True and "confirm" not in doc:
-                return {"v": 1, "results": dry_run(con, doc.get("starts"), cfg, grant, key, host)}
+                n = running()
+                fit = None if n is None else max(0, cfg["max_running"] - n)
+                return {"v": 1, "results": dry_run(con, doc.get("starts"), cfg, grant, key, host, fit),
+                        **({"running": n} if n is not None else {}), "max_running": cfg["max_running"]}
             if "confirm" in doc and "starts" not in doc:
                 if plan_only:
                     raise Refused("no_grant", reason="the plan key only makes plans: confirm with the start key")

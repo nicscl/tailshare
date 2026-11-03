@@ -770,7 +770,14 @@ class Bus:
             if a.get("tmux"):
                 a["tmux"] = {**a["tmux"], "alive": self._pane_alive(a["tmux"])}
         ssh = self.keys.ssh_info() if self.keys else {"enroll": False}
-        out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh}
+        if own:  # the id a session resumes by (tailshare/dead.py): for the owner's devices, to tell started and dead apart
+            from .dead import session_id
+
+            for a, f in zip(agents, full):
+                if session_id(f["harness"] or "", f["id"]):
+                    a["session_id"] = session_id(f["harness"] or "", f["id"])
+        out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh,
+               "sessions_dead": 1}
         if ip:
             out["you"] = {"user": u, "node": self.net.host_for_ip(ip) or ""}
             if self.squads is not None:
@@ -911,6 +918,15 @@ class Bus:
         if not self.net.user or self.net.user == "tagged-devices":
             raise BusError("this machine has no single tailnet owner", 403)
         return {"folders": start.folders()}
+
+    def dead_sessions(self, ip: str) -> dict:
+        """GET /sessions/dead: sessions that ran here lately and whose pane is gone, for the owner's devices."""
+        from . import dead
+
+        self.require_same_user(ip)
+        if not self.net.user or self.net.user == "tagged-devices":
+            raise BusError("this machine has no single tailnet owner", 403)
+        return dead.listing(self.net.host)
 
     def require_same_user(self, ip: str) -> None:
         """Only machines owned by this machine's tailnet user may update it or read its sessions."""
@@ -1185,6 +1201,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello(ip))
+                if (method, path) == ("GET", "/sessions/dead"):
+                    return self._reply(200, b.dead_sessions(ip))
                 if (method, path) == ("GET", "/sessions/start/folders"):
                     return self._reply(200, b.start_folders(ip))
                 if (method, path) == ("GET", "/peers"):

@@ -170,7 +170,9 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 - 32 items per request; 6 confirms a minute per key; 128 open (unconfirmed) plans per key (`rate`, with
   `retry_after` in seconds).
 - `max_running` started agents at once, counted over every `ts-*` server plus windows that older versions
-  started on the default server (`limit`).
+  started on the default server (`limit`, with `max_running` as a number). A dry run says how many run now
+  (`running`, when tmux can tell) and the `max_running` at the top, and the items past what still fits get `limit`
+  instead of a plan; a confirm checks again and stops at the limit.
 
 | error | meaning |
 |---|---|
@@ -179,12 +181,40 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 | `no_grant` / `no_skip_grant` | the key cannot start (or is the plan key, confirming) / cannot skip permissions |
 | `off` | starting is off on this machine |
 | `not_installed` / `no_tmux` | the agent / tmux is not installed |
-| `running` | a session with this name is already running |
+| `running` | a session with this name is already running (or, with `options.resume`, that session is) |
+| `not_dead` / `cwd` | `options.resume` names no session in this host's dead list / not in its own folder |
 | `limit` / `rate` | too many sessions / too many confirms |
 | `expired` / `unknown_plan` / `changed` | dry run again |
 | `root` | tailshare runs as root here |
 | `failed` | tmux refused; `reason` says why |
 | `no_bus` | the bus is not running on this host, so nothing was launched |
+
+## Reopening a dead session
+
+`GET /bus/v1/sessions/dead` (devices of the machine's own tailnet user only, header `X-Tailshare: 1`) lists the agent
+sessions this machine ran in the last 7 days whose tmux pane is gone (or taken by a newer agent), newest first, at most
+50:
+
+```json
+{"host": "macbook-air", "max_age": 604800, "limit": 50, "sessions": [
+  {"id": "<session uuid>", "kind": "claude", "address": "macbook-air/claude/app/appdev", "name": "AppDev",
+   "folder": "app", "cwd": "/Users/me/projects/app", "title": "AppDev", "squad": {"id": "…", "member": "…"} | null,
+   "last_seen": 1793390000.0, "resumable": true}]}
+```
+
+- `last_seen` is epoch seconds. `name` is the session's name (`--name` or `/rename`), which a reopen keeps; `title`
+  is the same, at most 120 characters.
+- Only sessions with an id to resume by (Claude's session uuid, Codex's thread id), never an agent that is online,
+  and never one on a `ts-*` server that `tailshare start` did not make (ts-agents brings those back itself).
+- `resumable: false` comes with a `reason`: `kind` (only Claude sessions reopen), `off` (starting is off here, or
+  claude's options do not include `resume`), `cwd` (its folder is gone or outside the roots), `name`.
+- `/hello` has `"sessions_dead": 1` where the route exists, and for the owner's devices each Claude or Codex agent
+  carries `session_id`, so a device can tell a live session from a dead one and a started tab from its agent.
+
+To reopen one, a device sends an ordinary start item with `options.resume` set to the id, `cwd` the recorded
+`cwd` and `name` the recorded `name`; it is signed, dry-run and confirmed like any start and runs on its own server.
+A squad member reopens as that member (its squad's tmux session, `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER`). Several at
+once are just several items (at most 32).
 
 ## What a device can see
 
