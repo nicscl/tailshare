@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from tailshare import bus, keys, sessions
+from tailshare import bus, keys, sessions, start
 from tests.test_bus import StaticNet, free_port, make_bus
 
 OWNER = "nick@example.com"
@@ -924,6 +925,117 @@ class GateEndToEnd(unittest.TestCase):
         subprocess.run([self.tmux, "-S", self.sock, "kill-server"], check=True)
         with self.assertRaises(SystemExit):  # registered, but the pane is gone
             self.gate(f"tmux -S {self.sock} attach -t {self.pane}")
+        self.assertEqual(self.execs, [])
+
+
+
+class GateJustStarted(unittest.TestCase):
+    """A pane `tailshare start` launched may be attached to before its agent registers: only on a ts-* socket of this
+    user, only the exact pane the confirm's result recorded, only while it lives, and only for LAUNCHED_ATTACH."""
+
+    def setUp(self):
+        self.tmux = keys.tmux_binary("")
+        self.state = Path(tempfile.mkdtemp())
+        self.env = {"HOME": str(self.state), "PATH": "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin", "TERM": "xterm"}
+        self.dir = Path(tempfile.mkdtemp(dir="/tmp"))  # short: sun_path is ~104 bytes
+        self.sock, self.plain = str(self.dir / "ts-new"), str(self.dir / "plain")
+        self.panes = {}
+        for sock in (self.sock, self.plain):
+            subprocess.run([self.tmux, "-S", sock, "new-session", "-d", "-s", "tailshare-start", "sleep 60"],
+                           check=True, env=self.env)
+            self.addCleanup(subprocess.run, [self.tmux, "-S", sock, "kill-server"], capture_output=True, env=self.env)
+            self.panes[sock] = self.tmux_out(sock, "display", "-p", "#{pane_id}")
+        self.pane = self.panes[self.sock]
+        self.other = self.tmux_out(self.sock, "split-window", "-d", "-P", "-F", "#{pane_id}", "sleep 60")  # same server
+        bus.Store(self.state / "bus.db")  # a bus database with no agents at all
+        self.old = bus.STATE_DIR, os.execv, os.environ.get("SSH_ORIGINAL_COMMAND")
+        bus.STATE_DIR = self.state
+        self.execs = []
+        os.execv = lambda path, argv: self.execs.append(argv)
+        self.con = start._db(self.state / "start.db")
+        self.addCleanup(self.con.close)
+
+    def tearDown(self):
+        bus.STATE_DIR, os.execv = self.old[0], self.old[1]
+        if self.old[2] is None:
+            os.environ.pop("SSH_ORIGINAL_COMMAND", None)
+        else:
+            os.environ["SSH_ORIGINAL_COMMAND"] = self.old[2]
+
+    def tmux_out(self, sock, *args):
+        return subprocess.run([self.tmux, "-S", sock, *args], capture_output=True, text=True, check=True,
+                              env=self.env).stdout.strip()
+
+    def plan(self, sock=None, pane=None, ago=5, launched=True, result=None):
+        pid = secrets.token_hex(16)
+        now = time.time()
+        res = result if result is not None else {"session": "s", "tmux": {"socket": sock or self.sock,
+                                                                           "pane": pane or self.pane, "bin": self.tmux}}
+        self.con.execute("INSERT INTO plans(id, key, item, plan, created, expires, used, result, approved, launched)"
+                         " VALUES(?,?,?,?,?,?,?,?,?,?)", (pid, "k" + "a" * 12, "{}", "{}", now - ago - 1, now + 60,
+                                                         now - ago, json.dumps(res), now - ago,
+                                                         now - ago if launched else None))
+        self.con.commit()
+
+    def gate(self, sock=None, pane=None):
+        os.environ["SSH_ORIGINAL_COMMAND"] = f"tmux -S {sock or self.sock} attach -t {pane or self.pane}"
+        keys.cmd_gate(None)
+
+    def refused(self, **kw):
+        with self.assertRaises(SystemExit):
+            self.gate(**kw)
+        self.assertEqual(self.execs, [])
+
+    def test_attaches_before_the_agent_registers(self):
+        self.plan()
+        self.gate()
+        self.assertEqual(self.execs, [[self.tmux, "-S", self.sock, "attach", "-t", self.pane]])
+
+    def test_nothing_launched_nothing_attached(self):
+        self.refused()
+
+    def test_an_old_plan(self):
+        self.plan(ago=keys.LAUNCHED_ATTACH + 5)
+        self.refused()
+
+    def test_a_socket_that_is_not_ts(self):
+        self.plan(sock=self.plain, pane=self.panes[self.plain])
+        self.refused(sock=self.plain, pane=self.panes[self.plain])
+
+    def test_a_dead_pane(self):
+        self.plan()
+        subprocess.run([self.tmux, "-S", self.sock, "kill-server"], check=True, env=self.env)
+        self.refused()
+
+    def test_another_pane_than_the_result(self):
+        self.plan()
+        self.refused(pane=self.other)  # alive, own, ts-*, same server: still not the one launched
+        self.refused(sock=self.plain)  # the same %N on another server
+
+    def test_a_plan_never_launched(self):
+        self.plan(launched=False)
+        self.refused()
+
+    def test_a_failed_start(self):
+        self.plan(result={"error": "failed", "tmux": {"socket": self.sock, "pane": self.pane}})
+        self.refused()
+
+    def test_a_start_db_others_may_write(self):
+        self.plan()
+        os.chmod(self.state / "start.db", 0o666)
+        self.refused()
+        with self.assertRaises(OSError):
+            keys.launched_panes(self.state / "start.db")
+
+    def test_control_mode_still_filtered(self):
+        self.plan()
+        with mock.patch("tailshare.gate_control.run", return_value=0) as run, self.assertRaises(SystemExit):
+            os.environ["SSH_ORIGINAL_COMMAND"] = f"tmux -S {self.sock} -C attach -r -t {self.pane}"
+            keys.cmd_gate(None)
+        self.assertEqual(run.call_args.args[0]["pane"], self.pane)
+        os.environ["SSH_ORIGINAL_COMMAND"] = f"tmux -CC -S {self.sock} attach -t {self.pane}"
+        with self.assertRaises(SystemExit):
+            keys.cmd_gate(None)
         self.assertEqual(self.execs, [])
 
 

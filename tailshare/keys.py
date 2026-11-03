@@ -544,6 +544,42 @@ def registered_panes(db: Path) -> list[dict]:
     return out
 
 
+LAUNCHED_ATTACH = 600  # seconds after a start launched it that its pane may be attached to before its agent registers
+
+
+def launched_panes(db: Path, now: float | None = None) -> list[dict]:
+    """Panes `tailshare start` launched here in the last LAUNCHED_ATTACH seconds, on this user's per-agent servers
+    (ts-*), as each confirm's result recorded them: so a device can attach while the agent still sits at a first-run
+    prompt, before it registers. No new access: once the agent registers, every pane key may attach to it anyway.
+    Read straight from start.db, read-only, with the same ownership check as bus.db; [] if there is none."""
+    import sqlite3
+
+    from .start import LABEL
+
+    if not db.exists():
+        return []
+    st = db.stat()
+    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise OSError(f"{db} must belong to this user and not be writable by others")
+    now = time.time() if now is None else now
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = con.execute("SELECT id, result FROM plans WHERE launched IS NOT NULL AND launched>? AND result IS NOT NULL",
+                           (now - LAUNCHED_ATTACH,)).fetchall()
+    finally:
+        con.close()
+    out = []
+    for pid, raw in rows:
+        try:
+            r = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        t = bus.clean_tmux(r.get("tmux")) if isinstance(r, dict) and "error" not in r else {}
+        if t and Path(t["socket"]).name.startswith(LABEL):
+            out.append({"address": f"(started just now, plan {pid[:8]})", "tmux": t})
+    return out
+
+
 def trusted_file(path: str) -> bool:
     """A binary only this user or root can change."""
     try:
@@ -584,6 +620,10 @@ def cmd_gate(args) -> None:
         panes = registered_panes(bus.STATE_DIR / "bus.db")
     except Exception as e:  # noqa: BLE001
         sys.exit(f"tailshare ssh-gate: cannot read the registered panes ({e})")
+    try:
+        panes += launched_panes(bus.STATE_DIR / "start.db")
+    except Exception as e:  # noqa: BLE001  (registered panes still work; just-started ones wait for their agent)
+        log(f"ssh-gate: cannot read the started panes ({e})")
     if not cmd:
         print("This key can only attach to the tmux pane of an agent on this machine:", file=sys.stderr)
         for p in panes:
