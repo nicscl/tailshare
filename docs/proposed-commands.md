@@ -149,7 +149,7 @@ that the path alone identifies code.
 
 A proposal is `pending`, `stale`, `running`, `done`, `failed`, `refused`, `interrupted`, `expired` or `declined`. A dependency
 change makes it stale. Do not mutate its hashed fields in place: the agent proposes a new plan and the owner
-reviews it again. **Review Again** on a stale card reads that original proposal and explains that the agent must
+reviews it again. **Review…** on a stale card (tinted, read-only) reads that original proposal and explains that the agent must
 submit a replacement; it never swaps a new hash into the same id or enables approval of the stale plan. More proposers/reasons or a run result do not change the plan. The app refreshes while Review
 is open, shows full instructions/argv where applicable, and disables approval whenever its displayed hash fails.
 
