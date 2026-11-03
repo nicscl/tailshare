@@ -1,6 +1,6 @@
 # Squad suggestions
 
-> Status: contract, not built yet. The Hive app checks it against this text before the server is written.
+> Status: implementation in PR #42; app and server use this contract.
 
 An agent can't change a [squad](squads.md): `tailshare squad edit` needs a person at a terminal, and a device signs
 its writes. An agent can **suggest** a change instead. The suggestion waits until the owner applies it, from
@@ -29,8 +29,8 @@ yet can ask to join.
 {agent: <agent id>, base: <squad version>, why: text ≤ 600, ops: [op, …] (1–8)}
 ```
 
-`base` is the `version` from `GET /squads/<id>`. The server adds `version` to that answer. It is the squad's
-checksum, the one machines already compare (`squad_sums` in /hello), so it is the same on every machine of the
+`base` is the top-level `version` from `GET /squads/<id>` (beside `squad`, not inside it).
+It is the squad's checksum, the one machines already compare (`squad_sums` in /hello), so it is the same on every machine of the
 owner. If `base` is not the current version, the suggestion is refused with 409 `stale`.
 
 An op is one of:
@@ -44,8 +44,11 @@ An op is one of:
 - An `add_member` that isn't a self-join may only place the new member on one of the owner's own machines: its
   `host` must be a machine of the squad's owner (the same tailnet user, not tagged). Otherwise 400 with
   `field: "host"`.
-- Each op is cleaned with the same rules as a write (`clean_member`, the 3-level tree, 32 members, unique names).
+- Each op is cleaned with the same rules as a write (`clean_member`, the 3-level tree, 32 members).
   A suggestion that would be refused as a write is refused when suggested, with the same `field`/`reason`.
+  Suggestions also require unique final member names: collapse whitespace runs, then Unicode lowercase;
+  no accent folding. This is checked when suggested and again when applied.
+- Removing a member that others still report to is refused. Set their `reports_to` first, in earlier ops.
 - `reports_to` in an op may name a member added earlier in the same suggestion, as `"new:<index>"`.
 - Agents can't suggest `shares`, `show_paths`, header fields, or a member's `start` (options, permission modes,
   resume, prompt). Those are left to the owner's own edits. An op naming one is a 400.
@@ -55,7 +58,7 @@ An op is one of:
   applied, the agent is that member from its next ts-agents `up` (see Joining, below). Its card reads
   "<agent> asks to join as <name>".
 
-Answer: `201 {suggestion}`.
+Answer: `200 {suggestion}`.
 
 **Limits.**
 - Per squad: 20 pending.
@@ -67,14 +70,15 @@ Answer: `201 {suggestion}`.
 
 ```
 {id: "sg_<22 base62>", squad, host, base, created, status, why,
- by: {agent, host, member | null},
+ by: {agent, host, member | null, name?: <member name at base>},
  ops: [op, …],
  diff: [change, …],
  resolved: null | {at, how: "applied" | "dismissed" | "expired"}}
 ```
 
-`by.member` is the suggester's member **id** (or null), not its name. The app shows the name from the squad at
-`base`. A member that was removed or renamed since then is shown as it was at `base`.
+`by.member` is the suggester's member **id** (or null), not its name. The optional `by.name` snapshots the member name at
+`base`, so removed or renamed authors keep that label. Older suggestions without it fall back to `by.agent`;
+the app must not substitute a later member name.
 
 `status` is `pending`, `stale`, `applied`, `dismissed` or `expired`. It is `stale` whenever `base` is not the current
 version. That is worked out when the suggestion is read, so a suggestion goes stale as soon as anything changes the
@@ -120,14 +124,27 @@ Apply:
   then replicates as usual, and every other pending suggestion for it goes stale;
 - refuses with 409 `not_pending` if the suggestion was already applied, dismissed or expired.
 
-Dismiss marks it `dismissed`.
+Dismiss marks it `dismissed`, including a stale suggestion. A resolved or expired one returns 409
+`not_pending` with `{suggestion}`. HTTP errors use the `error` field (`stale` or `not_pending`); `reason`
+is optional explanatory detail. Successful apply returns `{suggestion, squad}` with the full updated squad;
+there is no new-member-id mapping. Match an applied self-join by exact host/kind/folder from its op in that
+snapshot. Successful dismiss returns `{suggestion}`.
 
 Terminal: `tailshare squad suggestions [SQUAD] [--all]` lists them, and `tailshare squad apply <sid>` prints the
 whole diff (instructions in full) and asks `Apply? [y/N]`. Like `squad edit`, it refuses to run in an AI agent's
-shell. `tailshare squad dismiss <sid>` dismisses one.
+shell. `tailshare squad dismiss <sid>` dismisses one, with the same human check. Apply and dismiss must run on the
+suggestion's host; use Hive to act from another device. Listing defaults to this session's squad, or all local
+squads when the session is unbound. `--all` also queries other owner machines.
 
-Agents: `tailshare squad suggest` (with `--add FILE`, `--join NAME --role ROLE`, `--remove MEMBER`,
+Agents: `tailshare squad suggest [SQUAD]` (with `--add FILE`, `--join NAME --role ROLE`, `--remove MEMBER`,
 `--set MEMBER.FIELD=VALUE`, `--instructions MEMBER FILE`, `--why`), or the `squad` MCP tool's `suggest` action.
+
+CLI operations are ordered: additions, self-join, sets, instructions, removals. Reparenting with `--set`
+therefore precedes removal. For other dependent changes, use the MCP `suggest` action with an explicitly
+ordered `ops` array. `--set` values
+are text except `reports_to`: a member name/id, `new:<index>`, or `null` to clear it. `--add` reads one member
+JSON object per file. MCP takes `action: "suggest"`, optional `squad`, required `why` and `ops`; omitting the
+action keeps the existing read behavior.
 
 ## Joining
 
