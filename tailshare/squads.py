@@ -229,6 +229,19 @@ class Conflict(bus.BusError):
         super().__init__("conflict", 409, {what: current})
 
 
+HOLD = 24 * 3600  # a member's session quiet this long, with no live process, no longer stops a join
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)  # signal 0: only asks whether the process exists
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OverflowError, ValueError):
+        return isinstance(pid, int) and pid > 0
+    return True
+
+
 class Squads:
     def __init__(self, b: bus.Bus) -> None:
         self.bus, self.store = b, b.store
@@ -341,6 +354,17 @@ class Squads:
         r = self.store.one("SELECT squad, member FROM squad_joins WHERE agent=?", aid)
         return {"id": r["squad"], "member": r["member"]} if r else {}
 
+    def _held(self, tag: dict, aid: str) -> bool:
+        """Whether another session still holds the member, for a join: one quiet for more than 90 s still counts while
+        its process is alive or it was heard from within HOLD (a member that sat idle mustn't lose its pane to a join).
+        Only one gone that long, with no live process, gives the member up."""
+        now = time.time()
+        for r in self.store.q("SELECT pid, last_seen FROM agents WHERE squad=? AND id!=?",
+                              json.dumps(tag, sort_keys=True), aid):
+            if r["last_seen"] > now - HOLD or (r["pid"] and _pid_alive(r["pid"])):
+                return True
+        return False
+
     def _why_not(self, tag: dict, aid: str, a) -> str:
         d = self.squad(tag["id"])
         m = next((x for x in (d or {}).get("members", []) if x["id"] == tag["member"]), None)
@@ -368,6 +392,9 @@ class Squads:
             if a["squad"] and json.loads(a["squad"]) != tag:
                 raise bus.BusError("already_a_member", 409, {"reason": "this session is already another member: "
                                                                         "`tailshare squad leave` first"})
+            if self._held(tag, aid):
+                raise bus.BusError("not_that_member", 409, {"reason": "another session is that member (it may be idle; "
+                                                                      "it still exists)"})
             if not self.check_tag(tag, aid, a["harness"], a["cwd"]):
                 raise bus.BusError("not_that_member", 409, {"reason": self._why_not(tag, aid, a)})
             self.store.x("INSERT INTO squad_joins VALUES(?,?,?,?) ON CONFLICT(agent) DO UPDATE SET squad=excluded.squad,"

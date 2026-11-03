@@ -561,7 +561,7 @@ class Joining(unittest.TestCase):
         self.assertEqual(self.refused("s1", "../", 400).code, 400)
         self.join("s1", "m1")
         reg(self.m.bus, "s3", "app", cwd="/u/projects/app")
-        self.assertIn("another running session", self.refused("s3", "m1").extra["reason"])
+        self.assertIn("another session is that member", self.refused("s3", "m1").extra["reason"])
 
     def test_a_member_already_is_refused_and_env_wins(self):
         self.m.put("sq2", name="B", members=[{"id": "b1", **member(name="B1")}])
@@ -575,9 +575,19 @@ class Joining(unittest.TestCase):
         self.assertIsNone(a["squad"])  # s1 holds m1; the env tag is still tried first, not the join
         self.assertEqual(reg(self.m.bus, "s2", "app", cwd="/u/projects/app")["squad"], {"id": "sq2", "member": "b1"})
 
+    def test_a_quiet_member_still_holds_it(self):
+        reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
+        self.m.bus.store.x("UPDATE agents SET last_seen=? WHERE id='s1'", time.time() - 3600)  # idle an hour
+        reg(self.m.bus, "s2", "app", cwd="/u/projects/app")
+        self.assertIn("still exists", self.refused("s2", "m1").extra["reason"])
+        self.m.bus.store.x("UPDATE agents SET last_seen=?, pid=? WHERE id='s1'", time.time() - 2 * squads.HOLD, os.getpid())
+        self.assertIn("still exists", self.refused("s2", "m1").extra["reason"])  # its process is alive
+        self.m.bus.store.x("UPDATE agents SET pid=0 WHERE id='s1'")
+        self.assertEqual(self.join("s2", "m1")["agent"]["squad"], {"id": "sq1", "member": "m1"})  # gone a day
+
     def test_the_member_started_as_it_takes_it_back_from_a_joiner(self):
         real = reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})
-        self.m.bus.store.x("UPDATE agents SET last_seen=0 WHERE id='s1'")  # quiet for more than 90 s
+        self.m.bus.store.x("UPDATE agents SET last_seen=? WHERE id='s1'", time.time() - 2 * squads.HOLD)  # gone a day
         reg(self.m.bus, "s2", "app", cwd="/u/projects/app")
         self.join("s2", "m1")
         a = reg(self.m.bus, "s1", "app", cwd="/u/projects/app", squad={"id": "sq1", "member": "m1"})

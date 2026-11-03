@@ -93,7 +93,8 @@ started here.
 A session that was not started from the squad (one already running, or started by ts-agents) can become a member
 without a restart: `tailshare squad join <squad> <member>` (squad and member by name or id). The bus checks it
 the same way as a tag from the environment: the member runs on this machine, is of the session's kind and has
-its folder, and no other live agent holds it. Otherwise it says why (`409 not_that_member` with a `reason`). A
+its folder, and no other session holds it. For a join, a holder that went quiet still holds the member while
+its process is alive or it was heard from in the last 24 h. An idle member keeps its pane. Otherwise it says why (`409 not_that_member` with a `reason`). A
 session that is already another member is refused (`409 already_a_member`); `tailshare squad leave` first. A
 session started as a member stays that member.
 
@@ -101,7 +102,7 @@ The join is stored for the session's id, so later registrations without `TAILSHA
 keep it; `check_tag` still decides each time, and a join that no longer matches is not used. Variables from the
 environment are tried first, and they win: when the session started as the member registers while one that only
 joined it holds it (the real one was quiet for more than 90 s), the joiner's join is dropped and the member goes
-back to the started session. `leave` doesn't undo a member a session was started as. Joins of sessions the bus no longer knows are dropped when it prunes.
+back to the started session, on its next registration. `leave` doesn't undo a member a session was started as. Joins of sessions the bus no longer knows are dropped when it prunes.
 
 A join only labels a session: it changes no squad and needs no keys token. It is `POST
 /bus/v1/squads/<id>/join` `{agent, member}` and `POST /bus/v1/squads/<id>/leave` `{agent}`, on the local API
