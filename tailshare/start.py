@@ -711,6 +711,31 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
     return result
 
 
+def close(con: sqlite3.Connection, ids: object, key: str) -> list[dict]:
+    """`{"v":1, "close":["<session id>", …]}`: end sessions `tailshare start` started here. Counts against the
+    same per-key rate as confirms. The bus does the closing (close_started), as it does the launching."""
+    if not isinstance(ids, list) or not 0 < len(ids) <= MAX_ITEMS or not all(isinstance(i, str) for i in ids):
+        raise Refused("bad_request", "close", f"1 to {MAX_ITEMS} session ids")
+    now = time.time()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        recent = con.execute("SELECT at FROM confirms WHERE key=? AND at>? ORDER BY at", (key, now - 60)).fetchall()
+        if len(recent) >= CONFIRMS_PER_MIN:
+            raise Refused("rate", retry_after=max(1, int(recent[0]["at"] + 61 - now)))
+        con.execute("INSERT INTO confirms(key, at) VALUES(?,?)", (key, now))
+    finally:
+        con.execute("COMMIT")
+    out = []
+    for sid in ids:
+        try:
+            if not _UUID.fullmatch(sid.lower()):
+                raise Refused("bad_request", "close", "a session id")
+            out.append({"session_id": sid.lower(), **_ask_bus({"v": 1, "close": sid.lower()})})
+        except Refused as e:
+            out.append({"session_id": sid.lower(), **e.out})
+    return out
+
+
 def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None = None,
            db: Path | None = None, plan_only: bool = False) -> dict:
     """One `tailshare-start` call: {"v":1, "results":[…]} or {"v":1, "error":…}. `plan_only`: the call came in on
@@ -727,16 +752,20 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             raise Refused("bad_request", "v")
         con = _db(db)
         try:
-            if doc.get("dry_run") is True and "confirm" not in doc:
+            if doc.get("dry_run") is True and "confirm" not in doc and "close" not in doc:
                 n = running()
                 fit = None if n is None else max(0, cfg["max_running"] - n)
                 return {"v": 1, "results": dry_run(con, doc.get("starts"), cfg, grant, key, host, fit),
                         **({"running": n} if n is not None else {}), "max_running": cfg["max_running"]}
-            if "confirm" in doc and "starts" not in doc:
+            if "close" in doc and not {"starts", "confirm", "dry_run"} & set(doc):
+                if plan_only:
+                    raise Refused("no_grant", reason="the plan key only makes plans: close with the start key")
+                return {"v": 1, "results": close(con, doc.get("close"), key)}
+            if "confirm" in doc and "starts" not in doc and "close" not in doc:
                 if plan_only:
                     raise Refused("no_grant", reason="the plan key only makes plans: confirm with the start key")
                 return {"v": 1, "results": confirm(con, doc.get("confirm"), cfg, grant, key, host)}
-            raise Refused("bad_request", reason="send either dry_run with starts, or confirm")
+            raise Refused("bad_request", reason="send either dry_run with starts, confirm, or close")
         finally:
             con.close()
     except Refused as e:
@@ -798,6 +827,64 @@ def launch_approved(pid: object) -> dict:
         return e.out
 
 
+CLOSE_WAIT = 5  # seconds a closed pane has to go away
+
+
+def close_started(sid: object) -> dict:
+    """In the bus: end the live session `sid` if `tailshare start` started it here, on this user's own per-agent
+    server, and mark it ended, so it is listed as dead (dead.rows) and may be reopened at once. Never a pane
+    tailshare did not start: not the user's own sessions, not ts-agents' (which brings its agents back)."""
+    from . import dead, keys
+
+    try:
+        if not isinstance(sid, str) or not _UUID.fullmatch(sid):
+            raise Refused("bad_request", "close", "a session id")
+        cfg = load_config()
+        if not cfg or not cfg["roots"] or not cfg["kinds"]:
+            raise Refused("off", reason="starting sessions is off on this host")
+        db = bus.STATE_DIR / "bus.db"
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            try:
+                con.row_factory = sqlite3.Row
+                rows = con.execute("SELECT id, harness, tmux, state, last_seen FROM agents WHERE lower(id)=?",
+                                   (sid,)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            raise Refused("no_bus", reason="cannot read the bus's agents") from None
+        row = next((r for r in rows if dead.session_id(r["harness"] or "", r["id"]) == sid), None)
+        if row is None or not dead.is_live(row):
+            raise Refused("not_running", "close", "no session with this id runs here")
+        t = bus.clean_tmux(dead._json(row["tmux"]))
+        session = (t.get("target") or "").rsplit(":", 1)[0] if t else ""
+        if not t or not Path(t["socket"]).name.startswith(LABEL) or not session.startswith(dead.STARTED):
+            raise Refused("not_started", "close", "tailshare closes only sessions it started")
+        binary = keys.tmux_binary(t["bin"])
+        if not binary:
+            raise Refused("no_tmux", reason="no tmux binary that only this user or root can change")
+        if not (keys.own_socket(t["socket"]) and keys.pane_alive(binary, t["socket"], t["pane"])):
+            raise Refused("not_running", "close", "its pane is gone already")
+        r = subprocess.run([binary, "-S", t["socket"], "kill-pane", "-t", t["pane"]], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+        end = time.time() + CLOSE_WAIT
+        while keys.pane_alive(binary, t["socket"], t["pane"]):
+            if time.time() > end:
+                raise Refused("failed", reason=(r.stderr.strip() or "the pane is still there")[:200])
+            time.sleep(0.1)
+        now = time.time()
+        rw = sqlite3.connect(str(db), timeout=10)
+        try:
+            rw.execute("UPDATE agents SET state=? WHERE id=?",
+                       (json.dumps({"v": "ended", "since": now, "at": now}), row["id"]))
+            rw.commit()
+        finally:
+            rw.close()
+        return {"closed": True, "tmux": {"socket": t["socket"], "pane": t["pane"]}}
+    except Refused as e:
+        return e.out
+
+
 def _serve_one(conn: socket.socket) -> None:
     with conn:
         conn.settimeout(10)
@@ -814,10 +901,12 @@ def _serve_one(conn: socket.socket) -> None:
                 req = json.loads(raw.split(b"\n", 1)[0])
             except ValueError:
                 req = None
-            if not isinstance(req, dict) or req.get("v") != 1 or set(req) != {"v", "launch"}:
-                out = {"error": "bad_request"}
-            else:
+            if isinstance(req, dict) and req.get("v") == 1 and set(req) == {"v", "launch"}:
                 out = launch_approved(req["launch"])
+            elif isinstance(req, dict) and req.get("v") == 1 and set(req) == {"v", "close"}:
+                out = close_started(req["close"])
+            else:
+                out = {"error": "bad_request"}
             conn.sendall(json.dumps(out).encode() + b"\n")
         except OSError:
             pass
@@ -856,6 +945,10 @@ def serve_launches() -> socket.socket:
 
 def via_bus(pid: str) -> dict:
     """In the gate: have the bus launch the approved plan `pid`. Never launches it here."""
+    return _ask_bus({"v": 1, "launch": pid})
+
+
+def _ask_bus(req: dict) -> dict:
     path = launch_socket()
     try:
         st = os.lstat(path.parent)
@@ -864,7 +957,7 @@ def via_bus(pid: str) -> dict:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
             c.settimeout(LAUNCH_WAIT)
             c.connect(str(path))
-            c.sendall(json.dumps({"v": 1, "launch": pid}).encode() + b"\n")
+            c.sendall(json.dumps(req).encode() + b"\n")
             raw = b""
             while b"\n" not in raw and len(raw) < 65536:
                 chunk = c.recv(65536)

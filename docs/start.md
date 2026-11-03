@@ -216,6 +216,31 @@ To reopen one, a device sends an ordinary start item with `options.resume` set t
 A squad member reopens as that member (its squad's tmux session, `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER`). Several at
 once are just several items (at most 32).
 
+## Closing a session
+
+The start key (with Face ID; never the plan key) may also end sessions `tailshare start` started here, on the same
+`tailshare-start` command:
+
+```json
+{"v": 1, "close": ["<session uuid>", …]}
+{"v": 1, "results": [{"session_id": "<session uuid>", "closed": true, "tmux": {"socket": "…/ts-appdev", "pane": "%0"}}]}
+```
+
+One to 32 ids per call, each counted against the same per-key rate as confirms (`rate`, with `retry_after`). The
+bus, which launched it, kills the agent's pane (its per-agent server exits with its last pane), waits for the pane to
+go, and marks the session ended, so it is in `/sessions/dead` at once and a reopen of it is not refused as `running`.
+Only a live agent (seen within 90 s, not ended) whose pane is on this user's own `ts-*` server, in a
+`tailshare-start` or `squad-*` session: never the user's own panes, never ts-agents' servers. Starting must be on.
+
+| `error` | meaning |
+|---|---|
+| `bad_request` | malformed request, or `close` with `starts`/`confirm`/`dry_run`, or an id that is not a session uuid |
+| `no_grant` | the key cannot start, or it is the plan key |
+| `off` / `root` / `no_bus` / `no_tmux` | as for starts |
+| `not_running` | no live session with this id here, or its pane is gone already |
+| `not_started` | the session runs here, but `tailshare start` did not start it |
+| `failed` | the pane was still there after 5 s; `reason` says why |
+
 ## What a device can see
 
 `/hello` carries a `start` block (`kinds`, the options per kind, whether `skip` is possible and, when claude's options include
