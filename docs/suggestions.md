@@ -13,8 +13,9 @@ yet can ask to join.
 ## Who can suggest
 
 - Any live agent on one of the owner's own machines, through that machine's local API. The machine must belong to
-  the squad's owner: its tailnet user equals the squad's `owner`, and it isn't tagged. A machine the squad is
-  shared with holds only a filtered copy (squads.md) and refuses with 403.
+  the squad's owner: its tailnet user equals the squad's `owner`, and it isn't tagged. A machine of another
+  user never holds the squad: squads only sync between the owner's machines (squads.md). It answers 404, as for
+  any squad it doesn't have.
 - The suggester is the agent that sent it, found from its registration: `agent` (address), `host`, and `member`
   (its squad tag, or null when it isn't a member). This has the same local-trust limit as reports
   (reports.md): every agent on a machine runs as the same Unix user, so the label says which machine it came
@@ -51,7 +52,7 @@ An op is one of:
 - **Self-join.** `add_member` with `self: true` asks for the suggester itself to be added. Its `host`, `kind` and
   `folder` must be the suggester's own: its machine, its harness, and its cwd, the same rule `check_tag` uses.
   Without those, the new member could never bind to it. The suggester must not be a member already. When it is
-  applied, the agent's next registration binds to the new member (see join, below). Its card reads
+  applied, the agent is that member from its next ts-agents `up` (see Joining, below). Its card reads
   "<agent> asks to join as <name>".
 
 Answer: `201 {suggestion}`.
@@ -130,20 +131,14 @@ Agents: `tailshare squad suggest` (with `--add FILE`, `--join NAME --role ROLE`,
 
 ## Joining
 
-The owner applies a self-join, or adds a member by hand that matches a running session. In both cases the session
-can bind without a restart:
+A session becomes a member through its environment: ts-agents sets `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER` when it
+brings an agent `up`, as the start gate does for sessions it starts. `check_tag` decides on every registration:
+same host, kind and folder, and no other live holder. A member that crashed and comes back up gets its member
+back on its next registration.
 
-- `tailshare squad join <squad> <member>` stores a join for this session, by its session id (built: #41, see
-  squads.md "Joining").
-- Later registrations that carry no `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER` use the stored join.
-- `check_tag` still decides every time: same host, kind and folder, and no other live holder. A join that no
-  longer matches is ignored. A member that already has a live holder is refused (409 `not_that_member`).
-- A join is for **this session**: the CLI sends the id of the session it runs in. The API can't prove who calls
-  it: like reports, every agent on a machine runs as the same Unix user, so a local process could name another
-  session's id. `check_tag` bounds what that can do: it only works for a member that session matches (its
-  machine, kind and folder) and that nobody else holds. It changes no squad.
-- A self-join that is applied stores the join for the suggester, so it binds on its next registration.
-- ts-agents sets the env on `up`, which covers sessions it restarts.
+So once a self-join is applied, the suggester is that member from its next `up`. The member's `host`, `kind` and
+`folder` are the suggester's own, so the env binds it. There is no `squad join` for a running session; one was
+written and parked (#41).
 
 ## Reports
 
