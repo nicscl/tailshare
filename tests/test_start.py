@@ -346,8 +346,12 @@ class InTheBus(Base):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(10)
                 c.connect(str(start.launch_socket()))
-                c.sendall(b'{"v":1,"launch":"' + b"0" * 32 + b'"}\n')
-                self.assertEqual(c.recv(100), b"")  # hung up on, unanswered
+                try:  # the bus may hang up before the line is even sent: that is the point
+                    c.sendall(b'{"v":1,"launch":"' + b"0" * 32 + b'"}\n')
+                    got = c.recv(100)
+                except (BrokenPipeError, ConnectionResetError):
+                    got = b""
+                self.assertEqual(got, b"")  # hung up on, unanswered
         self.assertEqual(self.argvs(0.3), [])
         a, b = socket.socketpair()
         with a, b:
