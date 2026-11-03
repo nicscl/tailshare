@@ -4,7 +4,7 @@ A client with no tailshare install (the iOS app) generates a key and calls a mac
 
   POST /bus/v1/keys/enroll        {pubkey, device_name} -> a pending request, by tailnet node and user
   GET  /bus/v1/keys/enroll/<id>   its status, for polling
-  GET  /bus/v1/keys/request/<prefix>  one request by an 8-32 hex id prefix, for the owner's other devices
+  GET  /bus/v1/keys/request/<prefix>  one of the owner's requests by an 8-32 hex id prefix, for the owner's other devices
 
 Nothing is installed until a person runs `tailshare keys approve` in a terminal on that machine. That
 installs the key there, and on the owner's other machines when the person signs the approval with a
@@ -910,9 +910,9 @@ class Keys:
         if not _PREFIX_RE.fullmatch(prefix):
             raise bus.BusError("bad request id prefix")
         self._expire()
-        rows = self.store.q("SELECT * FROM key_requests WHERE substr(id, 1, ?)=? ORDER BY created", len(prefix), prefix)
-        if len(rows) != 1:
-            raise bus.BusError("no such request" if not rows else "more than one request has that prefix", 404)
+        rows = self.store.q("SELECT * FROM key_requests WHERE id >= ? AND id < ? LIMIT 2", prefix, prefix + "g")  # ids are hex
+        if len(rows) != 1 or rows[0]["user"] != self.bus.net.user:  # a card's prefix is an agent's: only the owner's own
+            raise bus.BusError("no single request of yours has that prefix", 404)
         r = rows[0]
         return {"request_id": r["id"], "host": self.host, "device_name": r["device"], "node": r["node"],
                 "user": r["user"], "ip": r["ip"], "fingerprint": r["fingerprint"], "purpose": r["purpose"],

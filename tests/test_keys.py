@@ -197,6 +197,10 @@ class Flow(unittest.TestCase):
         self.assertEqual((r["request_id"], r["host"], r["device_name"], r["ip"], r["status"]),
                          (rid, "air", "Nick's iPhone", PHONE, "pending"))
         self.assertNotIn("pubkey", r)
+        eve = self.enroll(ip="100.64.0.66", device="Eve")
+        with self.assertRaises(bus.BusError) as c:  # another tailnet user's request: the owner's devices don't see it
+            self.air_keys.route("GET", f"/keys/request/{eve['request_id'][:8]}", {}, False, "100.64.0.7")
+        self.assertEqual(c.exception.code, 404)
         for prefix in (rid[:7], rid[:8].upper(), rid + "0", "../" + rid[:8], "0" * 8):
             with self.assertRaises(bus.BusError) as c:
                 self.air_keys.route("GET", f"/keys/request/{prefix}", {}, False, "100.64.0.7")
@@ -1055,10 +1059,6 @@ class GateJustStarted(unittest.TestCase):
         self.assertEqual(self.execs, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Requested(unittest.TestCase):
     """`keys pending` and `keys approve` say when, from which address and by whom a request came."""
 
@@ -1067,3 +1067,7 @@ class Requested(unittest.TestCase):
         self.assertEqual(keys._requested({"created": t, "ip": "100.64.0.9", "user": "nick@example.com"}),
                          "2026-11-03 17:05 from 100.64.0.9, by nick@example.com")
         self.assertEqual(keys._requested({}), "at an unknown time from an unknown address, by an unknown tailnet user")
+
+
+if __name__ == "__main__":
+    unittest.main()
