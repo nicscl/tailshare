@@ -4,6 +4,7 @@ A client with no tailshare install (the iOS app) generates a key and calls a mac
 
   POST /bus/v1/keys/enroll        {pubkey, device_name} -> a pending request, by tailnet node and user
   GET  /bus/v1/keys/enroll/<id>   its status, for polling
+  GET  /bus/v1/keys/request/<prefix>  one request by an 8-32 hex id prefix, for the owner's other devices
 
 Nothing is installed until a person runs `tailshare keys approve` in a terminal on that machine. That
 installs the key there, and on the owner's other machines when the person signs the approval with a
@@ -57,6 +58,7 @@ BEGIN = "# >>> tailshare managed keys: change them with `tailshare keys`, not by
 END = "# <<< tailshare managed keys <<<"
 _ID_RE = re.compile(r"[0-9a-f]{32}")
 _KEY_ID_RE = re.compile(r"k[0-9a-f]{12}")
+_PREFIX_RE = re.compile(r"[0-9a-f]{8,32}")
 _EXE_RE = re.compile(r"/[A-Za-z0-9._/+-]+")
 SQUADS_NAMESPACE = "tailshare-squads"  # a device's signed squad write; never valid as a launch or a key approval
 SIGNED_WINDOW = 60  # how far a signed write's time may be from this machine's clock
@@ -899,6 +901,24 @@ class Keys:
             raise bus.BusError("no such request", 404)
         return self._view(r)
 
+    def lookup(self, ip: str, prefix: str) -> dict:
+        """One request by an id prefix, for the owner's other devices: a squad member's key_enroll card names a
+        prefix, and the phone showing it checks the request is real here. It shows the request, never approves it."""
+        if self._owner_problem():
+            raise bus.BusError(self._owner_problem(), 403)
+        self.bus.require_same_user(ip)
+        if not _PREFIX_RE.fullmatch(prefix):
+            raise bus.BusError("bad request id prefix")
+        self._expire()
+        rows = self.store.q("SELECT * FROM key_requests WHERE substr(id, 1, ?)=? ORDER BY created", len(prefix), prefix)
+        if len(rows) != 1:
+            raise bus.BusError("no such request" if not rows else "more than one request has that prefix", 404)
+        r = rows[0]
+        return {"request_id": r["id"], "host": self.host, "device_name": r["device"], "node": r["node"],
+                "user": r["user"], "ip": r["ip"], "fingerprint": r["fingerprint"], "purpose": r["purpose"],
+                "status": "pending" if r["status"] == "approving" else r["status"], "created": r["created"],
+                "expires": r["expires"]}
+
     def cancel(self, ip: str, rid: str) -> dict:
         """The device withdraws its own pending request (an app's "Cancel request")."""
         self._expire()
@@ -1361,6 +1381,8 @@ class Keys:
                       ("POST", "/keys/trust"): lambda: self.trust(body),
                       ("POST", "/keys/untrust"): lambda: self.untrust(body)}
         else:
+            if method == "GET" and path.startswith("/keys/request/"):
+                return self.lookup(ip, path.removeprefix("/keys/request/"))
             if method == "GET" and path.startswith("/keys/enroll/"):
                 return self.status(ip, path.removeprefix("/keys/enroll/"))
             if method == "POST" and path.startswith("/keys/enroll/") and path.endswith("/cancel"):

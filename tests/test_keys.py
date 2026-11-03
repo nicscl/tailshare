@@ -189,6 +189,22 @@ class Flow(unittest.TestCase):
     def enroll(self, ip=PHONE, pub=None, device="Nick's iPhone"):
         return self.air_keys.enroll(ip, {"pubkey": pub or self.phone_pub, "device_name": device})
 
+    def test_lookup_by_prefix_from_another_of_the_owners_devices(self):
+        """A squad card names a request by prefix; the owner's iPad checks a request the phone made."""
+        rid = self.enroll()["request_id"]
+        self.air.net.usermap["100.64.0.7"] = OWNER
+        r = self.air_keys.route("GET", f"/keys/request/{rid[:8]}", {}, False, "100.64.0.7")
+        self.assertEqual((r["request_id"], r["host"], r["device_name"], r["ip"], r["status"]),
+                         (rid, "air", "Nick's iPhone", PHONE, "pending"))
+        self.assertNotIn("pubkey", r)
+        for prefix in (rid[:7], rid[:8].upper(), rid + "0", "../" + rid[:8], "0" * 8):
+            with self.assertRaises(bus.BusError) as c:
+                self.air_keys.route("GET", f"/keys/request/{prefix}", {}, False, "100.64.0.7")
+            self.assertIn(c.exception.code, (400, 404), prefix)
+        with self.assertRaises(bus.BusError) as c:
+            self.air_keys.route("GET", f"/keys/request/{rid[:8]}", {}, False, "100.64.0.66")  # another tailnet user
+        self.assertEqual(c.exception.code, 403)
+
     def test_enroll_and_status(self):
         r = self.enroll()
         self.assertEqual((r["status"], r["host"], r["owner"]), ("pending", "air", OWNER))
