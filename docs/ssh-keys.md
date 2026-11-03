@@ -292,4 +292,9 @@ answers:
   starts a new request.
 - `POST /bus/v1/keys/enroll/<request_id>/cancel` withdraws a pending request, again only from the device that
   made it. It becomes `cancelled`, and `keys approve` no longer offers it.
+- `GET /bus/v1/keys/request/<prefix>` (8 to 32 lowercase hex characters) answers `{request_id, host,
+  device_name, node, user, ip, fingerprint, purpose, status, created, expires}` for the one request that matches,
+  or 404. It answers only requests made from the owner's own devices (another tailnet user's is a 404 too). Only the owner's devices can call it, from the same tailnet user as this machine. It lets one device check a
+  request another device made, for example a squad report's key card (docs/reports.md). Approving still happens in
+  the terminal.
 - Every call needs the header `X-Tailshare: 1`.
