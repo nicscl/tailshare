@@ -7,8 +7,10 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tailshare import bus, dead, start
@@ -183,6 +185,124 @@ class Reopen(Base):
                             "k0123456789ab", "air", fit=2)
         self.assertEqual([r.get("error") for r in out], [None, None, "limit"])
         self.assertEqual(out[2]["max_running"], 2)
+
+
+
+@unittest.skipUnless(TMUX, "needs tmux")
+class Close(Base):
+    """start.close_started (in the bus) and the gate's {"v":1,"close":[…]}: only a live session tailshare started,
+    on this user's own ts-* server; it is listed as dead at once and reopens."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = Path(tempfile.mkdtemp(dir="/tmp"))  # short: sun_path is ~104 bytes
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.socks = []
+
+    def server(self, name="ts-appdev", session="tailshare-start"):
+        sock = str(self.dir / name)
+        subprocess.run([TMUX, "-S", sock, "new-session", "-d", "-s", session, "sleep 60"], check=True, env=self.env)
+        self.addCleanup(subprocess.run, [TMUX, "-S", sock, "kill-server"], capture_output=True, env=self.env)
+        pane = subprocess.run([TMUX, "-S", sock, "display", "-p", "#{pane_id}"], capture_output=True, text=True,
+                              check=True, env=self.env).stdout.strip()
+        return sock, pane
+
+    def item(self, sid=S1, **kw):
+        return {"kind": "claude", "cwd": self.app, "name": "AppDev", "options": {"resume": sid}, **kw}
+
+    def alive(self, sock, pane):
+        from tailshare import keys
+
+        return keys.pane_alive(TMUX, sock, pane)
+
+    def test_closes_a_started_session_and_it_reopens_at_once(self):
+        cfg = self.config()
+        sock, pane = self.server()
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="tailshare-start:0")
+        self.assertNotIn(S1, self.ids())
+        out = start.close_started(S1)
+        self.assertEqual(out, {"closed": True, "tmux": {"socket": sock, "pane": pane}})
+        self.assertFalse(self.alive(sock, pane))
+        self.assertIn(S1, self.ids())  # no wait for bus.LIVE
+        self.assertEqual(dead.find(S1)[1], False)
+        self.assertEqual(start.build(self.item(), cfg, "safe", "air")["session"], S1)
+        self.assertEqual(start.close_started(S1)["error"], "not_running")  # once
+
+    def test_a_squad_member(self):
+        self.config()
+        sock, pane = self.server(session="squad-tail-share")
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="squad-tail-share:0")
+        self.assertTrue(start.close_started(S1)["closed"])
+
+    def test_refusals(self):
+        self.config()
+        mine, p1 = self.server(name="plain")  # the user's own server, not a per-agent one
+        self.agent(S1, ago=5, sock=mine, pane=p1, target="tailshare-start:0")
+        managed, p2 = self.server(name="ts-bmo", session="bmo")  # ts-agents', which brings its agents back
+        self.agent(S2, ago=5, sock=managed, pane=p2, target="bmo:0")
+        for sid in (S1, S2):
+            self.assertEqual(start.close_started(sid)["error"], "not_started")
+        self.assertTrue(self.alive(mine, p1) and self.alive(managed, p2))
+        self.assertEqual(start.close_started(S3)["error"], "not_running")  # never seen here
+        self.agent(S3, ago=600)  # seen, not live
+        self.assertEqual(start.close_started(S3)["error"], "not_running")
+        self.assertEqual(start.close_started("../x")["error"], "bad_request")
+        self.assertEqual(start.close_started(S1.upper())["error"], "bad_request")  # the gate lowercases
+
+    def test_a_pane_gone_already(self):
+        self.config()
+        sock, pane = self.server()
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="tailshare-start:0")
+        subprocess.run([TMUX, "-S", sock, "kill-server"], check=True, env=self.env)
+        self.assertEqual(start.close_started(S1)["error"], "not_running")
+
+    def test_off(self):
+        sock, pane = self.server()
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="tailshare-start:0")
+        self.assertEqual(start.close_started(S1)["error"], "off")
+        self.assertTrue(self.alive(sock, pane))
+
+    def test_the_gate(self):
+        self.config()
+        sock, pane = self.server()
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="tailshare-start:0")
+        cfg_path, db = self.tmp / "start.json", self.tmp / "start.db"
+        key = "k0123456789ab"
+        doc = {"v": 1, "close": [S1.upper()]}
+        with mock.patch.object(start, "_ask_bus", side_effect=lambda req: start.close_started(req["close"])):
+            out = start.handle(doc, "safe", key, "air", cfg_path, db, plan_only=True)
+            self.assertEqual(out["error"], "no_grant")  # the plan key, with no Face ID
+            self.assertTrue(self.alive(sock, pane))
+            self.assertEqual(start.handle({"v": 1, "close": [S1], "confirm": ["x"]}, "safe", key, "air", cfg_path,
+                                          db)["error"], "bad_request")
+            self.assertEqual(start.handle({"v": 1, "close": []}, "safe", key, "air", cfg_path, db)["error"],
+                             "bad_request")
+            out = start.handle(doc, "safe", key, "air", cfg_path, db)
+            self.assertEqual(out["results"], [{"session_id": S1, "closed": True,
+                                               "tmux": {"socket": sock, "pane": pane}}])
+            self.assertEqual(start.handle({"v": 1, "close": ["nope"]}, "safe", key, "air", cfg_path, db)["results"],
+                             [{"session_id": "nope", "error": "bad_request", "field": "close", "reason": "a session id"}])
+            for _ in range(start.CONFIRMS_PER_MIN - 2):  # with the two above
+                start.handle({"v": 1, "close": [S2]}, "safe", key, "air", cfg_path, db)
+            self.assertEqual(start.handle(doc, "safe", key, "air", cfg_path, db)["error"], "rate")
+            self.assertEqual(start.handle(doc, "", key, "air", cfg_path, db)["error"], "no_grant")
+
+    def test_through_the_bus_socket(self):
+        self.config()
+        sock, pane = self.server()
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="tailshare-start:0")
+        state = Path(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, state, True)
+        shutil.copy(self.tmp / "start.json", state / "start.json")
+        self.m.bus.store.db.execute("VACUUM INTO ?", (str(state / "bus.db"),))
+        with mock.patch.object(bus, "STATE_DIR", state):
+            srv = start.serve_launches()
+            self.addCleanup(srv.close)
+            self.assertEqual(start._ask_bus({"v": 1, "close": S1}), {"closed": True, "tmux": {"socket": sock, "pane": pane}})
+            with self.assertRaises(start.Refused) as c:
+                start._ask_bus({"v": 1, "close": S1, "launch": "x"})
+            self.assertEqual(c.exception.out, {"error": "bad_request"})
+        self.assertFalse(self.alive(sock, pane))
 
 
 if __name__ == "__main__":

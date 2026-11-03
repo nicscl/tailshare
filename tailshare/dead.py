@@ -35,6 +35,15 @@ def _managed_elsewhere(t: dict) -> bool:
     return name.startswith(LABEL) and not session.startswith(STARTED)
 
 
+def is_live(a, now: float | None = None) -> bool:
+    """An agent seen within bus.LIVE that has not ended: a closed session (SessionEnd, or start.close_started) is
+    not live even while its last poll is recent."""
+    if a["last_seen"] <= (time.time() if now is None else now) - bus.LIVE:
+        return False
+    st = _json(a["state"] if "state" in a.keys() else "")
+    return not (isinstance(st, dict) and st.get("v") == "ended")
+
+
 def _pane_gone(t: dict, cache: dict) -> bool:
     from . import keys
 
@@ -60,12 +69,12 @@ def rows(db: Path | None = None, now: float | None = None) -> list[dict]:
         return []
     finally:
         con.close()
-    live = [a for a in agents if a["last_seen"] > now - bus.LIVE]
+    live = [a for a in agents if is_live(a, now)]
     held = {(t["socket"], t["pane"]): a["last_seen"] for a in live if (t := bus.clean_tmux(_json(a["tmux"])))}
     out, cache = [], {}
     for a in agents:
         sid, t = session_id(a["harness"] or "", a["id"]), bus.clean_tmux(_json(a["tmux"]))
-        if not sid or not t or a["last_seen"] > now - bus.LIVE or _managed_elsewhere(t):
+        if not sid or not t or is_live(a, now) or _managed_elsewhere(t):
             continue
         # gone, or a newer live agent sits in that pane now (pane ids start again at %0 on a new server)
         if not (_pane_gone(t, cache) or held.get((t["socket"], t["pane"]), 0) > a["last_seen"]):
@@ -118,8 +127,8 @@ def find(sid: str, db: Path | None = None) -> tuple[dict | None, bool]:
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
         try:
-            live = con.execute("SELECT 1 FROM agents WHERE lower(id)=? AND last_seen>?",
-                               (sid, time.time() - bus.LIVE)).fetchone() is not None
+            con.row_factory = sqlite3.Row
+            live = any(is_live(a) for a in con.execute("SELECT last_seen, state FROM agents WHERE lower(id)=?", (sid,)))
         finally:
             con.close()
     except sqlite3.Error:
