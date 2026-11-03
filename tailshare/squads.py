@@ -369,6 +369,8 @@ class Squads:
     def leave(self, body: dict) -> dict:
         aid = str(body.get("agent") or "")
         with self.store.lock:
+            if self.store.one("SELECT 1 FROM agents WHERE id=? AND last_seen>?", aid, time.time() - bus.LIVE) is None:
+                raise bus.BusError("this session is not running on the bus", 404)  # gone ones are pruned instead
             r = self.joined(aid)
             if not r:
                 raise bus.BusError("this session did not join a squad (one started as a member stays it)", 409)

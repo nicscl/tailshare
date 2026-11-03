@@ -105,7 +105,8 @@ A join only labels a session: it changes no squad and needs no keys token. It is
 /bus/v1/squads/<id>/join` `{agent, member}` and `POST /bus/v1/squads/<id>/leave` `{agent}`, on the local API
 only (the peer API answers 404). As with reports (reports.md), every agent on a machine runs as the same Unix
 user, so the API can't tell which session asks. A process could name another session's id, but only for a member
-that session matches and nobody else holds. Run it for your own session only.
+that session matches and nobody else holds, and leave only for a session that is running. Run it for your own
+session only.
 
 ## How it syncs
 

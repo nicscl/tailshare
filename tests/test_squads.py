@@ -584,6 +584,12 @@ class Joining(unittest.TestCase):
         with self.assertRaises(bus.BusError) as c:
             self.m.squads.route("POST", "/squads/sq1/leave", {"agent": "s1"}, True, "127.0.0.1", {})
         self.assertEqual(c.exception.code, 409)
+        self.join("s1", "m1")
+        self.m.bus.store.x("UPDATE agents SET last_seen=0 WHERE id='s1'")
+        with self.assertRaises(bus.BusError) as c:  # not for a session that isn't running
+            self.m.squads.route("POST", "/squads/sq1/leave", {"agent": "s1"}, True, "127.0.0.1", {})
+        self.assertEqual(c.exception.code, 404)
+        self.assertEqual(self.m.squads.joined("s1"), {"id": "sq1", "member": "m1"})
 
     def test_only_on_the_local_api(self):
         reg(self.m.bus, "s1", "app", cwd="/u/projects/app")
