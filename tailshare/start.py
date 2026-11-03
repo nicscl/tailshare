@@ -425,6 +425,12 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         raise Refused("not_allowed", "options.permission_mode", "this host does not allow auto mode")
     if opts.get("resume") and not squad:  # a squad member's resume comes from the squad, signed by its owner
         squad = _reopen(opts["resume"], cwd, name, host)
+    # A member keeps its report current for the squad page; after the reopen, so a resumed member gets it too. The
+    # owner's instructions stay within their cap.
+    if squad:
+        from .reports_cli import HOW
+
+        instructions = f"{instructions}\n\n{HOW}" if instructions else HOW
     session = str(item.get("_session") or "") if kind == "claude" and not opts.get("resume") else ""
     if kind == "claude":
         session = opts.get("resume") or session

@@ -241,6 +241,10 @@ terminal). A squad is synced between your machines; agents started as a member l
 squadmates' addresses, and a device can start a member by naming it. You can let another tailnet user see a
 squad, nothing more. See [docs/squads.md](docs/squads.md).
 
+**Reports.** Each squad member keeps a short report of its work, what it waits on and the decisions it needs
+(`tailshare report`, or the `report` MCP tool). Your own devices read them for the squad page. See
+[docs/reports.md](docs/reports.md).
+
 How messages reach an agent:
 
 - **Claude Code**: a SessionStart hook registers the session and tells it to run `tailshare agent watch --once`

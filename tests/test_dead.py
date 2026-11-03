@@ -178,6 +178,7 @@ class Reopen(Base):
         self.agent(S1, squad={"id": "sq1", "member": "m1"})
         plan = start.build(self.item(), cfg, "safe", "air")
         self.assertEqual(plan["squad"], {"id": "sq1", "name": "Tail Share", "member": "m1"})
+        self.assertIn("## Reporting", plan["instructions"])  # reopened, it still keeps its report
         self.assertEqual((plan["env"]["TAILSHARE_SQUAD"], plan["env"]["TAILSHARE_MEMBER"]), ("sq1", "m1"))
         self.assertEqual(plan["tmux"]["session"], "squad-tail-share")
 
