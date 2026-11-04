@@ -82,6 +82,9 @@ KINDS = {
         "sandbox": ("enum", ("read-only", "workspace-write", "danger-full-access")),
         "skip_permissions": ("bool",),
         "model": ("word",),
+        "effort": ("word",),
+        "resume": ("uuid",),
+        "add_dirs": ("dirs",),
     },
 }
 
@@ -169,7 +172,28 @@ def capabilities(path: Path | None = None) -> dict | None:
         out["permission_modes"] = {"claude": [m for m in KINDS["claude"]["permission_mode"][1]
                                               if (m != "auto" or cfg["auto"])
                                               and (m != "bypassPermissions" or cfg["skip_permissions"])]}
+    if "model" in cfg["kinds"].get("codex", {}).get("options", []):
+        out["models"] = {"codex": codex_models()}
     return out
+
+
+def codex_models(limit: int = 30) -> list[str]:
+    """The models this host's Codex offers in its picker (its models_cache.json), so a device need not guess."""
+    home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    try:
+        doc = json.loads((home / "models_cache.json").read_text())
+        rows = doc.get("models") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    out: list[str] = []
+    for m in rows:
+        slug = m.get("slug") if isinstance(m, dict) else None
+        if (m.get("visibility") == "list" if isinstance(m, dict) else False) and isinstance(slug, str) \
+                and len(slug) <= 40 and _WORD.fullmatch(slug) and not slug.startswith("-") and slug not in out:
+            out.append(slug)
+    return out[:limit]
 
 
 def folders(path: Path | None = None, depth: int = 2, limit: int = 200) -> list[str]:
@@ -311,15 +335,21 @@ def argv_for(kind: str, exe: str, cwd: str, name: str, opts: dict, instructions:
         if opts.get("skip_permissions"):
             a.append("--dangerously-skip-permissions")
     else:
-        a = [exe, f"--cd={cwd}"]
+        # `codex resume <thread id>` takes the same flags; the id goes after `--`, before the prompt
+        a = [exe, *(["resume"] if opts.get("resume") else []), f"--cd={cwd}"]
         if instructions:
             a.append("--config=developer_instructions="
                      + (instructions if instructions == INSTRUCTIONS else toml_string(instructions)))
+        if "effort" in opts:
+            a.append("--config=model_reasoning_effort=" + toml_string(opts["effort"]))
         for k, flag in (("model", "--model"), ("approval", "--ask-for-approval"), ("sandbox", "--sandbox")):
             if k in opts:
                 a.append(f"{flag}={opts[k]}")
+        a += [f"--add-dir={d}" for d in opts.get("add_dirs", [])]
         if opts.get("skip_permissions"):
             a.append("--dangerously-bypass-approvals-and-sandbox")
+        if opts.get("resume"):
+            return a + ["--", opts["resume"], *([prompt] if prompt else [])]
     if prompt:
         a += ["--", prompt]
     return a
@@ -376,7 +406,7 @@ def _from_squad(item: dict, host: str) -> tuple[dict, dict]:
     return out, {"id": head["id"], "name": head["name"], "member": m["id"]}
 
 
-def _reopen(sid: str, cwd: str, name: str, host: str) -> dict | None:
+def _reopen(sid: str, cwd: str, name: str, host: str, kind: str = "claude") -> dict | None:
     """A start that resumes session `sid`: only one this host lists as dead, in its own folder under its own name.
     Returns the squad it was a member of (it reopens as that member), or None."""
     from . import dead
@@ -384,7 +414,7 @@ def _reopen(sid: str, cwd: str, name: str, host: str) -> dict | None:
     r, live = dead.find(sid)
     if live:
         raise Refused("running", "options.resume", "this session is running")
-    if r is None or r["kind"] != "claude":
+    if r is None or r["kind"] != kind:
         raise Refused("not_dead", "options.resume", "not a session this host lists as dead")
     if os.path.realpath(r["cwd"]) != cwd:
         raise Refused("cwd", "cwd", "a session reopens in its own folder")
@@ -424,7 +454,7 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
     if auto and not cfg["auto"]:
         raise Refused("not_allowed", "options.permission_mode", "this host does not allow auto mode")
     if opts.get("resume") and not squad:  # a squad member's resume comes from the squad, signed by its owner
-        squad = _reopen(opts["resume"], cwd, name, host)
+        squad = _reopen(opts["resume"], cwd, name, host, kind)
     # A member keeps its report current for the squad page; after the reopen, so a resumed member gets it too. The
     # owner's instructions stay within their cap.
     if squad:
@@ -432,8 +462,7 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
 
         instructions = f"{instructions}\n\n{HOW}" if instructions else HOW
     session = str(item.get("_session") or "") if kind == "claude" and not opts.get("resume") else ""
-    if kind == "claude":
-        session = opts.get("resume") or session
+    session = opts.get("resume") or session  # a new Codex thread's id is not known until it starts
     exe = binary(kind, cfg)
     env = {"TAILSHARE_AGENT_NAME": name, "TAILSHARE_STARTED_BY": device or "a device",
            **({"TAILSHARE_SQUAD": squad["id"], "TAILSHARE_MEMBER": squad["member"]} if squad else {}),

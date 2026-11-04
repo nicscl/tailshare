@@ -96,9 +96,10 @@ def _codex_title(thread_id: str) -> str:
     return str(rec.get("thread_name") or "")
 
 
-def detect(hook: dict | None = None) -> Identity:
-    """Work out which agent session this process belongs to, and the human behind it."""
-    ident = _detect_session(hook or {})
+def detect(hook: dict | None = None, harness: str = "") -> Identity:
+    """Work out which agent session this process belongs to, and the human behind it. `harness` names whose hook
+    input `hook` is: "codex" for Codex's, else Claude's."""
+    ident = _detect_session(hook or {}, harness)
     ident.user = os.environ.get("TAILSHARE_USER", "")
     ssh = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT") or ""
     ident.ssh_ip = ssh.split()[0] if ssh.split() else ""
@@ -150,16 +151,20 @@ def _codex_pid() -> int:
     (bus.pid_skip). Kept once found (the MCP server and watch register often); 0, asked again next time, if not."""
     global _codex_found
     if not _codex_found:
-        _codex_found = _find_codex_pid()
+        h, pid = _nearest_harness()
+        _codex_found = pid if h == "codex" else 0
     return _codex_found
 
 
-def _find_codex_pid() -> int:
+def _nearest_harness() -> tuple[str, int]:
+    """("claude" | "codex", pid) of the closest harness process above this one, or ("", 0). A Codex started from
+    a Claude session's shell (or the reverse) inherits the other's environment variables; the process tree says
+    which one this process actually runs under."""
     try:
         out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True,
                              timeout=2).stdout
     except (OSError, subprocess.SubprocessError):
-        return 0
+        return "", 0
     procs = {}  # macOS cuts comm at 16 characters, so the program is args' first word
     for line in out.splitlines():
         parts = line.split(None, 3)
@@ -168,27 +173,46 @@ def _find_codex_pid() -> int:
     pid = os.getppid()
     for _ in range(16):
         if pid not in procs:
-            return 0
-        if procs[pid][1] == "codex":
-            return pid
+            return "", 0
+        if procs[pid][1] in ("claude", "codex"):
+            return procs[pid][1], pid
         pid = procs[pid][0]
-    return 0
+    return "", 0
 
 
-def _detect_session(hook: dict) -> Identity:
+def _codex(tid: str, cwd: str = "") -> Identity:
+    # Codex has no --name: a session tailshare started is named by TAILSHARE_AGENT_NAME until it is renamed
+    title = _codex_title(tid) or os.environ.get("TAILSHARE_AGENT_NAME", "")
+    return Identity(tid, "codex", cwd or os.getcwd(), title, _codex_pid())
+
+
+def _claude(sid: str, hook: dict) -> Identity:
+    env = os.environ
+    tp = Path(hook["transcript_path"]) if hook.get("transcript_path") else _claude_transcript(sid)
+    cwd = hook.get("cwd") or _claude_cwd(tp) or os.getcwd()
+    return Identity(sid, "claude", cwd, _claude_title(tp), int(env.get("CLAUDE_PID") or 0))
+
+
+def _detect_session(hook: dict, harness: str = "") -> Identity:
+    """`harness` says whose hook `hook` is (Claude's and Codex's look alike); "" means Claude's."""
     env = os.environ
     if env.get("TAILSHARE_AGENT_ID"):
         cwd = os.getcwd()
         return Identity(env["TAILSHARE_AGENT_ID"], env.get("TAILSHARE_AGENT_HARNESS", "cli"), cwd,
                         env.get("TAILSHARE_AGENT_NAME", ""))
-    sid = hook.get("session_id") or env.get("CLAUDE_CODE_SESSION_ID")
+    if hook.get("session_id"):
+        return _codex(hook["session_id"], hook.get("cwd") or "") if harness == "codex" \
+            else _claude(hook["session_id"], hook)
+    sid, tid = env.get("CLAUDE_CODE_SESSION_ID"), env.get("CODEX_THREAD_ID")
+    if sid and tid:  # one of them was inherited: the nearest harness process is the one we run under
+        if _nearest_harness()[0] == "codex":
+            sid = ""
+        else:
+            tid = ""
     if sid:
-        tp = Path(hook["transcript_path"]) if hook.get("transcript_path") else _claude_transcript(sid)
-        cwd = hook.get("cwd") or _claude_cwd(tp) or os.getcwd()
-        return Identity(sid, "claude", cwd, _claude_title(tp), int(env.get("CLAUDE_PID") or 0))
-    tid = env.get("CODEX_THREAD_ID")
+        return _claude(sid, hook)
     if tid:
-        return Identity(tid, "codex", os.getcwd(), _codex_title(tid), _codex_pid())
+        return _codex(tid)
     cwd = os.getcwd()
     # A person at a shell: one identity per folder.
     return Identity("cli-" + hashlib.sha1(cwd.encode()).hexdigest()[:12], "cli", cwd, env.get("TAILSHARE_AGENT_NAME", ""))
@@ -401,29 +425,39 @@ def _hook_out(event: str, text: str) -> None:
     print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
 
 
+def bus_text(me: dict, harness: str) -> str:
+    """What a session is told at its start about the bus."""
+    t = exe()
+    if harness == "codex":  # nothing wakes a Codex session from the background: it waits in the foreground
+        receive = (f"- New messages are shown with each prompt. To wait for one, run `{t} agent watch --once`: it "
+                   "returns when a message arrives. `tailshare agent inbox` reads them without waiting.\n")
+    else:
+        receive = (f"- To receive messages, start this with the Bash tool and run_in_background: `{t} agent watch --once`. "
+                   "It exits when a message arrives, which wakes you; handle it, then start it again.\n")
+    return (
+        f"You are on the tailshare agent bus as `{me['address']}` (user {me.get('user') or 'unknown'}). "
+        "Other agents on the user's tailnet can message you.\n" + receive +
+        f"- Send: `{t} agent send <address-or-pattern> \"text\"` (add `--file PATH` to attach a file). "
+        f"List agents: `{t} agent ls`. Addresses are host/harness/folder[/session]; "
+        "`*/*/<folder>` reaches every agent working in that folder, `@<user>` every session of that person.\n"
+        f"- {NOTE}"
+    )
+
+
 def cmd_hook(args):
-    """Claude Code hook entry point. Must never fail loudly or block the session."""
+    """Claude Code and Codex hook entry point. Must never fail loudly or block the session."""
     if os.environ.get("TAILSHARE_HOOKS") == "0":  # a throwaway session tailshare started to answer a question
         sys.exit(0)
     try:
         data = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         data = {}
+    harness = getattr(args, "harness", "") or ""
     try:
-        me = register(detect(data))
+        me = register(detect(data if isinstance(data, dict) else {}, harness))
         if args.event == "session-start":
             msgs = call(f"/inbox?agent={me['id']}")["messages"]
-            t = exe()
-            text = (
-                f"You are on the tailshare agent bus as `{me['address']}` (user {me.get('user') or 'unknown'}). "
-                "Other agents on the user's tailnet can message you.\n"
-                f"- To receive messages, start this with the Bash tool and run_in_background: `{t} agent watch --once`. "
-                "It exits when a message arrives, which wakes you; handle it, then start it again.\n"
-                f"- Send: `{t} agent send <address-or-pattern> \"text\"` (add `--file PATH` to attach a file). "
-                f"List agents: `{t} agent ls`. Addresses are host/harness/folder[/session]; "
-                "`*/*/<folder>` reaches every agent working in that folder, `@<user>` every session of that person.\n"
-                f"- {NOTE}"
-            )
+            text = bus_text(me, harness)
             squad = squad_text(me)
             if squad:
                 text += "\n" + squad
@@ -479,12 +513,12 @@ def _ours(h: dict) -> bool:
     return "agent hook" in c or STATE_MARK in c
 
 
-def _add_hooks(settings: dict, skip: set[str] = frozenset()) -> bool:
+def _add_hooks(settings: dict, skip: set[str] = frozenset(), wanted: list | None = None) -> bool:
     """Add the tailshare hooks that are missing, except `event|marker`s in skip. Never changes or
     removes anyone else's."""
     hooks = settings.setdefault("hooks", {})
     changed = False
-    for event, mark, hook in _wanted():
+    for event, mark, hook in (_wanted() if wanted is None else wanted):
         if f"{event}|{mark}" in skip:
             continue
         groups = hooks.setdefault(event, [])
@@ -571,26 +605,96 @@ def cmd_install_claude(args):
     print("New Claude Code sessions join the bus automatically.")
 
 
+def _remove_hooks(settings: dict) -> None:
+    hooks = settings.get("hooks", {})
+    for event in list(hooks):
+        groups = []
+        for g in hooks[event]:
+            kept = [h for h in g.get("hooks", []) if not _ours(h)]
+            if kept or not g.get("hooks"):
+                groups.append({**g, "hooks": kept} if kept != g.get("hooks") else g)
+        if groups:
+            hooks[event] = groups
+        else:
+            hooks.pop(event, None)
+
+
 def cmd_uninstall_claude(args):
     path = _settings_path()
     if path.exists():
         settings = json.loads(path.read_text())
-        hooks = settings.get("hooks", {})
-        for event in list(hooks):
-            groups = []
-            for g in hooks[event]:
-                kept = [h for h in g.get("hooks", []) if not _ours(h)]
-                if kept or not g.get("hooks"):
-                    groups.append({**g, "hooks": kept} if kept != g.get("hooks") else g)
-            if groups:
-                hooks[event] = groups
-            else:
-                hooks.pop(event, None)
+        _remove_hooks(settings)
         path.write_text(json.dumps(settings, indent=2) + "\n")
         print(f"✓ hooks removed from {path}")
     claude = shutil.which("claude")
     if claude:
         subprocess.run([claude, "mcp", "remove", "-s", "user", "tailshare"], capture_output=True)
+        print("✓ MCP server removed")
+
+
+# --------------------------------------------------------------------------- Codex hooks
+
+# Codex's hooks (~/.codex/hooks.json) take Claude's shape and input; session_id is the thread id. Codex runs a hook
+# only once the person trusts it (/hooks in Codex): tailshare never marks its own hooks trusted.
+CODEX_STATE_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop",
+                      "SessionEnd")
+
+
+def _codex_wanted() -> list[tuple[str, str, dict]]:
+    t = exe()
+    out = [(e, "agent hook", {"type": "command", "command": f"{t} agent hook {n} --harness codex", "timeout": 10})
+           for e, n in HOOKS.items()]
+    out += [(e, STATE_MARK, {"type": "command", "command": state_command(), "timeout": 5}) for e in CODEX_STATE_EVENTS]
+    return out
+
+
+def _codex_hooks_path() -> Path:
+    return CODEX_HOME / "hooks.json"
+
+
+def cmd_install_codex(args):
+    t = exe()
+    path = _codex_hooks_path()
+    try:
+        doc = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict) or not isinstance(doc.get("hooks", {}), dict):
+        print(f"✗ {path} is not a JSON object with a hooks object; fix it first")
+        sys.exit(1)
+    if _add_hooks(doc, wanted=_codex_wanted()):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_settings(path, doc, ".json.bak-tailshare")
+        print(f"✓ hooks added to {path} (backup: hooks.json.bak-tailshare)")
+    else:
+        print("✓ hooks already installed")
+    print("  Codex runs new hooks only after you trust them: open /hooks in Codex once and trust tailshare's.")
+    codex = shutil.which("codex")
+    if not codex:
+        print("✗ codex CLI not found; add the MCP server yourself: codex mcp add tailshare -- tailshare mcp")
+        return
+    if subprocess.run([codex, "mcp", "get", "tailshare"], capture_output=True).returncode == 0:
+        print("✓ MCP server already registered")
+    else:
+        cp = subprocess.run([codex, "mcp", "add", "tailshare", "--", *shlex.split(t), "mcp"], capture_output=True, text=True)
+        print("✓ MCP server registered" if cp.returncode == 0 else f"✗ codex mcp add: {cp.stderr.strip()}")
+    print("New Codex sessions join the bus once the hooks are trusted.")
+
+
+def cmd_uninstall_codex(args):
+    path = _codex_hooks_path()
+    try:
+        doc = json.loads(path.read_text()) if path.exists() else None
+    except ValueError:
+        print(f"✗ {path} is not valid JSON; left as it is")
+        doc = None
+    if isinstance(doc, dict) and isinstance(doc.get("hooks", {}), dict):
+        _remove_hooks(doc)
+        _write_settings(path, doc, ".json.bak-tailshare-uninstall")
+        print(f"✓ hooks removed from {path}")
+    codex = shutil.which("codex")
+    if codex:
+        subprocess.run([codex, "mcp", "remove", "tailshare"], capture_output=True)
         print("✓ MCP server removed")
 
 
@@ -621,8 +725,9 @@ def add_parser(sub) -> None:
     p.set_defaults(fn=cmd_watch)
     p = s.add_parser("outbox", help="messages waiting for an offline machine")
     p.set_defaults(fn=cmd_outbox)
-    p = s.add_parser("hook")  # called by Claude Code hooks
+    p = s.add_parser("hook")  # called by Claude Code and Codex hooks
     p.add_argument("event", choices=sorted(HOOKS.values()))
+    p.add_argument("--harness", default="", choices=["", "claude", "codex"])
     p.set_defaults(fn=cmd_hook)
     p = s.add_parser("codex-notify")  # Codex's `notify` program
     p.add_argument("payload", nargs="?", default="{}")
@@ -631,3 +736,7 @@ def add_parser(sub) -> None:
     p.set_defaults(fn=cmd_install_claude)
     p = s.add_parser("uninstall-claude", help="undo install-claude")
     p.set_defaults(fn=cmd_uninstall_claude)
+    p = s.add_parser("install-codex", help="join every Codex session to the bus (hooks + MCP)")
+    p.set_defaults(fn=cmd_install_codex)
+    p = s.add_parser("uninstall-codex", help="undo install-codex")
+    p.set_defaults(fn=cmd_uninstall_codex)
