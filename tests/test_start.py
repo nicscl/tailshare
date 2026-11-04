@@ -280,6 +280,8 @@ class Plans(Base):
             self.assertIn("--model=gpt-6.1-terra", self.dry(self.item(kind="codex", options={"model": "gpt-6.1-terra"}))[0]["plan"]["argv"])
             self.assertEqual(self.refused(self.item(options={"model": "claude-old-1"})),
                              ("not_allowed", "options.model"))  # not offered: not taken
+            for junk in (5, True, "model", ["model"]):  # not a dict: a per-item bad_request, never a crashed batch
+                self.assertEqual(self.refused(self.item(options=junk)), ("bad_request", "options"), junk)
             for bad in ("-x", "a b", "x" * 65, "[", 7):
                 self.assertEqual(self.refused(self.item(options={"model": bad}))[0], "bad_request" if bad != "[" else
                                  "not_allowed", bad)

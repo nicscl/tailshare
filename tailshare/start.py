@@ -483,7 +483,7 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
     cwd = _in_roots(item.get("cwd"), cfg["roots"], "cwd")
     name = clean_name(item.get("name"))
     opts = _options(kind, item.get("options"), cfg["kinds"][kind]["options"], cfg["roots"],
-                    allowed_models(kind, cfg) if "model" in (item.get("options") or {}) else None)
+                    allowed_models(kind, cfg) if isinstance(item.get("options"), dict) and "model" in item["options"] else None)
     instructions = _text(item.get("instructions"), "instructions", INSTRUCTIONS_MAX)
     prompt = _text(item.get("prompt"), "prompt", PROMPT_MAX)
     device = "".join(c for c in _text(item.get("device_name"), "device_name", 256)
