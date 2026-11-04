@@ -63,6 +63,11 @@ INSTRUCTIONS = "<instructions>"  # stands for the instructions in a plan's argv
 PROMPT = "<prompt>"  # and the prompt
 
 _WORD = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# A model value: a CLI alias or a full id, "[1m]" included. Never led by "-"; it goes as one --model=<value> argument.
+_MODEL = re.compile(r"[A-Za-z0-9._:\[\]][A-Za-z0-9._:\[\]-]{0,63}")
+CLAUDE_ALIASES = ("opus", "sonnet", "haiku", "opus[1m]", "sonnet[1m]")  # what `claude --model` takes as aliases
+MODELS_MAX = 30
+SEEN_DAYS = 30  # how far back a model seen in a session here (the bus's agents.model) is offered
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _PLAN_ID = re.compile(r"[0-9a-f]{32}")
 _KEY_ID = re.compile(r"k[0-9a-f]{12}")
@@ -72,7 +77,7 @@ KINDS = {
     "claude": {
         "permission_mode": ("enum", ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")),
         "skip_permissions": ("bool",),
-        "model": ("word",),
+        "model": ("model",),
         "effort": ("word",),
         "resume": ("uuid",),
         "add_dirs": ("dirs",),
@@ -81,7 +86,7 @@ KINDS = {
         "approval": ("enum", ("untrusted", "on-request", "never")),
         "sandbox": ("enum", ("read-only", "workspace-write", "danger-full-access")),
         "skip_permissions": ("bool",),
-        "model": ("word",),
+        "model": ("model",),
         "effort": ("word",),
         "resume": ("uuid",),
         "add_dirs": ("dirs",),
@@ -150,7 +155,9 @@ def load_config(path: Path | None = None) -> dict | None:
         if k in KINDS and isinstance(v, dict):
             opts = [o for o in v.get("options") or [] if isinstance(o, str) and o in KINDS[k]]
             b = v.get("bin")
-            kinds[k] = {"options": opts, "bin": b if isinstance(b, str) and b.startswith("/") else ""}
+            extra = [m for m in v.get("models") or [] if isinstance(m, str) and _MODEL.fullmatch(m)] \
+                if isinstance(v.get("models"), list) else []
+            kinds[k] = {"options": opts, "bin": b if isinstance(b, str) and b.startswith("/") else "", "models": extra}
     mr = d.get("max_running")
     return {"roots": roots, "kinds": kinds, "skip_permissions": d.get("skip_permissions") is True,
             "auto": d.get("auto") is True,
@@ -172,9 +179,40 @@ def capabilities(path: Path | None = None) -> dict | None:
         out["permission_modes"] = {"claude": [m for m in KINDS["claude"]["permission_mode"][1]
                                               if (m != "auto" or cfg["auto"])
                                               and (m != "bypassPermissions" or cfg["skip_permissions"])]}
-    if "model" in cfg["kinds"].get("codex", {}).get("options", []):
-        out["models"] = {"codex": codex_models()}
+    models = {k: allowed_models(k, cfg) for k in sorted(cfg["kinds"]) if "model" in cfg["kinds"][k]["options"]}
+    if models:
+        out["models"] = models
     return out
+
+
+def allowed_models(kind: str, cfg: dict) -> list[str]:
+    """The model values a device may pick for a kind, and the only ones a start accepts: start.json's own
+    `models` first, then Claude's aliases or Codex's picker, then the full ids sessions here ran recently."""
+    base = list(CLAUDE_ALIASES) if kind == "claude" else codex_models() if kind == "codex" else []
+    out: list[str] = []
+    for m in [*cfg["kinds"].get(kind, {}).get("models", []), *base, *seen_models(kind)]:
+        if _MODEL.fullmatch(m) and m not in out:
+            out.append(m)
+    return out[:MODELS_MAX]
+
+
+def seen_models(kind: str) -> list[str]:
+    """Models this host's sessions of a kind ran in the last SEEN_DAYS days, newest first, from the bus's
+    agents table (the ids their transcripts name, see bus.transcript_model)."""
+    path = bus.STATE_DIR / "bus.db"
+    if not path.exists():
+        return []
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = db.execute("SELECT model, MAX(last_seen) AS t FROM agents WHERE harness=? AND model!='' AND last_seen>?"
+                              " GROUP BY model ORDER BY t DESC LIMIT ?", (kind, time.time() - SEEN_DAYS * 86400,
+                                                                         MODELS_MAX)).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
+    return [r[0] for r in rows if isinstance(r[0], str) and _MODEL.fullmatch(r[0])]
 
 
 def codex_models(limit: int = 30) -> list[str]:
@@ -263,7 +301,7 @@ def slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "agent"
 
 
-def _options(kind: str, raw: object, allowed: list[str], roots: list[str]) -> dict:
+def _options(kind: str, raw: object, allowed: list[str], roots: list[str], models: list[str] | None = None) -> dict:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -281,6 +319,10 @@ def _options(kind: str, raw: object, allowed: list[str], roots: list[str]) -> di
         elif t[0] == "bool" and isinstance(v, bool):
             out[k] = v
         elif t[0] == "word" and isinstance(v, str) and _WORD.fullmatch(v):
+            out[k] = v
+        elif t[0] == "model" and isinstance(v, str) and _MODEL.fullmatch(v):
+            if v not in (models or []):
+                raise Refused("not_allowed", f, "not one of this host's models (/hello start.models)")
             out[k] = v
         elif t[0] == "uuid" and isinstance(v, str) and _UUID.fullmatch(v):
             out[k] = v
@@ -440,7 +482,8 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         raise Refused("not_allowed", "kind")
     cwd = _in_roots(item.get("cwd"), cfg["roots"], "cwd")
     name = clean_name(item.get("name"))
-    opts = _options(kind, item.get("options"), cfg["kinds"][kind]["options"], cfg["roots"])
+    opts = _options(kind, item.get("options"), cfg["kinds"][kind]["options"], cfg["roots"],
+                    allowed_models(kind, cfg) if "model" in (item.get("options") or {}) else None)
     instructions = _text(item.get("instructions"), "instructions", INSTRUCTIONS_MAX)
     prompt = _text(item.get("prompt"), "prompt", PROMPT_MAX)
     device = "".join(c for c in _text(item.get("device_name"), "device_name", 256)
