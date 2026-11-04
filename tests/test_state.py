@@ -575,7 +575,6 @@ class Model(unittest.TestCase):
         self.assertEqual(self.models()["claude"], "claude-opus-5-5")
         self.b.report_state(hook("Stop", sid=self.SID))  # no transcript yet: kept
         self.assertEqual(self.models()["claude"], "claude-opus-5-5")
-        bus._transcripts.clear()  # a miss waits MODEL_MISS before searching again
         tool = {"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": [
             {"type": "tool_use", "input": {"model": "haiku"}}]}}
         self.write(self.claude, tool,
@@ -620,3 +619,17 @@ class Model(unittest.TestCase):
         for aid in ("../../etc", "*", "short", "1111-aaaa-bbbb-cccc-222222222222", "aaaa-bbbb-cccc-222222222222"):
             self.assertEqual(bus.transcript_model("claude", aid), "")
         self.assertEqual(bus.transcript_model("cli", self.SID), "")
+
+    def test_idle_session_gets_its_transcripts_at_hello(self):
+        """A session idle since a restart sends no hook: the owner's /hello reads its transcript once."""
+        self.write(self.claude, {"type": "assistant", "message": {"model": "claude-opus-5-5"}})
+        self.write(self.codex, {"type": "turn_context", "payload": {"model": "gpt-6.1-terra"}})
+        self.assertTrue(all("model" not in a for a in self.b.hello("100.2.2.2")["agents"]))  # not for a sharee
+        self.assertEqual(self.models(), {"claude": "claude-opus-5-5", "codex": "gpt-6.1-terra"})
+        self.assertEqual(self.b.store.one("SELECT model FROM agents WHERE id=?", self.SID)["model"], "claude-opus-5-5")
+        with mock.patch.object(bus, "transcript_model", side_effect=AssertionError("read again")):
+            self.assertEqual(self.models()["claude"], "claude-opus-5-5")  # kept: not read again
+        self.b.store.x("UPDATE agents SET last_seen=last_seen-? WHERE id=?", bus.LIVE + 1, self.TID)
+        self.b.store.x("UPDATE agents SET model='' WHERE id=?", self.TID)
+        with mock.patch.object(bus, "transcript_model", side_effect=AssertionError("offline")):
+            self.assertIsNone(self.models().get("codex"))  # an offline agent is not looked up

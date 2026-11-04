@@ -213,7 +213,7 @@ def _tail_records(path: Path, marker: bytes):
                 yield rec
 
 
-def transcript_model(harness: str, aid: str) -> str:
+def transcript_model(harness: str, aid: str, fresh: bool = False) -> str:
     """The model of a session's last turn, from its own transcript: the session id names the file, never a path a
     hook posted. Claude: the last main-thread assistant message's (so /model shows from the next reply). Codex: the
     rollout's last turn_context."""
@@ -221,7 +221,7 @@ def transcript_model(harness: str, aid: str) -> str:
         return ""
     path = _transcripts.get((harness, aid))
     if isinstance(path, float):
-        if time.time() - path < MODEL_MISS:
+        if not fresh and time.time() - path < MODEL_MISS:  # a turn's end searches anyway: it has just written one
             return ""
         path = None
     if path is None or not path.exists():
@@ -712,9 +712,19 @@ class Bus:
         model = "" if codex_turn else clean_model(d.get("model"))
         if not model and (codex_turn or d.get("hook_event_name") in ("Stop", "SessionStart")):
             r = self.store.one("SELECT harness FROM agents WHERE id=?", aid)
-            model = transcript_model(r["harness"] or "", aid) if r else ""
+            model = transcript_model(r["harness"] or "", aid, fresh=True) if r else ""
         if model:
             self.store.x("UPDATE agents SET model=? WHERE id=?", model, aid)
+
+    def _model_from_transcript(self, a: dict) -> str:
+        """An agent whose hooks have not said its model since this mailbox started (an idle session, or one
+        that was mid-turn at a restart): its transcript's, kept once found. A miss waits MODEL_MISS."""
+        if not a.get("online"):
+            return ""
+        model = transcript_model(a.get("harness") or "", a["id"])
+        if model:
+            self.store.x("UPDATE agents SET model=? WHERE id=? AND model=''", model, a["id"])
+        return model
 
     def by_pid(self, pid: int) -> dict | None:
         r = self.store.one("SELECT * FROM agents WHERE pid=? ORDER BY last_seen DESC", pid)
@@ -883,8 +893,9 @@ class Bus:
                         a["skip"] = f["skip"]
                     if f["permission_mode"]:
                         a["permission_mode"] = f["permission_mode"]
-                    if f["model"]:
-                        a["model"] = f["model"]
+                    model = f["model"] or self._model_from_transcript(f)
+                    if model:
+                        a["model"] = model
             if own:  # what a start key may start here (tailshare/start.py); never the folders
                 from . import start
 
