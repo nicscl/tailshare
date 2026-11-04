@@ -346,6 +346,23 @@ class Replication(unittest.TestCase):
         self.assertEqual(a.squads.sum("sq1"), b.squads.sum("sq1"))
         self.assertEqual({m["role"] for m in a.squads.squad("sq1")["members"]}, {"from-a", "iOS app"})
 
+    def test_writer_heals_a_copy_an_older_version_trimmed(self):
+        a, b = Machine(self, "air"), Machine(self, "pro")
+        a.put("sq1", name="A", members=[{"id": "m1", **member()}])
+        b.squads.merge(a.squads.squad("sq1", tombstones=True))
+        # as if b had stored it with a version that dropped a field: same rev, less content
+        row = b.squads.store.one("SELECT doc FROM squad_members WHERE squad='sq1' AND id='m1'")
+        trimmed = {k: v for k, v in json.loads(row["doc"]).items() if k != "role"}
+        b.squads.store.x("UPDATE squad_members SET doc=? WHERE squad='sq1' AND id='m1'", json.dumps(trimmed))
+        self.assertNotEqual(a.squads.sum("sq1"), b.squads.sum("sq1"))  # so sync pulls even at equal revs
+        d = a.squads.squad("sq1", tombstones=True)
+        self.assertEqual(b.squads.merge(d), 0)  # no source: the rev says nothing is newer
+        self.assertEqual(b.squads.merge(d, "mini"), 0)  # not the writer: it can't speak for air's rev
+        self.assertEqual(b.squads.merge(d, "air"), 1)
+        self.assertEqual(a.squads.sum("sq1"), b.squads.sum("sq1"))
+        self.assertEqual(b.squads.squad("sq1")["members"][0]["role"], a.squads.squad("sq1")["members"][0]["role"])
+        self.assertEqual(b.squads.merge(d, "air"), 0)  # nothing left to heal
+
     def test_merge_refuses_bad_registers(self):
         a = Machine(self, "air")
         a.put("sq1", name="A")
