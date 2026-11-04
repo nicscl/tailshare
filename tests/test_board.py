@@ -106,6 +106,7 @@ class Members(B):
         add = {"op": "add", "column": "backlog", "title": "t"}
         cases = [({**add, "card": "c1", "title": "x" * 81}, "ops[0].title"),
                  ({**add, "card": "c1", "note": "x" * 1001}, "ops[0].note"),
+                 ({**add, "card": "c1", "note": "é" * 1001}, "ops[0].note"),
                  ({**add, "card": "c1", "links": ["#1"] * 6}, "ops[0].links"),
                  ({**add, "card": "a-m2-0123abcd"}, "ops[0].card"),
                  ({**add, "card": "c 1"}, "ops[0].card"),
@@ -125,14 +126,14 @@ class Members(B):
 
 class Links(unittest.TestCase):
     def test_links(self):
-        ok = ["#1", "#123456", "https://github.com/nicscl/tailshare/pull/45", "https://a.b:443/x?y=1#z",
-              "https://localhost"]
+        ok = ["#1", "#123456", "https://github.com/nicscl/tailshare/pull/45", "https://a.bc:443/x?y=1#z"]
         for v in ok:
             self.assertEqual(board.link(v, "l"), v)
         bad = ["#1234567", "#x", "http://a.b", "javascript:alert(1)", "https://user@a.b", "https://a.b:8443/",
                "https://a.b\n/x", "https://a_b.c", "https://-a.b", "https://a.b/ x", "https://[::1]/",
                "https://1.2.3.4:443:1/", "https://a.b\\@c.d", "https://a.b/‮", "https://" + "a" * 300 + ".b",
-               "https:///x", "ftp://a.b", "", 7]
+               "https:///x", "ftp://a.b", "", 7, "https://localhost", "https://1.2.3.4/", "https://100.96.123.74",
+               "https://a.1"]
         for v in bad:
             with self.assertRaises(bus.BusError, msg=repr(v)):
                 board.link(v, "l")
@@ -195,6 +196,21 @@ class Autos(B):
         self.write("m2", now=[{"title": "Task B"}])
         self.assertEqual(self.get()["hidden"], [])  # gone from the report: no longer hidden
         self.assertEqual(self.m.squads.board._meta("sq")["hidden"], [])
+        self.m.patch("sq/members/m2x", base_rev=None, **member(name="Bob2", folder="/u/bob2"))
+        self.m.patch("sq/members/m2-2", base_rev=None, **member(name="Bob3", folder="/u/bob3"))
+        self.write("m2", now=[{"title": "Task B"}, {"title": "Task C"}])
+        self.m.squads.board._autos.clear()
+        c = board.auto_key("m2", "Task C")
+        hidden = sorted([c, board.auto_key("m2-2", "Never")])
+        with mock.patch.object(self.r, "everywhere", side_effect=bus.BusError("down", 500)):
+            self.m.squads.board._autos.clear()
+            self.owner({"op": "hide", "auto_key": c}, {"op": "hide", "auto_key": board.auto_key("m2-2", "Never")})
+            self.get()  # reports unreadable: nothing is unhidden
+        self.assertEqual(self.m.squads.board._meta("sq")["hidden"], hidden)
+        self.m.squads.board._autos.clear()
+        self.get()  # m2-2's report has no such task: only its key goes, not m2's
+        self.assertEqual(self.m.squads.board._meta("sq")["hidden"], [c])
+        self.owner({"op": "unhide", "auto_key": c})
         b = self.owner({"op": "pin", "auto_card": bk, "card": "p1"})
         p1 = self.card(b, "p1")
         self.assertEqual((p1["auto"], p1["follow_key"], p1["column"], p1["title"]), (False, bk, "doing", "Task B"))
@@ -227,13 +243,28 @@ class Sync(unittest.TestCase):
         b = pro.squads.board.read("sq")
         self.assertEqual([c["title"] for c in b["cards"]], ["Synced"])
         self.assertEqual(pro.squads.board.log("sq")[0]["card"], "c1")
-        self.assertEqual(air.squads.sum("sq"), pro.squads.sum("sq"))
+        self.assertEqual(air.squads.board.sum("sq"), pro.squads.board.sum("sq"))
         # a delete on pro reaches air as a tombstone
         pro.squads.board.apply("sq", [{"op": "delete", "card": "c1"}], {"owner": True, "by": "iPad k1"})
         d = pro.squads.board.copy("sq")
         self.assertGreater(air.squads.board.merge("sq", d, "pro"), 0)
         self.assertEqual(air.squads.board.read("sq")["cards"], [])
-        self.assertEqual(air.squads.sum("sq"), pro.squads.sum("sq"))
+        self.assertEqual(air.squads.board.sum("sq"), pro.squads.board.sum("sq"))
+
+    def test_board_writes_keep_the_squad_version(self):
+        """squad_sums is the version pending suggestions are based on: a card moving must not make them stale."""
+        air = Machine(self, "air")
+        mk(air)
+        air.put("sq", name="S", members=[{"id": "m1", **member(folder="/u/dev")}])
+        reg(air.bus, "s-m1", "dev", cwd="/u/dev", squad={"id": "sq", "member": "m1"})
+        v, b = air.squads.sum("sq"), air.squads.board.sum("sq")
+        air.squads.route("POST", "/squads/sq/board", {"agent": "s-m1", "ops": [
+            {"op": "add", "card": "c1", "column": "backlog", "title": "x"}]}, True, "127.0.0.1", {})
+        self.assertEqual(air.squads.sum("sq"), v)
+        self.assertNotEqual(air.squads.board.sum("sq"), b)
+        h = air.squads.hello("nick@example.com", True)
+        self.assertEqual(h["board_sums"]["sq"], air.squads.board.sum("sq"))
+        self.assertNotIn("board_sums", air.squads.hello("alex@example.com", False))
 
     def test_merge_refuses_bad_registers(self):
         air = Machine(self, "air")

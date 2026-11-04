@@ -382,7 +382,6 @@ class Squads:
         revs = sorted(f"{r['id']}:{r['hlc']}:{r['rhost']}:{_digest(r['doc'], r['deleted'])}" for r in self.store.q(
             "SELECT '' AS id, hlc, rhost, doc, deleted FROM squads WHERE owner=? AND id=? UNION ALL "
             "SELECT id, hlc, rhost, doc, deleted FROM squad_members WHERE owner=? AND squad=?", self.owner, sid, self.owner, sid))
-        revs += sorted(self.board.sum_parts(sid))
         return hashlib.sha256("\n".join(revs).encode()).hexdigest()[:16]
 
     def shared_with(self, sid: str, user: str) -> dict | None:
@@ -428,7 +427,12 @@ class Squads:
             ids = [i for i in self.ids() if self.shared_with(i, user)]
         else:
             ids = []
-        return {"squads": {i: self.max_rev(i) for i in ids}, "squad_sums": {i: self.sum(i) for i in ids}} if ids else {}
+        if not ids:
+            return {}
+        out = {"squads": {i: self.max_rev(i) for i in ids}, "squad_sums": {i: self.sum(i) for i in ids}}
+        if own:  # boards go to the owner's machines only; apart from squad_sums, which suggestions use as the version
+            out["board_sums"] = {i: self.board.sum(i) for i in ids}
+        return out
 
     # -- writing -------------------------------------------------------------------------
     def _check_caps(self, sid: str, written: dict | None = None) -> None:
@@ -640,9 +644,16 @@ class Squads:
                 continue
             if self.merge(d.get("squad"), host):
                 bus.log(f"squads: {sid} updated from {host}")
-            if self._header_row(sid) is not None and self.sum(sid) != s and self.board.pull(host, peer, sid):
-                bus.log(f"squads: {sid}'s board updated from {host}")
             self._pulled[(host, sid)] = s + self.sum(sid)
+        boards = hello.get("board_sums")  # an older peer has none
+        for sid, s in (list(boards.items())[:MAX_SQUADS * 2] if isinstance(boards, dict) else []):
+            if not isinstance(sid, str) or not ID_RE.fullmatch(sid) or not isinstance(s, str) \
+                    or self._header_row(sid) is None or self.board.sum(sid) == s \
+                    or self._pulled.get((host, sid, "board")) == s + self.board.sum(sid):
+                continue
+            if self.board.pull(host, peer, sid):
+                bus.log(f"squads: {sid}'s board updated from {host}")
+            self._pulled[(host, sid, "board")] = s + self.board.sum(sid)
 
     def prune(self) -> None:
         cutoff = time.time() - TOMBSTONE_DAYS * 86400

@@ -73,13 +73,16 @@ def link(v: object, field: str) -> str:
     host = u.hostname or ""
     labels = host.split(".")
     if (u.scheme != "https" or "@" in u.netloc or port not in (None, 443) or len(host) > 253
-            or u.netloc.lower() not in (host, f"{host}:443") or not all(LABEL_RE.fullmatch(x) for x in labels)):
+            or u.netloc.lower() not in (host, f"{host}:443") or not all(LABEL_RE.fullmatch(x) for x in labels)
+            or len(labels) < 2 or not re.fullmatch(r"[a-z][a-z0-9-]*", labels[-1])):  # a host name: no IPs, no "localhost"
         raise Bad(field, "an https link or #123")
     return v
 
 
 def note(v: object, field: str) -> str:
-    v = _text(v, field, NOTE_MAX, oneline=False)
+    v = _text(v, field, NOTE_MAX * 4, oneline=False)  # characters, not bytes
+    if len(v) > NOTE_MAX:
+        raise Bad(field, f"at most {NOTE_MAX} characters")
     return "".join(c for c in v if c in "\n\t" or unicodedata.category(c)[0] != "C").strip()
 
 
@@ -176,14 +179,14 @@ class Board:
     def _reports(self, sid: str, fresh: bool = False) -> dict:
         reps = self.squads.bus.reports
         if reps is None:
-            return {"reports": [], "unreachable": []}
+            return {"reports": [], "unreachable": [], "failed": True}
         hit = self._autos.get(sid)
         if hit and not fresh and hit[0] > time.time() - AUTO_TTL:
             return hit[1]
         try:
             d = reps.everywhere(sid)
-        except bus.BusError:
-            d = {"reports": [], "unreachable": []}
+        except Exception:  # noqa: BLE001
+            return {"reports": [], "unreachable": [], "failed": True}  # not cached: try again next read
         self._autos[sid] = (time.time(), d)
         return d
 
@@ -193,7 +196,8 @@ class Board:
         d = self._reports(sid)
         ids = {m["id"]: m for m in sq["members"] if not m.get("deleted")}
         gone = set(d.get("unreachable") or [])
-        seen = {mid for mid, m in ids.items() if m["host"] not in gone}
+        # whose reports were really read: only their hidden keys may be dropped (fail closed when reading failed)
+        seen = set() if d.get("failed") else {mid for mid, m in ids.items() if m["host"] not in gone}
         out: dict[str, dict] = {}
         done: set[str] = set()
 
@@ -237,7 +241,7 @@ class Board:
             self._follow(sid, cards, done)
             live = {a["id"] for a in autos}
             # a hidden key goes once its member's report no longer has it (not when its machine didn't answer)
-            keep = [h for h in meta["hidden"] if h in live or not any(h.startswith(f"a-{m}-") for m in seen)]
+            keep = [h for h in meta["hidden"] if h in live or h[2:-9] not in seen]  # a-<member>-<8 hex>
             if keep != meta["hidden"]:
                 meta = {**meta, "hidden": keep}
                 self._write_meta(sid, meta, self.squads.tick())
@@ -485,8 +489,9 @@ class Board:
         return {**{k: v for k, v in c.items() if k != "followed"}, "auto": False, "done": c["column"] == DONE}
 
     # -- replication ---------------------------------------------------------------------
-    def sum_parts(self, sid: str) -> list[str]:
-        """What squads.sum adds for the board: each register's rev and content, and the log's entries."""
+    def sum(self, sid: str) -> str:
+        """/hello's board_sums: each register's rev and content, and the log's entries. Apart from squads.sum,
+        which pending suggestions use as the squad's version: a card moving must not make them stale."""
         out = [f"c:{r['id']}:{r['hlc']}:{r['rhost']}:{_digest(r['doc'], r['deleted'])}"
                for r in self._card_rows(sid, tombstones=True)]
         m = self._meta_row(sid)
@@ -494,7 +499,7 @@ class Board:
             out.append(f"m:{m['hlc']}:{m['rhost']}:{_digest(m['doc'], 0)}")
         out += [f"l:{r['hlc']}:{r['rhost']}" for r in self.store.q(
             "SELECT hlc, rhost FROM board_log WHERE owner=? AND squad=?", self.owner, sid)]
-        return out
+        return hashlib.sha256("\n".join(sorted(out)).encode()).hexdigest()[:16]
 
     def copy(self, sid: str) -> dict:
         """GET /squads/<id>/board/sync: every register with its rev, tombstones too, for the owner's machines."""

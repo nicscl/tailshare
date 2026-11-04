@@ -67,8 +67,9 @@ to done. Nobody moves or edits an auto card; the member changes its report inste
 ## Sync
 
 Each card and the board row (columns, hidden keys) is a register with a rev, like a squad member: the higher
-rev wins. Equal revs heal from the writer, as squads do. `squad_sums` cover the board too. A machine that
-pulls a squad also pulls `GET …/board/sync` (owner's machines only). An older peer answers 404 there and is
+rev wins. Equal revs heal from the writer, as squads do. The owner's machines compare
+`board_sums` in `/hello`, which is kept apart from `squad_sums`: pending suggestions use that as the squad's version,
+so a card moving does not make them stale. A machine whose `board_sums` differ pulls `GET …/board/sync` (owner's machines only). An older peer answers 404 there and is
 skipped.
 
 ## CLI
