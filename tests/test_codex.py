@@ -82,5 +82,15 @@ class Install(unittest.TestCase):
         self.assertEqual(json.loads((self.tmp / "hooks.json").read_text()), theirs)
 
 
+    def test_bad_hooks_file_is_left_alone(self):
+        (self.tmp / "hooks.json").write_text("[1, 2]")
+        with self.assertRaises(SystemExit):
+            self.run_cmd(agent.cmd_install_codex)
+        self.run_cmd(agent.cmd_uninstall_codex)
+        (self.tmp / "hooks.json").write_text("{nope")
+        self.run_cmd(agent.cmd_uninstall_codex)
+        self.assertEqual((self.tmp / "hooks.json").read_text(), "{nope")
+
+
 if __name__ == "__main__":
     unittest.main()

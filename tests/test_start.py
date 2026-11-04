@@ -247,6 +247,9 @@ class Plans(Base):
             {"slug": "-x", "visibility": "list"}, {"slug": "a b", "visibility": "list"}, "junk"]}))
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
             self.assertEqual(start.codex_models(), ["gpt-6-sol"])
+        (home / "models_cache.json").write_text('{"models": 5}')
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            self.assertEqual(start.codex_models(), [])
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(home / "none")}):
             self.assertEqual(start.codex_models(), [])
 

@@ -185,6 +185,8 @@ def codex_models(limit: int = 30) -> list[str]:
         rows = doc.get("models") or []
     except (OSError, ValueError, AttributeError):
         return []
+    if not isinstance(rows, list):
+        return []
     out: list[str] = []
     for m in rows:
         slug = m.get("slug") if isinstance(m, dict) else None

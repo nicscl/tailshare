@@ -658,7 +658,9 @@ def cmd_install_codex(args):
     try:
         doc = json.loads(path.read_text()) if path.exists() else {}
     except ValueError:
-        print(f"✗ {path} is not valid JSON; fix it first")
+        doc = None
+    if not isinstance(doc, dict) or not isinstance(doc.get("hooks", {}), dict):
+        print(f"✗ {path} is not a JSON object with a hooks object; fix it first")
         sys.exit(1)
     if _add_hooks(doc, wanted=_codex_wanted()):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -674,15 +676,19 @@ def cmd_install_codex(args):
     if subprocess.run([codex, "mcp", "get", "tailshare"], capture_output=True).returncode == 0:
         print("✓ MCP server already registered")
     else:
-        cp = subprocess.run([codex, "mcp", "add", "tailshare", "--", *t.split(), "mcp"], capture_output=True, text=True)
+        cp = subprocess.run([codex, "mcp", "add", "tailshare", "--", *shlex.split(t), "mcp"], capture_output=True, text=True)
         print("✓ MCP server registered" if cp.returncode == 0 else f"✗ codex mcp add: {cp.stderr.strip()}")
     print("New Codex sessions join the bus once the hooks are trusted.")
 
 
 def cmd_uninstall_codex(args):
     path = _codex_hooks_path()
-    if path.exists():
-        doc = json.loads(path.read_text())
+    try:
+        doc = json.loads(path.read_text()) if path.exists() else None
+    except ValueError:
+        print(f"✗ {path} is not valid JSON; left as it is")
+        doc = None
+    if isinstance(doc, dict) and isinstance(doc.get("hooks", {}), dict):
         _remove_hooks(doc)
         _write_settings(path, doc, ".json.bak-tailshare-uninstall")
         print(f"✓ hooks removed from {path}")

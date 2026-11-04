@@ -126,7 +126,12 @@ INSTRUCTIONS = (
 def _identity() -> agent.Identity:
     """Our session. Claude Code may not pass the session id to MCP servers, so fall back to
     the session the SessionStart hook registered for our parent process."""
-    if os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or os.environ.get("TAILSHARE_AGENT_ID"):
+    env = os.environ
+    if env.get("TAILSHARE_AGENT_ID") or env.get("CODEX_THREAD_ID"):
+        return agent.detect()
+    # a Codex started from a Claude shell inherits CLAUDE_CODE_SESSION_ID but may not pass CODEX_THREAD_ID to MCP
+    # servers: then the process tree, and the mailbox's pid record, say which session this is
+    if env.get("CLAUDE_CODE_SESSION_ID") and agent._nearest_harness()[0] != "codex":
         return agent.detect()
     found = agent.call(f"/agents?pid={os.getppid()}").get("agent")
     if found and found.get("harness") in ("claude", "codex"):
