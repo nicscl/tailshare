@@ -239,6 +239,20 @@ def _rev(v: object) -> tuple[int, str] | None:
     return None
 
 
+def _doc_text(doc: dict | None) -> str:
+    """A register's doc as stored."""
+    return json.dumps(doc or {})
+
+
+def _digest(text: str, deleted: object) -> str:
+    """A register's content, whatever key order it was stored in."""
+    try:
+        canon = json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
+    except ValueError:
+        canon = text
+    return hashlib.sha256(f"{int(bool(deleted))}:{canon}".encode()).hexdigest()[:8]
+
+
 class Conflict(bus.BusError):
     def __init__(self, what: str, current: dict | None) -> None:
         super().__init__("conflict", 409, {what: current})
@@ -360,9 +374,11 @@ class Squads:
 
     def sum(self, sid: str) -> str:
         """Changes with any register's rev, even one that merged in under the max: what peers compare."""
-        revs = sorted(f"{r['id']}:{r['hlc']}:{r['rhost']}" for r in self.store.q(
-            "SELECT '' AS id, hlc, rhost FROM squads WHERE owner=? AND id=? UNION ALL "
-            "SELECT id, hlc, rhost FROM squad_members WHERE owner=? AND squad=?", self.owner, sid, self.owner, sid))
+        # each register's content too: a copy stored under the writer's rev by an older version (which dropped a
+        # field it did not know) differs only there, and must still make the two machines compare
+        revs = sorted(f"{r['id']}:{r['hlc']}:{r['rhost']}:{_digest(r['doc'], r['deleted'])}" for r in self.store.q(
+            "SELECT '' AS id, hlc, rhost, doc, deleted FROM squads WHERE owner=? AND id=? UNION ALL "
+            "SELECT id, hlc, rhost, doc, deleted FROM squad_members WHERE owner=? AND squad=?", self.owner, sid, self.owner, sid))
         return hashlib.sha256("\n".join(revs).encode()).hexdigest()[:16]
 
     def shared_with(self, sid: str, user: str) -> dict | None:
@@ -545,9 +561,11 @@ class Squads:
             return {"member": m}
 
     # -- replicating ---------------------------------------------------------------------
-    def merge(self, d: object) -> int:
+    def merge(self, d: object, source: str = "") -> int:
         """Take a copy from another machine of the owner: each register that is newer and valid. Returns how
-        many registers changed. Invalid registers are dropped one by one; caps are the writer's to keep."""
+        many registers changed. Invalid registers are dropped one by one; caps are the writer's to keep.
+        `source` is the machine the copy came from: for a register it wrote itself, its copy also replaces ours at
+        the same rev when they differ (ours was stored by a version that did not keep every field)."""
         if not isinstance(d, dict) or d.get("owner") != self.owner or not isinstance(d.get("id"), str) \
                 or not ID_RE.fullmatch(d["id"]):
             return 0
@@ -556,14 +574,21 @@ class Squads:
         def newer(rev, row) -> bool:
             return rev is not None and rev[0] <= limit and (row is None or rev > (row["hlc"], row["rhost"]))
 
+        def healed(rev, row, doc) -> bool:
+            """The writer's own copy at our rev, saying something else: ours was stored by a version that dropped
+            a field it did not know, and the rev alone would never let it be repaired."""
+            return bool(source) and rev is not None and row is not None and rev == (row["hlc"], row["rhost"]) \
+                and rev[1] == source and _digest(_doc_text(doc), doc is None) != _digest(row["doc"], row["deleted"])
+
         with self.store.lock:
-            rev = _rev(d.get("rev"))
-            if newer(rev, self._header_row(sid)):
+            rev, row = _rev(d.get("rev")), self._header_row(sid)
+            if newer(rev, row) or (source and row is not None and rev == (row["hlc"], row["rhost"])):
                 try:
                     doc = None if d.get("deleted") is True else {**clean_header(d), "updated": int(d.get("updated") or 0)}
-                    self._write_header(sid, doc, list(rev))
-                    self.observe(rev[0])
-                    n += 1
+                    if newer(rev, row) or healed(rev, row, doc):
+                        self._write_header(sid, doc, list(rev))
+                        self.observe(rev[0])
+                        n += 1
                 except bus.BusError:
                     pass
             if self._header_row(sid) is None:  # members only arrive with their squad
@@ -573,11 +598,13 @@ class Squads:
                     continue
                 rev = _rev(m.get("rev"))
                 row = self.store.one("SELECT * FROM squad_members WHERE owner=? AND squad=? AND id=?", self.owner, sid, m["id"])
-                if not newer(rev, row):
+                if not newer(rev, row) and not (source and row is not None and rev == (row["hlc"], row["rhost"])):
                     continue
                 try:
                     doc = None if m.get("deleted") is True else {**clean_member(m), "updated": int(m.get("updated") or 0)}
                 except bus.BusError:
+                    continue
+                if not newer(rev, row) and not healed(rev, row, doc):
                     continue
                 self._write_member(sid, m["id"], doc, list(rev))
                 self.observe(rev[0])
@@ -607,7 +634,7 @@ class Squads:
                 d = bus.request(f"http://{peer['ip']}:{peer['port']}/bus/v1/squads/{sid}?tombstones=1", timeout=5)
             except Exception:  # noqa: BLE001
                 continue
-            if self.merge(d.get("squad")):
+            if self.merge(d.get("squad"), host):
                 bus.log(f"squads: {sid} updated from {host}")
             self._pulled[(host, sid)] = s + self.sum(sid)
 
