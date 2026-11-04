@@ -63,6 +63,11 @@ INSTRUCTIONS = "<instructions>"  # stands for the instructions in a plan's argv
 PROMPT = "<prompt>"  # and the prompt
 
 _WORD = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# A model value: a CLI alias or a full id, "[1m]" included. Never led by "-"; it goes as one --model=<value> argument.
+_MODEL = re.compile(r"[A-Za-z0-9._:\[\]][A-Za-z0-9._:\[\]-]{0,63}")
+CLAUDE_ALIASES = ("opus", "sonnet", "haiku", "opus[1m]", "sonnet[1m]")  # what `claude --model` takes as aliases
+MODELS_MAX = 30
+SEEN_DAYS = 30  # how far back a model seen in a session here (the bus's agents.model) is offered
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _PLAN_ID = re.compile(r"[0-9a-f]{32}")
 _KEY_ID = re.compile(r"k[0-9a-f]{12}")
@@ -72,7 +77,7 @@ KINDS = {
     "claude": {
         "permission_mode": ("enum", ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions")),
         "skip_permissions": ("bool",),
-        "model": ("word",),
+        "model": ("model",),
         "effort": ("word",),
         "resume": ("uuid",),
         "add_dirs": ("dirs",),
@@ -81,7 +86,7 @@ KINDS = {
         "approval": ("enum", ("untrusted", "on-request", "never")),
         "sandbox": ("enum", ("read-only", "workspace-write", "danger-full-access")),
         "skip_permissions": ("bool",),
-        "model": ("word",),
+        "model": ("model",),
         "effort": ("word",),
         "resume": ("uuid",),
         "add_dirs": ("dirs",),
@@ -150,14 +155,16 @@ def load_config(path: Path | None = None) -> dict | None:
         if k in KINDS and isinstance(v, dict):
             opts = [o for o in v.get("options") or [] if isinstance(o, str) and o in KINDS[k]]
             b = v.get("bin")
-            kinds[k] = {"options": opts, "bin": b if isinstance(b, str) and b.startswith("/") else ""}
+            extra = [m for m in v.get("models") or [] if isinstance(m, str) and _MODEL.fullmatch(m)] \
+                if isinstance(v.get("models"), list) else []
+            kinds[k] = {"options": opts, "bin": b if isinstance(b, str) and b.startswith("/") else "", "models": extra}
     mr = d.get("max_running")
     return {"roots": roots, "kinds": kinds, "skip_permissions": d.get("skip_permissions") is True,
             "auto": d.get("auto") is True,
             "max_running": mr if isinstance(mr, int) and not isinstance(mr, bool) and 0 < mr <= 100 else 12}
 
 
-def capabilities(path: Path | None = None) -> dict | None:
+def capabilities(path: Path | None = None, owner: str = "") -> dict | None:
     """The /hello `start` block for the owner's devices: what this host takes, never its folders."""
     try:
         cfg = load_config(path)
@@ -172,9 +179,43 @@ def capabilities(path: Path | None = None) -> dict | None:
         out["permission_modes"] = {"claude": [m for m in KINDS["claude"]["permission_mode"][1]
                                               if (m != "auto" or cfg["auto"])
                                               and (m != "bypassPermissions" or cfg["skip_permissions"])]}
-    if "model" in cfg["kinds"].get("codex", {}).get("options", []):
-        out["models"] = {"codex": codex_models()}
+    cfg["owner"] = owner
+    models = {k: allowed_models(k, cfg) for k in sorted(cfg["kinds"]) if "model" in cfg["kinds"][k]["options"]}
+    if models:
+        out["models"] = models
     return out
+
+
+def allowed_models(kind: str, cfg: dict) -> list[str]:
+    """The model values a device may pick for a kind, and the only ones a start accepts: start.json's own
+    `models` first, then Claude's aliases or Codex's picker, then the full ids the owner's sessions here ran
+    recently (none when the owner is unknown)."""
+    base = list(CLAUDE_ALIASES) if kind == "claude" else codex_models() if kind == "codex" else []
+    out: list[str] = []
+    for m in [*cfg["kinds"].get(kind, {}).get("models", []), *base, *seen_models(kind, cfg.get("owner", ""))]:
+        if _MODEL.fullmatch(m) and m not in out:
+            out.append(m)
+    return out[:MODELS_MAX]
+
+
+def seen_models(kind: str, owner: str) -> list[str]:
+    """Models the owner's sessions of a kind on this host ran in the last SEEN_DAYS days, newest first, from the
+    bus's agents table (the ids their transcripts name, see bus.transcript_model). Not other people's sessions
+    (someone ssh'd in): what they ran is theirs."""
+    path = bus.STATE_DIR / "bus.db"  # agents.user is the login's short handle (bus.handle), as /hello names it
+    if not bus.handle(owner) or not path.exists():
+        return []
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = db.execute("SELECT model, MAX(last_seen) AS t FROM agents WHERE harness=? AND user=? AND model!=''"
+                              " AND last_seen>? GROUP BY model ORDER BY t DESC LIMIT ?",
+                              (kind, bus.handle(owner), time.time() - SEEN_DAYS * 86400, MODELS_MAX)).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
+    return [r[0] for r in rows if isinstance(r[0], str) and _MODEL.fullmatch(r[0])]
 
 
 def codex_models(limit: int = 30) -> list[str]:
@@ -263,7 +304,7 @@ def slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "agent"
 
 
-def _options(kind: str, raw: object, allowed: list[str], roots: list[str]) -> dict:
+def _options(kind: str, raw: object, allowed: list[str], roots: list[str], models: list[str] | None = None) -> dict:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -281,6 +322,10 @@ def _options(kind: str, raw: object, allowed: list[str], roots: list[str]) -> di
         elif t[0] == "bool" and isinstance(v, bool):
             out[k] = v
         elif t[0] == "word" and isinstance(v, str) and _WORD.fullmatch(v):
+            out[k] = v
+        elif t[0] == "model" and isinstance(v, str) and _MODEL.fullmatch(v):
+            if v not in (models or []):
+                raise Refused("not_allowed", f, "not one of this host's models (/hello start.models)")
             out[k] = v
         elif t[0] == "uuid" and isinstance(v, str) and _UUID.fullmatch(v):
             out[k] = v
@@ -440,7 +485,8 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         raise Refused("not_allowed", "kind")
     cwd = _in_roots(item.get("cwd"), cfg["roots"], "cwd")
     name = clean_name(item.get("name"))
-    opts = _options(kind, item.get("options"), cfg["kinds"][kind]["options"], cfg["roots"])
+    opts = _options(kind, item.get("options"), cfg["kinds"][kind]["options"], cfg["roots"],
+                    allowed_models(kind, cfg) if isinstance(item.get("options"), dict) and "model" in item["options"] else None)
     instructions = _text(item.get("instructions"), "instructions", INSTRUCTIONS_MAX)
     prompt = _text(item.get("prompt"), "prompt", PROMPT_MAX)
     device = "".join(c for c in _text(item.get("device_name"), "device_name", 256)
@@ -772,7 +818,7 @@ def close(con: sqlite3.Connection, ids: object, key: str) -> list[dict]:
 
 
 def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None = None,
-           db: Path | None = None, plan_only: bool = False) -> dict:
+           db: Path | None = None, plan_only: bool = False, owner: str = "") -> dict:
     """One `tailshare-start` call: {"v":1, "results":[…]} or {"v":1, "error":…}. `plan_only`: the call came in on
     the pair's plan key, which needs no Face ID, so it may dry-run but never confirm."""
     try:
@@ -783,6 +829,7 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
         cfg = load_config(cfg_path)
         if not cfg or not cfg["roots"] or not cfg["kinds"]:
             raise Refused("off", reason="starting sessions is off on this host")
+        cfg["owner"] = owner  # whose sessions' models are offered (seen_models)
         if not isinstance(doc, dict) or doc.get("v") != 1:
             raise Refused("bad_request", "v")
         con = _db(db)
@@ -1041,11 +1088,11 @@ def gate(grant: str, key: str, plan_only: bool = False) -> int:
         except (ValueError, UnicodeDecodeError):
             doc = None
         try:
-            host = host_name()
+            host, owner = machine()
         except Refused as e:
             out = {"v": 1, **e.out}
         else:
-            out = handle(doc, grant, key, host, plan_only=plan_only)
+            out = handle(doc, grant, key, host, plan_only=plan_only, owner=owner)
     line = json.dumps(out, separators=(",", ":"))
     if len(line) > MAX_OUTPUT:
         line = json.dumps({"v": 1, "error": "too_large", "reason": "the reply is too large; send fewer starts"})
@@ -1055,15 +1102,20 @@ def gate(grant: str, key: str, plan_only: bool = False) -> int:
 
 
 def host_name() -> str:
-    """This machine's tailnet name, as the bus knows it (its local /machines: /hello is served on the tailnet only).
+    return machine()[0]
+
+
+def machine() -> tuple[str, str]:
+    """This machine's tailnet name and owner's login ("" for a tagged machine). The name, as the bus knows it (its local /machines: /hello is served on the tailnet only).
     No guess when the bus does not say: devices check a plan's host against the machine they reached, so a wrong
     name would only be refused there, after the person had looked at it."""
     try:
         rows = bus.request(f"http://127.0.0.1:{bus.BUS_PORT}/bus/v1/machines", None, timeout=3)["machines"]
-        host = next(str(m["host"]) for m in rows if m.get("self") is True)
+        me = next(m for m in rows if m.get("self") is True)
+        host, owner = str(me["host"]), me.get("owner")
     except Exception:  # noqa: BLE001
         raise Refused("no_bus", reason="the bus is not running here, so this machine's name is unknown; start it "
                       "with `tailshare serve`") from None
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", host):
         raise Refused("no_bus", reason="the bus gave no usable machine name")
-    return host
+    return host, owner if isinstance(owner, str) and 0 < len(owner) <= 256 else ""

@@ -71,7 +71,8 @@ class Base(unittest.TestCase):
     def config(self, **kw):
         d = {"enabled": True, "roots": [str(self.root)], "skip_permissions": True, "max_running": 4,
              "kinds": {"claude": {"bin": str(self.bin / "claude"), "options": list(start.KINDS["claude"])},
-                       "codex": {"bin": str(self.bin / "codex"), "options": list(start.KINDS["codex"])}}}
+                       "codex": {"bin": str(self.bin / "codex"), "options": list(start.KINDS["codex"]),
+                                 "models": ["gpt-5.5"]}}}
         d.update(kw)
         p = self.state / "start.json"
         p.write_text(json.dumps(d))
@@ -82,7 +83,7 @@ class Base(unittest.TestCase):
         return {"kind": "claude", "cwd": str(self.root / "app"), "name": "AppDev", **kw}
 
     def call(self, doc, grant="safe", key=KEY):
-        return start.handle(doc, grant, key, "air")
+        return start.handle(doc, grant, key, "air", owner="nick@example.com")
 
     def dry(self, *items, grant="safe", key=KEY):
         return self.call({"v": 1, "dry_run": True, "starts": list(items)}, grant, key)["results"]
@@ -131,7 +132,8 @@ class Config(Base):
 
     def test_capabilities_and_folders(self):
         self.config(kinds={"claude": {"options": ["model", "nonsense"]}, "grok": {"options": []}})
-        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True})
+        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True,
+                                                "models": {"claude": list(start.CLAUDE_ALIASES)}})
         (self.root / ".hidden").mkdir()
         (self.root / "app" / "src").mkdir()
         self.assertEqual(start.folders(), [str(self.root / "app"), str(self.root / "lib"), str(self.root / "app" / "src")])
@@ -252,6 +254,41 @@ class Plans(Base):
             self.assertEqual(start.codex_models(), [])
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(home / "none")}):
             self.assertEqual(start.codex_models(), [])
+
+    def test_models_offered_and_the_only_ones_taken(self):
+        import sqlite3
+
+        db = sqlite3.connect(self.state / "bus.db")
+        db.execute("CREATE TABLE agents(id TEXT, harness TEXT, model TEXT NOT NULL DEFAULT '', last_seen REAL,"
+                   " user TEXT NOT NULL DEFAULT 'nick')")
+        now = time.time()
+        db.executemany("INSERT INTO agents(id, harness, model, last_seen) VALUES(?,?,?,?)", [
+            ("a", "claude", "claude-opus-5-5", now - 60), ("b", "claude", "claude-opus-5-5[1m]", now),
+            ("c", "claude", "claude-opus-5-5", now - 120), ("d", "claude", "claude-old-1", now - 40 * 86400),
+            ("e", "codex", "gpt-6.1-terra", now), ("f", "claude", "", now), ("g", "claude", "-bad", now)])
+        db.execute("INSERT INTO agents VALUES('h', 'claude', 'claude-guest-9', ?, 'guest')", (now,))  # ssh'd-in guest
+        db.commit()
+        db.close()
+        home = Path(tempfile.mkdtemp())
+        (home / "models_cache.json").write_text(json.dumps({"models": [{"slug": "gpt-6-sol", "visibility": "list"}]}))
+        self.config(kinds={"claude": {"bin": str(self.bin / "claude"), "options": ["model"], "models": ["fable", "-x", 7]},
+                           "codex": {"bin": str(self.bin / "codex"), "options": ["model"]}})
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            self.assertEqual(start.capabilities()["models"]["claude"], ["fable", *start.CLAUDE_ALIASES])  # no owner
+            models = start.capabilities(owner="nick@example.com")["models"]
+            self.assertEqual(models, {"claude": ["fable", *start.CLAUDE_ALIASES, "claude-opus-5-5[1m]", "claude-opus-5-5"],
+                                      "codex": ["gpt-6-sol", "gpt-6.1-terra"]})
+            p = self.dry(self.item(options={"model": "claude-opus-5-5[1m]"}))[0]["plan"]
+            self.assertIn("--model=claude-opus-5-5[1m]", p["argv"])
+            self.assertIn("--model=gpt-6.1-terra", self.dry(self.item(kind="codex", options={"model": "gpt-6.1-terra"}))[0]["plan"]["argv"])
+            self.assertEqual(self.refused(self.item(options={"model": "claude-old-1"})),
+                             ("not_allowed", "options.model"))  # not offered: not taken
+            self.assertEqual(self.refused(self.item(options={"model": "claude-guest-9"})), ("not_allowed", "options.model"))
+            for junk in (5, True, "model", ["model"]):  # not a dict: a per-item bad_request, never a crashed batch
+                self.assertEqual(self.refused(self.item(options=junk)), ("bad_request", "options"), junk)
+            for bad in ("-x", "a b", "x" * 65, "[", 7):
+                self.assertEqual(self.refused(self.item(options={"model": bad}))[0], "bad_request" if bad != "[" else
+                                 "not_allowed", bad)
 
     def test_codex_argv_and_toml(self):
         tricky = 'say "hi"\\n\nnew line\ttab \x01 \u2028 é'
@@ -755,6 +792,10 @@ class HostName(unittest.TestCase):
     def test_from_the_local_machines_route(self):
         bus.BUS_PORT = fake_bus(self, "macbook-air", [{"host": "pro", "self": False}, {"host": "macbook-air", "self": True}])
         self.assertEqual(start.host_name(), "macbook-air")
+        bus.BUS_PORT = fake_bus(self, "", [{"host": "macbook-air", "self": True, "owner": "nick"}])
+        self.assertEqual(start.machine(), ("macbook-air", "nick"))
+        bus.BUS_PORT = fake_bus(self, "", [{"host": "macbook-air", "self": True, "owner": 5}])
+        self.assertEqual(start.machine(), ("macbook-air", ""))  # tagged or junk: no owner, so no seen models
 
     def test_no_guess_without_the_bus(self):
         for machines in ([], [{"host": "bad name!", "self": True}], [{"host": "x", "self": 1}]):

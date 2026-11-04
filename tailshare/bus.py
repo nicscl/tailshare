@@ -906,7 +906,7 @@ class Bus:
             if own:  # what a start key may start here (tailshare/start.py); never the folders
                 from . import start
 
-                caps = start.capabilities()
+                caps = start.capabilities(owner=self.net.user)
                 if caps:
                     out["start"] = caps
         return out

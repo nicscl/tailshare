@@ -28,7 +28,8 @@ machine that should accept starts.
   accepted as a root.
 - `kinds`: which agents may be started, and which options a device may set for each. A kind or option missing
   here is refused. `bin` is optional: by default the agent is looked up in `~/.local/bin`, `~/.claude/local`,
-  `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and must not be writable by others.
+  `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and must not be writable by others. `models` is optional:
+  more model values to offer and accept for that kind, e.g. `"claude": {"options": ["model"], "models": ["fable"]}`.
 - `max_running`: how many tailshare-started agents may run at once (1 to 100, default 12).
 - `skip_permissions`: whether a session may run with permissions skipped at all (see below). Default false.
 - `auto`: whether a Claude session may run in auto mode (`permission_mode: auto`, see below). Default false.
@@ -134,7 +135,8 @@ never attaches to the returned pane directly.
   since every server numbers its panes from `%0`.
 - As argv, never through a shell. Every option is one `--flag=value` element, so a value can never be read as
   another flag. The prompt is one element after `--`. Names lose control and format characters and must then
-  be 1 to 64 characters; model and effort must match `[A-Za-z0-9._-]{1,64}`; `resume` must be a UUID; `add_dirs`
+  be 1 to 64 characters; effort must match `[A-Za-z0-9._-]{1,64}`; model must match `[A-Za-z0-9._:\[\]-]{1,64}`, not
+  start with `-`, and be one of the host's models (`start.models`, below; else `not_allowed`, field `options.model`); `resume` must be a UUID; `add_dirs`
   must be under the roots like the folder.
 - Claude Code gets `--name`, `--session-id` (chosen at the dry run, so the device knows it),
   `--append-system-prompt` for the instructions, and the options. Codex gets `--cd`, the instructions as
@@ -246,6 +248,11 @@ Only a live agent (seen within 90 s, not ended) whose pane is on this user's own
 
 `/hello` carries a `start` block (`kinds`, the options per kind, whether `skip` is possible and, when claude's options include
 `permission_mode`, `permission_modes: {"claude": [...]}`, the modes a device may pick: `auto` only with `auto:
-true`, `bypassPermissions` only with `skip_permissions: true`) only to devices
+true`, `bypassPermissions` only with `skip_permissions: true`; and, for each kind whose options include `model`,
+`models: {"<kind>": [...]}`, the only values a start takes, at most 30: start.json's `models` first, then Claude's
+aliases (`opus`, `sonnet`, `haiku`, `opus[1m]`, `sonnet[1m]`) or the models Codex's own picker lists
+(`~/.codex/models_cache.json`), then the full ids that the owner's sessions of that kind on this host ran in the last
+30 days, newest first, as `/hello`'s `agents[].model` names them; not those of someone ssh'd in, and none on a
+tagged machine) only to devices
 of the machine's own tailnet user, and only when starting is on. `GET /bus/v1/sessions/start/folders` lists the
 folders under the roots (two levels deep, at most 200, no hidden folders or symlinks) to the same devices only.
