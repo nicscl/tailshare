@@ -232,6 +232,24 @@ class Plans(Base):
         self.assertEqual(p["tmux"], {"session": "tailshare-start", "window": "appdev"})
         self.assertNotIn("--dangerously-skip-permissions", a)
 
+    def test_codex_resume_effort_dirs(self):
+        tid = "019a0b1c-2d3e-4f5a-8b6c-7d8e9f0a1b2c"
+        a = start.argv_for("codex", "codex", "/x", "n", {"resume": tid, "effort": "high", "add_dirs": ["/y"]}, "", "go", "")
+        self.assertEqual(a, ["codex", "resume", "--cd=/x", '--config=model_reasoning_effort="high"', "--add-dir=/y",
+                             "--", tid, "go"])
+        a = start.argv_for("codex", "codex", "/x", "n", {"resume": tid}, "", "", "")
+        self.assertEqual(a[-2:], ["--", tid])
+
+    def test_codex_models(self):
+        home = Path(tempfile.mkdtemp())
+        (home / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": "gpt-6-sol", "visibility": "list"}, {"slug": "hidden", "visibility": "hide"},
+            {"slug": "-x", "visibility": "list"}, {"slug": "a b", "visibility": "list"}, "junk"]}))
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            self.assertEqual(start.codex_models(), ["gpt-6-sol"])
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home / "none")}):
+            self.assertEqual(start.codex_models(), [])
+
     def test_codex_argv_and_toml(self):
         tricky = 'say "hi"\\n\nnew line\ttab \x01 \u2028 é'
         p = self.dry(self.item(kind="codex", instructions=tricky, options={"model": "gpt-5.5", "sandbox": "read-only"}))[0]["plan"]

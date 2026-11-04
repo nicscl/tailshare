@@ -129,8 +129,8 @@ def _identity() -> agent.Identity:
     if os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or os.environ.get("TAILSHARE_AGENT_ID"):
         return agent.detect()
     found = agent.call(f"/agents?pid={os.getppid()}").get("agent")
-    if found and found.get("harness") == "claude":
-        return agent.detect({"session_id": found["id"], "cwd": found["cwd"]})
+    if found and found.get("harness") in ("claude", "codex"):
+        return agent.detect({"session_id": found["id"], "cwd": found["cwd"]}, found["harness"])
     return agent.detect()
 
 

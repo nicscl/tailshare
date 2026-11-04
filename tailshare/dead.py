@@ -93,9 +93,9 @@ def resumable(r: dict, cfg: dict | None) -> str:
     """Why this host would refuse to reopen `r`, or '' if a start with options.resume may."""
     from . import start
 
-    if r["kind"] != "claude":
+    if r["kind"] not in start.KINDS:
         return "kind"
-    if not cfg or not cfg["roots"] or "claude" not in cfg["kinds"] or "resume" not in cfg["kinds"]["claude"]["options"]:
+    if not cfg or not cfg["roots"] or r["kind"] not in cfg["kinds"] or "resume" not in cfg["kinds"][r["kind"]]["options"]:
         return "off"
     try:
         start._in_roots(r["cwd"], cfg["roots"], "cwd")

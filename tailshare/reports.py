@@ -316,7 +316,8 @@ class Reports:
             if self._may_raise(sq, mid, b) or not self._pending(b.get("approval")):
                 continue
             blockers.append(b)
-        return {"member": mid, "agent": agent or row["agent"], "online": bool(agent), "at": row["at"], "lead": lead,
+        return {"member": mid, "agent": agent or row["agent"], "harness": m.get("kind") or "", "online": bool(agent),
+                "at": row["at"], "lead": lead,
                 "bio": doc.get("bio") or "", "now": doc.get("now") or [], "next": doc.get("next") or [],
                 "done": [t for t in doc.get("done") or [] if t.get("at", 0) >= now - KEEP],
                 "waiting_on": wait, "blockers": blockers, "notes": (doc.get("notes") or "") if lead else ""}

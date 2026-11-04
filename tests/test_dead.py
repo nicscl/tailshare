@@ -95,10 +95,14 @@ class Listing(Base):
         self.agent(S2, cwd="/elsewhere")
         self.agent(S3, ago=700)
         self.assertEqual({r["id"]: r.get("reason") for r in dead.listing("air")["sessions"]},
-                         {S1: "kind", S2: "off", S3: "off"})  # start is off here
-        self.config()
+                         {S1: "off", S2: "off", S3: "off"})  # start is off here
+        self.config()  # codex is not a kind here
         self.assertEqual({r["id"]: (r["resumable"], r.get("reason")) for r in dead.listing("air")["sessions"]},
-                         {S1: (False, "kind"), S2: (False, "cwd"), S3: (True, None)})
+                         {S1: (False, "off"), S2: (False, "cwd"), S3: (True, None)})
+        self.config(kinds={"claude": {"bin": "/bin/echo", "options": ["resume"]},
+                           "codex": {"bin": "/bin/echo", "options": ["resume"]}})
+        self.assertEqual({r["id"]: r["resumable"] for r in dead.listing("air")["sessions"]},
+                         {S1: True, S2: False, S3: True})
         self.config(kinds={"claude": {"bin": "/bin/echo", "options": []}})  # no resume here
         self.assertEqual(dead.listing("air")["sessions"][-1]["reason"], "off")
 

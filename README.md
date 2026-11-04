@@ -146,6 +146,7 @@ everything under it (`macbook-pro/codex/api`) and globs work (`*/*/tailshare` is
 
 ```sh
 tailshare agent install-claude          # every new Claude Code session joins (hooks + MCP server)
+tailshare agent install-codex           # the same for Codex (trust the hooks once with /hooks in Codex)
 tailshare agent whoami                  # this session's address
 tailshare agent ls                      # agents here and on other machines
 tailshare agent send '*/*/api' "migration is ready" --file schema.sql
@@ -184,9 +185,10 @@ add Python's start-up time to it. `install-claude` adds them; when the service s
 any that are missing to a settings file that already has tailshare hooks, keeping your own hooks and a backup
 in `settings.json.bak-tailshare-upgrade` (a symlinked settings.json stays a link). Each hook is added this way
 only once (recorded in `~/.tailshare/claude-hooks.json`), so one you delete by hand stays deleted;
-`install-claude` puts it back and `uninstall-claude` removes them all. Codex only says when a turn ends: add
-`notify = ["tailshare", "agent", "codex-notify"]` to `~/.codex/config.toml` (if `notify` is not already set)
-and its agents show `idle` after each turn.
+`install-claude` puts it back and `uninstall-claude` removes them all. `install-codex` adds the same hooks to
+`~/.codex/hooks.json` (Codex also reports `PermissionRequest` as `waiting_input`/`permission`); see
+[docs/codex.md](docs/codex.md). Without them, `notify = ["tailshare", "agent", "codex-notify"]` in
+`~/.codex/config.toml` still shows `idle` after each turn.
 
 **Skipped permissions.** For the owner's own machines and devices only (another user, a tagged device or an unknown
 caller never gets it), each agent in `/hello` carries `skip: true` when it runs without asking, `false` when it

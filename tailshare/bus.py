@@ -142,6 +142,8 @@ def hook_state(d: dict) -> tuple[str, str, str]:
         state = "working"
     elif event == "Notification":
         state, reason = _NOTIFIED.get(note, ("", ""))
+    elif event == "PermissionRequest":  # Codex: it asks the person before running a tool
+        state, reason = "waiting_input", "permission"
     elif event == "Stop":
         state = "idle"
     elif event == "SessionStart" and d.get("source") != "compact":  # after a compaction it carries on working

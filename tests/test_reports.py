@@ -147,6 +147,7 @@ class Blockers(Base):
         self.write("m1", blockers=[self.q()], notes="# Team\nAll good.")
         r = self.r.view(self.m.squads.squad("sq"), "m1")
         self.assertEqual((len(r["blockers"]), r["notes"], r["lead"]), (1, "# Team\nAll good.", True))
+        self.assertIn(r["harness"], ("claude", "codex"))
         self.set_lead("m2", None)  # Lead leads no one now, and still reports to Manager
         r = self.r.view(self.m.squads.squad("sq"), "m1")
         self.assertEqual((r["blockers"], r["notes"], r["lead"]), ([], "", False))
