@@ -247,6 +247,10 @@ squad, nothing more. See [docs/squads.md](docs/squads.md).
 (`tailshare report`, or the `report` MCP tool). Your own devices read them for the squad page. See
 [docs/reports.md](docs/reports.md).
 
+**Board.** A squad's board of cards: To do, In progress, Needs you, Done. Members add and move their own cards
+(`tailshare board`, or the `board` MCP tool), and cards also follow what their reports say. Your devices do the
+rest. See [docs/board.md](docs/board.md).
+
 How messages reach an agent:
 
 - **Claude Code**: a SessionStart hook registers the session and tells it to run `tailshare agent watch --once`

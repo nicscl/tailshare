@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, agent, core, daemon, hive, keys, reports_cli, sessions_cli, squads_cli
+from . import __version__, agent, board_cli, core, daemon, hive, keys, reports_cli, sessions_cli, squads_cli
 
 
 def _base_url() -> str:
@@ -170,6 +170,7 @@ def main(argv: list[str] | None = None) -> None:
     keys.add_parser(sub)
     squads_cli.add_parser(sub)
     reports_cli.add_parser(sub)
+    board_cli.add_parser(sub)
     hive.add_parser(sub)
     up = sub.add_parser("update", help="update tailshare from its git source now")
     up.add_argument("--all", action="store_true", help="also tell every other machine to update")

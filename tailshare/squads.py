@@ -271,6 +271,9 @@ class Squads:
         from .suggestions import Suggestions
 
         self.suggestions = Suggestions(self)
+        from .board import Board
+
+        self.board = Board(self)
 
     # -- clock ---------------------------------------------------------------------------
     def tick(self) -> list:
@@ -424,7 +427,12 @@ class Squads:
             ids = [i for i in self.ids() if self.shared_with(i, user)]
         else:
             ids = []
-        return {"squads": {i: self.max_rev(i) for i in ids}, "squad_sums": {i: self.sum(i) for i in ids}} if ids else {}
+        if not ids:
+            return {}
+        out = {"squads": {i: self.max_rev(i) for i in ids}, "squad_sums": {i: self.sum(i) for i in ids}}
+        if own:  # boards go to the owner's machines only; apart from squad_sums, which suggestions use as the version
+            out["board_sums"] = {i: self.board.sum(i) for i in ids}
+        return out
 
     # -- writing -------------------------------------------------------------------------
     def _check_caps(self, sid: str, written: dict | None = None) -> None:
@@ -637,6 +645,15 @@ class Squads:
             if self.merge(d.get("squad"), host):
                 bus.log(f"squads: {sid} updated from {host}")
             self._pulled[(host, sid)] = s + self.sum(sid)
+        boards = hello.get("board_sums")  # an older peer has none
+        for sid, s in (list(boards.items())[:MAX_SQUADS * 2] if isinstance(boards, dict) else []):
+            if not isinstance(sid, str) or not ID_RE.fullmatch(sid) or not isinstance(s, str) \
+                    or self._header_row(sid) is None or self.board.sum(sid) == s \
+                    or self._pulled.get((host, sid, "board")) == s + self.board.sum(sid):
+                continue
+            if self.board.pull(host, peer, sid):
+                bus.log(f"squads: {sid}'s board updated from {host}")
+            self._pulled[(host, sid, "board")] = s + self.board.sum(sid)
 
     def prune(self) -> None:
         cutoff = time.time() - TOMBSTONE_DAYS * 86400
@@ -644,6 +661,7 @@ class Squads:
         self.store.x("DELETE FROM squads WHERE deleted=1 AND at<? AND NOT EXISTS (SELECT 1 FROM squad_members m "
                      "WHERE m.owner=squads.owner AND m.squad=squads.id)", cutoff)
         self.suggestions.prune()
+        self.board.prune()
 
     # -- HTTP ----------------------------------------------------------------------------
     def route(self, method: str, path: str, body: dict, local: bool, ip: str, qs: dict, token: str = "",
@@ -656,6 +674,14 @@ class Squads:
                 self.bus.net.refresh()
             user = self.bus.net.user_for_ip(ip) or ""
             own = bool(user) and user != "tagged-devices" and user == self.bus.net.user
+        if len(parts) >= 3 and parts[2] == "board":
+            def sign() -> dict:
+                if not any(signed[1].values()) and self._machine(ip):
+                    raise bus.BusError("board edits from a machine go through its own local API: `tailshare board`", 403)
+                if self.bus.keys is None:
+                    raise bus.BusError("signature", 403, {"reason": "unknown_key", "detail": "SSH keys are off on this machine"})
+                return self.bus.keys.check_signed(method, "/bus/v1" + path, signed[0], signed[1], self.owner, ip)
+            return self.board.route(method, parts, body, local, own, sign)
         sugg = len(parts) in (3, 4, 5) and parts[2] == "suggestions"
         if sugg and not own:  # suggestions are the owner's: a sharee sees the squad, not what agents proposed
             raise bus.BusError("only the squad's owner sees its suggestions", 403)
