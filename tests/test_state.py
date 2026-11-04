@@ -575,6 +575,7 @@ class Model(unittest.TestCase):
         self.assertEqual(self.models()["claude"], "claude-opus-5-5")
         self.b.report_state(hook("Stop", sid=self.SID))  # no transcript yet: kept
         self.assertEqual(self.models()["claude"], "claude-opus-5-5")
+        bus._transcripts.clear()  # a miss waits MODEL_MISS before searching again
         tool = {"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": [
             {"type": "tool_use", "input": {"model": "haiku"}}]}}
         self.write(self.claude, tool,
@@ -616,6 +617,6 @@ class Model(unittest.TestCase):
                                "pro/claude/d": "absent"})
 
     def test_ids_that_are_not_session_ids_read_nothing(self):
-        for aid in ("../../etc", "*", "short"):
+        for aid in ("../../etc", "*", "short", "1111-aaaa-bbbb-cccc-222222222222", "aaaa-bbbb-cccc-222222222222"):
             self.assertEqual(bus.transcript_model("claude", aid), "")
         self.assertEqual(bus.transcript_model("cli", self.SID), "")

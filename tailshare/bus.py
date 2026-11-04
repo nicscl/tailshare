@@ -183,10 +183,11 @@ def hook_mode(d: dict) -> str:
 # display hint like permission_mode: Codex takes any -m string and any local process can post a hook.
 MODEL_RE = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,64}")
 MODEL_TAIL = 512 * 1024  # how much of a transcript's end to read for the model its last turn used
-_SESSION_ID_RE = re.compile(r"[A-Za-z0-9-]{8,100}")
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")  # a whole UUID: no glob tail
+MODEL_MISS = 60.0  # how long a session with no transcript found waits before the next search
 _CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
 _CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-_transcripts: dict[tuple[str, str], Path] = {}
+_transcripts: dict[tuple[str, str], Path | float] = {}  # its path, or when a search last found none
 
 
 def clean_model(v: object) -> str:
@@ -216,14 +217,21 @@ def transcript_model(harness: str, aid: str) -> str:
     """The model of a session's last turn, from its own transcript: the session id names the file, never a path a
     hook posted. Claude: the last main-thread assistant message's (so /model shows from the next reply). Codex: the
     rollout's last turn_context."""
-    if harness not in ("claude", "codex") or not _SESSION_ID_RE.fullmatch(aid):
+    if harness not in ("claude", "codex") or not _SESSION_ID_RE.fullmatch(aid.lower()):
         return ""
     path = _transcripts.get((harness, aid))
+    if isinstance(path, float):
+        if time.time() - path < MODEL_MISS:
+            return ""
+        path = None
     if path is None or not path.exists():
         pattern = f"*/{aid}.jsonl" if harness == "claude" else f"*/*/*/rollout-*-{aid}.jsonl"
         root = _CLAUDE_HOME / "projects" if harness == "claude" else _CODEX_HOME / "sessions"
         path = next(iter(root.glob(pattern)), None)
         if path is None:
+            if len(_transcripts) > 4096:
+                _transcripts.clear()
+            _transcripts[(harness, aid)] = time.time()
             return ""
         _transcripts[(harness, aid)] = path
     if harness == "claude":
