@@ -179,6 +179,75 @@ def hook_mode(d: dict) -> str:
     return mode if isinstance(mode, str) and mode in CLAUDE_MODES else ""
 
 
+# The model a session runs, as its harness names it ("claude-opus-5-5", "claude-opus-5-5[1m]", a Codex model). A
+# display hint like permission_mode: Codex takes any -m string and any local process can post a hook.
+MODEL_RE = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,64}")
+MODEL_TAIL = 512 * 1024  # how much of a transcript's end to read for the model its last turn used
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")  # a whole UUID: no glob tail
+MODEL_MISS = 60.0  # how long a session with no transcript found waits before the next search
+_CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+_transcripts: dict[tuple[str, str], Path | float] = {}  # its path, or when a search last found none
+
+
+def clean_model(v: object) -> str:
+    return v if isinstance(v, str) and MODEL_RE.fullmatch(v) else ""
+
+
+def _tail_records(path: Path, marker: bytes):
+    """The JSON records with `marker` in the last MODEL_TAIL bytes of a JSONL file, newest first."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - MODEL_TAIL))
+            data = fh.read(MODEL_TAIL)
+    except OSError:
+        return
+    for line in reversed(data.split(b"\n")):
+        if marker in line:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                yield rec
+
+
+def transcript_model(harness: str, aid: str) -> str:
+    """The model of a session's last turn, from its own transcript: the session id names the file, never a path a
+    hook posted. Claude: the last main-thread assistant message's (so /model shows from the next reply). Codex: the
+    rollout's last turn_context."""
+    if harness not in ("claude", "codex") or not _SESSION_ID_RE.fullmatch(aid.lower()):
+        return ""
+    path = _transcripts.get((harness, aid))
+    if isinstance(path, float):
+        if time.time() - path < MODEL_MISS:
+            return ""
+        path = None
+    if path is None or not path.exists():
+        pattern = f"*/{aid}.jsonl" if harness == "claude" else f"*/*/*/rollout-*-{aid}.jsonl"
+        root = _CLAUDE_HOME / "projects" if harness == "claude" else _CODEX_HOME / "sessions"
+        path = next(iter(root.glob(pattern)), None)
+        if path is None:
+            if len(_transcripts) > 4096:
+                _transcripts.clear()
+            _transcripts[(harness, aid)] = time.time()
+            return ""
+        _transcripts[(harness, aid)] = path
+    if harness == "claude":
+        for rec in _tail_records(path, b'"assistant"'):
+            msg = rec.get("message")
+            if rec.get("type") == "assistant" and not rec.get("isSidechain") and isinstance(msg, dict) \
+                    and clean_model(msg.get("model")):  # "<synthetic>" (a message Claude Code wrote) is not one
+                return msg["model"]
+    else:
+        for rec in _tail_records(path, b'turn_context'):
+            p = rec.get("payload")
+            if rec.get("type") == "turn_context" and isinstance(p, dict) and clean_model(p.get("model")):
+                return p["model"]
+    return ""
+
+
 def hook_skip(d: dict) -> tuple[str, bool | None]:
     """(agent id, whether it runs with permissions skipped) from a Claude Code hook's permission_mode; None
     when the hook does not say. A display hint, not a security signal: any local process can post a hook."""
@@ -460,7 +529,7 @@ class Store:
         with self.lock:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
-            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "squad"), ("agents", "skip"), ("agents", "mode")):  # added after 1st release
+            for table, col in (("agents", "user"), ("messages", "sender_user"), ("agents", "tmux"), ("peers", "node"), ("peers", "power"), ("agents", "state"), ("agents", "squad"), ("agents", "skip"), ("agents", "mode"), ("agents", "model")):  # added after 1st release
                 if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
@@ -604,6 +673,7 @@ class Bus:
             "squad": json.loads(r["squad"]) if r["squad"] else None,
             "skip": {"1": True, "0": False}.get(r["skip"]),  # a display hint (hook_skip): None when unknown
             "permission_mode": r["mode"] or None,  # Claude's, from its hooks (hook_mode): a hint like skip
+            "model": r["model"] or None,  # from its hooks and transcript (_note_model): a hint like skip
         }
 
     def report_state(self, d: dict) -> dict:
@@ -611,6 +681,7 @@ class Bus:
         sid, skip = hook_skip(d)
         if skip is not None:  # every hook says the mode, which Shift+Tab can change mid-session
             self.store.x("UPDATE agents SET skip=?, mode=? WHERE id=?", "1" if skip else "0", hook_mode(d), sid)
+        self._note_model(d)
         aid, state, reason = hook_state(d)
         if not state:
             return {"ok": False}
@@ -630,6 +701,20 @@ class Bus:
             if state != "ended":  # a report shows the session is alive; a closed one is not online
                 self.store.x("UPDATE agents SET last_seen=? WHERE id=?", now, aid)
         return {"ok": True, "state": new}
+
+    def _note_model(self, d: dict) -> None:
+        """The model a hook names (Claude's SessionStart; Codex's hooks), or at the end of a turn the one its
+        transcript shows, so a /model change shows after the next reply. Unknown stays as it was."""
+        codex_turn = d.get("type") == "agent-turn-complete"
+        aid = d.get("thread-id") if codex_turn else d.get("session_id")
+        if not isinstance(aid, str) or not aid:
+            return
+        model = "" if codex_turn else clean_model(d.get("model"))
+        if not model and (codex_turn or d.get("hook_event_name") in ("Stop", "SessionStart")):
+            r = self.store.one("SELECT harness FROM agents WHERE id=?", aid)
+            model = transcript_model(r["harness"] or "", aid) if r else ""
+        if model:
+            self.store.x("UPDATE agents SET model=? WHERE id=?", model, aid)
 
     def by_pid(self, pid: int) -> dict | None:
         r = self.store.one("SELECT * FROM agents WHERE pid=? ORDER BY last_seen DESC", pid)
@@ -655,6 +740,8 @@ class Bus:
                     a.pop("skip", None)
                 if a.get("permission_mode") not in CLAUDE_MODES:  # a mode tailshare knows, or nothing
                     a.pop("permission_mode", None)
+                if not clean_model(a.get("model")):
+                    a.pop("model", None)
                 out.append(a)
         return {"host": self.net.host, "agents": out}
 
@@ -796,6 +883,8 @@ class Bus:
                         a["skip"] = f["skip"]
                     if f["permission_mode"]:
                         a["permission_mode"] = f["permission_mode"]
+                    if f["model"]:
+                        a["model"] = f["model"]
             if own:  # what a start key may start here (tailshare/start.py); never the folders
                 from . import start
 

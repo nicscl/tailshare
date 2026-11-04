@@ -540,3 +540,83 @@ class Install(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Model(unittest.TestCase):
+    """The model a session runs, for the owner's machines and devices: from its hooks and its own transcript."""
+
+    SID, TID = "11111111-aaaa-bbbb-cccc-222222222222", "33333333-dddd-eeee-ffff-444444444444"
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        for name, value in (("_CLAUDE_HOME", self.home / "claude"), ("_CODEX_HOME", self.home / "codex")):
+            p = mock.patch.object(bus, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        bus._transcripts.clear()
+        self.b = make_bus("pro", StaticNet("pro", usermap={"100.1.1.1": "nick@example.com", "100.2.2.2": "alex@example.com"}))
+        reg(self.b, self.SID, "api")
+        reg(self.b, self.TID, "web", harness="codex")
+        self.claude = self.home / "claude/projects/-x-api" / f"{self.SID}.jsonl"
+        self.codex = self.home / "codex/sessions/2026/11/04" / f"rollout-2026-11-04T10-00-00-{self.TID}.jsonl"
+
+    def write(self, path: Path, *recs):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+
+    def models(self, ip="100.1.1.1"):
+        return {a["address"].split("/")[1]: a.get("model") for a in self.b.hello(ip)["agents"]}
+
+    def test_claude_session_start_then_transcript(self):
+        self.assertEqual(self.models(), {"claude": None, "codex": None})  # unknown until a hook says
+        self.b.report_state(hook("SessionStart", sid=self.SID, source="startup", model="claude-opus-5-5"))
+        self.assertEqual(self.models()["claude"], "claude-opus-5-5")
+        self.b.report_state(hook("Stop", sid=self.SID))  # no transcript yet: kept
+        self.assertEqual(self.models()["claude"], "claude-opus-5-5")
+        bus._transcripts.clear()  # a miss waits MODEL_MISS before searching again
+        tool = {"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": [
+            {"type": "tool_use", "input": {"model": "haiku"}}]}}
+        self.write(self.claude, tool,
+                   {"type": "user", "message": {"content": "say \"model\":\"x\""}},
+                   {"type": "assistant", "isSidechain": True, "message": {"model": "claude-haiku-5-5"}},
+                   {"type": "assistant", "message": {"model": "<synthetic>"}})
+        self.b.report_state(hook("PreToolUse", sid=self.SID, tool_name="Bash"))  # mid-turn: not read
+        self.assertEqual(self.models()["claude"], "claude-opus-5-5")
+        self.b.report_state(hook("Stop", sid=self.SID, transcript_path="/etc/passwd"))  # the posted path is ignored
+        self.assertEqual(self.models()["claude"], "claude-sonnet-5-5")  # after /model: the last real reply's
+        self.write(self.claude, {"type": "assistant", "message": {"model": "claude-opus-5-5[1m]"}})
+        self.b.report_state(hook("Stop", sid=self.SID))
+        self.assertEqual(self.models()["claude"], "claude-opus-5-5[1m]")
+        for bad in ("claude opus", "x" * 65, ["claude-opus-5-5"], "", "a\nb"):
+            self.b.report_state(hook("SessionStart", sid="nope-" + self.SID, model=bad))
+            self.assertEqual(bus.clean_model(bad), "", bad)
+        reg(self.b, self.SID, "api")  # registering again keeps it
+        self.assertEqual(self.models()["claude"], "claude-opus-5-5[1m]")
+
+    def test_codex_from_its_rollout(self):
+        self.write(self.codex, {"type": "turn_context", "payload": {"model": "gpt-6.1-terra"}},
+                   {"type": "event_msg", "payload": {"text": "\"turn_context\" model gpt-x"}})
+        self.b.report_state({"type": "agent-turn-complete", "thread-id": self.TID, "model": "forged"})
+        self.assertEqual(self.models()["codex"], "gpt-6.1-terra")
+        self.write(self.codex, {"type": "turn_context", "payload": {"model": "gpt-6.1-astra"}})
+        self.b.report_state({"type": "agent-turn-complete", "thread-id": self.TID})
+        self.assertEqual(self.models()["codex"], "gpt-6.1-astra")
+
+    def test_owner_only_and_peers_cleaned(self):
+        self.b.report_state(hook("SessionStart", sid=self.SID, model="claude-opus-5-5"))
+        for ip in ("100.2.2.2", "100.9.9.9", None):
+            self.assertTrue(all("model" not in a for a in self.b.hello(ip)["agents"]), ip)
+        air = make_bus("air", StaticNet("air", peers={"pro": {"ip": "127.0.0.1", "port": free_port(), "online": True}}))
+        air.store.x("INSERT INTO peers(host, last_ok, agents) VALUES('pro', 1, ?)", json.dumps(
+            [{"address": "pro/claude/a", "model": "claude-opus-5-5"}, {"address": "pro/claude/b", "model": "a b"},
+             {"address": "pro/claude/c", "model": 7}, {"address": "pro/claude/d"}]))
+        got = {a["address"]: a.get("model", "absent") for a in air.directory()["agents"] if a["host"] == "pro"}
+        self.assertEqual(got, {"pro/claude/a": "claude-opus-5-5", "pro/claude/b": "absent", "pro/claude/c": "absent",
+                               "pro/claude/d": "absent"})
+
+    def test_ids_that_are_not_session_ids_read_nothing(self):
+        for aid in ("../../etc", "*", "short", "1111-aaaa-bbbb-cccc-222222222222", "aaaa-bbbb-cccc-222222222222"):
+            self.assertEqual(bus.transcript_model("claude", aid), "")
+        self.assertEqual(bus.transcript_model("cli", self.SID), "")

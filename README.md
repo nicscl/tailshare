@@ -198,6 +198,11 @@ post a hook or start a process with misleading flags, so a missing or false `ski
   `bypassPermissions` counts as skip (`bus.SKIP_MODES`, the same set as start.json's). `auto` does not: Claude
   decides when to ask. The owner also gets the mode itself as `permission_mode` (one of Claude's modes), so
   the app can mark `auto` on its own. Unknown until its first hook.
+- The owner also gets `model`, the id the harness names (`claude-opus-5-5`, `claude-opus-5-5[1m]`, a Codex model),
+  matching `[A-Za-z0-9._:/\[\]-]{1,64}`, or nothing when unknown. Claude's comes from its SessionStart hook,
+  then from its transcript at the end of each turn, so `/model` shows after the next reply. Codex's comes from its
+  rollout's last `turn_context` after each turn. Transcripts are found by session id, never by a posted path. A
+  display hint: Codex takes any `-m` string, and any local process can post a hook.
 - Codex: from its real argv (macOS `kern.procargs2`, Linux `/proc`), read once per process when it registers, and
   only for a process of the account the mailbox runs as whose program is `codex`. A prompt is one argument, so
   what it says is never taken for a flag. `--dangerously-bypass-approvals-and-sandbox` (`--yolo`) or a
