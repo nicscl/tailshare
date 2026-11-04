@@ -271,6 +271,9 @@ class Squads:
         from .suggestions import Suggestions
 
         self.suggestions = Suggestions(self)
+        from .board import Board
+
+        self.board = Board(self)
 
     # -- clock ---------------------------------------------------------------------------
     def tick(self) -> list:
@@ -379,6 +382,7 @@ class Squads:
         revs = sorted(f"{r['id']}:{r['hlc']}:{r['rhost']}:{_digest(r['doc'], r['deleted'])}" for r in self.store.q(
             "SELECT '' AS id, hlc, rhost, doc, deleted FROM squads WHERE owner=? AND id=? UNION ALL "
             "SELECT id, hlc, rhost, doc, deleted FROM squad_members WHERE owner=? AND squad=?", self.owner, sid, self.owner, sid))
+        revs += sorted(self.board.sum_parts(sid))
         return hashlib.sha256("\n".join(revs).encode()).hexdigest()[:16]
 
     def shared_with(self, sid: str, user: str) -> dict | None:
@@ -636,6 +640,8 @@ class Squads:
                 continue
             if self.merge(d.get("squad"), host):
                 bus.log(f"squads: {sid} updated from {host}")
+            if self._header_row(sid) is not None and self.sum(sid) != s and self.board.pull(host, peer, sid):
+                bus.log(f"squads: {sid}'s board updated from {host}")
             self._pulled[(host, sid)] = s + self.sum(sid)
 
     def prune(self) -> None:
@@ -644,6 +650,7 @@ class Squads:
         self.store.x("DELETE FROM squads WHERE deleted=1 AND at<? AND NOT EXISTS (SELECT 1 FROM squad_members m "
                      "WHERE m.owner=squads.owner AND m.squad=squads.id)", cutoff)
         self.suggestions.prune()
+        self.board.prune()
 
     # -- HTTP ----------------------------------------------------------------------------
     def route(self, method: str, path: str, body: dict, local: bool, ip: str, qs: dict, token: str = "",
@@ -656,6 +663,14 @@ class Squads:
                 self.bus.net.refresh()
             user = self.bus.net.user_for_ip(ip) or ""
             own = bool(user) and user != "tagged-devices" and user == self.bus.net.user
+        if len(parts) >= 3 and parts[2] == "board":
+            def sign() -> dict:
+                if not any(signed[1].values()) and self._machine(ip):
+                    raise bus.BusError("board edits from a machine go through its own local API: `tailshare board`", 403)
+                if self.bus.keys is None:
+                    raise bus.BusError("signature", 403, {"reason": "unknown_key", "detail": "SSH keys are off on this machine"})
+                return self.bus.keys.check_signed(method, "/bus/v1" + path, signed[0], signed[1], self.owner, ip)
+            return self.board.route(method, parts, body, local, own, sign)
         sugg = len(parts) in (3, 4, 5) and parts[2] == "suggestions"
         if sugg and not own:  # suggestions are the owner's: a sharee sees the squad, not what agents proposed
             raise bus.BusError("only the squad's owner sees its suggestions", 403)
