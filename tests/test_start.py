@@ -83,7 +83,7 @@ class Base(unittest.TestCase):
         return {"kind": "claude", "cwd": str(self.root / "app"), "name": "AppDev", **kw}
 
     def call(self, doc, grant="safe", key=KEY):
-        return start.handle(doc, grant, key, "air", owner="nick")
+        return start.handle(doc, grant, key, "air", owner="nick@example.com")
 
     def dry(self, *items, grant="safe", key=KEY):
         return self.call({"v": 1, "dry_run": True, "starts": list(items)}, grant, key)["results"]
@@ -275,7 +275,7 @@ class Plans(Base):
                            "codex": {"bin": str(self.bin / "codex"), "options": ["model"]}})
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
             self.assertEqual(start.capabilities()["models"]["claude"], ["fable", *start.CLAUDE_ALIASES])  # no owner
-            models = start.capabilities(owner="nick")["models"]
+            models = start.capabilities(owner="nick@example.com")["models"]
             self.assertEqual(models, {"claude": ["fable", *start.CLAUDE_ALIASES, "claude-opus-5-5[1m]", "claude-opus-5-5"],
                                       "codex": ["gpt-6-sol", "gpt-6.1-terra"]})
             p = self.dry(self.item(options={"model": "claude-opus-5-5[1m]"}))[0]["plan"]

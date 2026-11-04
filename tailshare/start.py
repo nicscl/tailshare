@@ -202,15 +202,15 @@ def seen_models(kind: str, owner: str) -> list[str]:
     """Models the owner's sessions of a kind on this host ran in the last SEEN_DAYS days, newest first, from the
     bus's agents table (the ids their transcripts name, see bus.transcript_model). Not other people's sessions
     (someone ssh'd in): what they ran is theirs."""
-    path = bus.STATE_DIR / "bus.db"
-    if not owner or not path.exists():
+    path = bus.STATE_DIR / "bus.db"  # agents.user is the login's short handle (bus.handle), as /hello names it
+    if not bus.handle(owner) or not path.exists():
         return []
     try:
         db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
         try:
             rows = db.execute("SELECT model, MAX(last_seen) AS t FROM agents WHERE harness=? AND user=? AND model!=''"
                               " AND last_seen>? GROUP BY model ORDER BY t DESC LIMIT ?",
-                              (kind, owner, time.time() - SEEN_DAYS * 86400, MODELS_MAX)).fetchall()
+                              (kind, bus.handle(owner), time.time() - SEEN_DAYS * 86400, MODELS_MAX)).fetchall()
         finally:
             db.close()
     except sqlite3.Error:
