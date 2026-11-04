@@ -251,7 +251,8 @@ Only a live agent (seen within 90 s, not ended) whose pane is on this user's own
 true`, `bypassPermissions` only with `skip_permissions: true`; and, for each kind whose options include `model`,
 `models: {"<kind>": [...]}`, the only values a start takes, at most 30: start.json's `models` first, then Claude's
 aliases (`opus`, `sonnet`, `haiku`, `opus[1m]`, `sonnet[1m]`) or the models Codex's own picker lists
-(`~/.codex/models_cache.json`), then the full ids that sessions of that kind on this host ran in the last 30 days,
-newest first, as `/hello`'s `agents[].model` names them) only to devices
+(`~/.codex/models_cache.json`), then the full ids that the owner's sessions of that kind on this host ran in the last
+30 days, newest first, as `/hello`'s `agents[].model` names them; not those of someone ssh'd in, and none on a
+tagged machine) only to devices
 of the machine's own tailnet user, and only when starting is on. `GET /bus/v1/sessions/start/folders` lists the
 folders under the roots (two levels deep, at most 200, no hidden folders or symlinks) to the same devices only.

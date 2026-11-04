@@ -83,7 +83,7 @@ class Base(unittest.TestCase):
         return {"kind": "claude", "cwd": str(self.root / "app"), "name": "AppDev", **kw}
 
     def call(self, doc, grant="safe", key=KEY):
-        return start.handle(doc, grant, key, "air")
+        return start.handle(doc, grant, key, "air", owner="nick")
 
     def dry(self, *items, grant="safe", key=KEY):
         return self.call({"v": 1, "dry_run": True, "starts": list(items)}, grant, key)["results"]
@@ -259,12 +259,14 @@ class Plans(Base):
         import sqlite3
 
         db = sqlite3.connect(self.state / "bus.db")
-        db.execute("CREATE TABLE agents(id TEXT, harness TEXT, model TEXT NOT NULL DEFAULT '', last_seen REAL)")
+        db.execute("CREATE TABLE agents(id TEXT, harness TEXT, model TEXT NOT NULL DEFAULT '', last_seen REAL,"
+                   " user TEXT NOT NULL DEFAULT 'nick')")
         now = time.time()
-        db.executemany("INSERT INTO agents VALUES(?,?,?,?)", [
+        db.executemany("INSERT INTO agents(id, harness, model, last_seen) VALUES(?,?,?,?)", [
             ("a", "claude", "claude-opus-5-5", now - 60), ("b", "claude", "claude-opus-5-5[1m]", now),
             ("c", "claude", "claude-opus-5-5", now - 120), ("d", "claude", "claude-old-1", now - 40 * 86400),
             ("e", "codex", "gpt-6.1-terra", now), ("f", "claude", "", now), ("g", "claude", "-bad", now)])
+        db.execute("INSERT INTO agents VALUES('h', 'claude', 'claude-guest-9', ?, 'guest')", (now,))  # ssh'd-in guest
         db.commit()
         db.close()
         home = Path(tempfile.mkdtemp())
@@ -272,7 +274,8 @@ class Plans(Base):
         self.config(kinds={"claude": {"bin": str(self.bin / "claude"), "options": ["model"], "models": ["fable", "-x", 7]},
                            "codex": {"bin": str(self.bin / "codex"), "options": ["model"]}})
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
-            models = start.capabilities()["models"]
+            self.assertEqual(start.capabilities()["models"]["claude"], ["fable", *start.CLAUDE_ALIASES])  # no owner
+            models = start.capabilities(owner="nick")["models"]
             self.assertEqual(models, {"claude": ["fable", *start.CLAUDE_ALIASES, "claude-opus-5-5[1m]", "claude-opus-5-5"],
                                       "codex": ["gpt-6-sol", "gpt-6.1-terra"]})
             p = self.dry(self.item(options={"model": "claude-opus-5-5[1m]"}))[0]["plan"]
@@ -280,6 +283,7 @@ class Plans(Base):
             self.assertIn("--model=gpt-6.1-terra", self.dry(self.item(kind="codex", options={"model": "gpt-6.1-terra"}))[0]["plan"]["argv"])
             self.assertEqual(self.refused(self.item(options={"model": "claude-old-1"})),
                              ("not_allowed", "options.model"))  # not offered: not taken
+            self.assertEqual(self.refused(self.item(options={"model": "claude-guest-9"})), ("not_allowed", "options.model"))
             for junk in (5, True, "model", ["model"]):  # not a dict: a per-item bad_request, never a crashed batch
                 self.assertEqual(self.refused(self.item(options=junk)), ("bad_request", "options"), junk)
             for bad in ("-x", "a b", "x" * 65, "[", 7):
@@ -788,6 +792,10 @@ class HostName(unittest.TestCase):
     def test_from_the_local_machines_route(self):
         bus.BUS_PORT = fake_bus(self, "macbook-air", [{"host": "pro", "self": False}, {"host": "macbook-air", "self": True}])
         self.assertEqual(start.host_name(), "macbook-air")
+        bus.BUS_PORT = fake_bus(self, "", [{"host": "macbook-air", "self": True, "owner": "nick"}])
+        self.assertEqual(start.machine(), ("macbook-air", "nick"))
+        bus.BUS_PORT = fake_bus(self, "", [{"host": "macbook-air", "self": True, "owner": 5}])
+        self.assertEqual(start.machine(), ("macbook-air", ""))  # tagged or junk: no owner, so no seen models
 
     def test_no_guess_without_the_bus(self):
         for machines in ([], [{"host": "bad name!", "self": True}], [{"host": "x", "self": 1}]):
