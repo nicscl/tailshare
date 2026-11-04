@@ -188,6 +188,7 @@ MODEL_MISS = 60.0  # how long a session with no transcript found waits before th
 _CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
 _CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 _transcripts: dict[tuple[str, str], Path | float] = {}  # its path, or when a search last found none
+_no_model: dict[tuple[str, str], float] = {}  # when a transcript that was found last had no model in it yet
 
 
 def clean_model(v: object) -> str:
@@ -219,7 +220,10 @@ def transcript_model(harness: str, aid: str, fresh: bool = False) -> str:
     rollout's last turn_context."""
     if harness not in ("claude", "codex") or not _SESSION_ID_RE.fullmatch(aid.lower()):
         return ""
-    path = _transcripts.get((harness, aid))
+    key = (harness, aid)
+    if not fresh and time.time() - _no_model.get(key, 0) < MODEL_MISS:  # found, but no reply yet: wait too
+        return ""
+    path = _transcripts.get(key)
     if isinstance(path, float):
         if not fresh and time.time() - path < MODEL_MISS:  # a turn's end searches anyway: it has just written one
             return ""
@@ -245,6 +249,9 @@ def transcript_model(harness: str, aid: str, fresh: bool = False) -> str:
             p = rec.get("payload")
             if rec.get("type") == "turn_context" and isinstance(p, dict) and clean_model(p.get("model")):
                 return p["model"]
+    if len(_no_model) > 4096:
+        _no_model.clear()
+    _no_model[key] = time.time()
     return ""
 
 

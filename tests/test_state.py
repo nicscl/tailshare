@@ -554,6 +554,7 @@ class Model(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         bus._transcripts.clear()
+        bus._no_model.clear()
         self.b = make_bus("pro", StaticNet("pro", usermap={"100.1.1.1": "nick@example.com", "100.2.2.2": "alex@example.com"}))
         reg(self.b, self.SID, "api")
         reg(self.b, self.TID, "web", harness="codex")
@@ -633,3 +634,12 @@ class Model(unittest.TestCase):
         self.b.store.x("UPDATE agents SET model='' WHERE id=?", self.TID)
         with mock.patch.object(bus, "transcript_model", side_effect=AssertionError("offline")):
             self.assertIsNone(self.models().get("codex"))  # an offline agent is not looked up
+
+    def test_a_transcript_without_a_reply_yet_is_not_reread_every_hello(self):
+        self.write(self.claude, {"type": "user", "message": {"content": "hi"}})
+        self.assertIsNone(self.models()["claude"])
+        with mock.patch.object(bus, "_tail_records", side_effect=AssertionError("read again")):
+            self.assertIsNone(self.models()["claude"])  # waits MODEL_MISS
+        self.write(self.claude, {"type": "assistant", "message": {"model": "claude-opus-5-5"}})
+        self.b.report_state(hook("Stop", sid=self.SID))  # a turn's end reads anyway
+        self.assertEqual(self.models()["claude"], "claude-opus-5-5")
