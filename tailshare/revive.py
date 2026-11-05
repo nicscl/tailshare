@@ -53,18 +53,35 @@ def _states(ids: list[str], db=None) -> dict[str, dict]:
     return out
 
 
-def _item(con: sqlite3.Connection, r: dict) -> tuple[dict, str]:
-    """The start that resumes dead row `r`, with the options it was started with here (start.db `launched`), and
-    the grant it was approved with; only resume and the safe grant for one started before that was recorded."""
-    row = con.execute("SELECT options, grant_ FROM launched WHERE session=?", (r["id"],)).fetchone()
+def _key_grant(b, key: str) -> str | None:
+    """What start key `key` may do here now: "skip", "safe", or None once it was removed or is no start key."""
+    try:
+        if b.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key):
+            return None
+        k = b.store.one("SELECT mode FROM ssh_keys WHERE id=?", key)
+    except sqlite3.Error:  # no keys tables: no key was ever installed here
+        return None
+    return {"start-skip": "skip", "start": "safe"}.get(k["mode"]) if k else None
+
+
+def _item(b, con: sqlite3.Connection, r: dict) -> tuple[dict, str | None, str]:
+    """The start that resumes dead row `r`, with the options it was started with here (start.db `launched`); the
+    grant to build it with, never more than the start key that approved it may do now (None: that key is gone);
+    and that key. One started before launches were recorded: only resume, and the safe grant."""
+    row = con.execute("SELECT options, grant_, key FROM launched WHERE session=?", (r["id"],)).fetchone()
     opts = json.loads(row["options"]) if row else {}
     opts = {k: v for k, v in opts.items() if k != "resume"} if isinstance(opts, dict) else {}
-    grant = row["grant_"] if row and row["grant_"] in ("safe", "skip") else "safe"
-    return {"kind": r["kind"], "cwd": r["cwd"], "name": r["name"], "options": {**opts, "resume": r["id"]},
-            "device_name": "revive"}, grant
+    item = {"kind": r["kind"], "cwd": r["cwd"], "name": r["name"], "options": {**opts, "resume": r["id"]},
+            "device_name": "revive"}
+    if not row or not row["key"]:
+        return item, "safe", ""
+    now = _key_grant(b, row["key"])
+    if now is None:
+        return item, None, row["key"]
+    return item, ("skip" if row["grant_"] == "skip" and now == "skip" else "safe"), row["key"]
 
 
-def _flag(b, con: sqlite3.Connection, key: str, r: dict | None, why: str, now: float) -> None:
+def _flag(b, con: sqlite3.Connection, key: str, r: dict | None, why: str, now: float, title: str = "") -> None:
     """Tell the owner, once an hour per `key`: a blocker in the member's report, or only the log for a single
     session (it has no board)."""
     last = con.execute("SELECT at FROM revive_flags WHERE key=?", (key,)).fetchone()
@@ -74,11 +91,12 @@ def _flag(b, con: sqlite3.Connection, key: str, r: dict | None, why: str, now: f
     bus.log(f"revive stopped {key}: {why}")
     if not r or not r.get("squad") or b.reports is None:
         return
-    title = f"{r['name']} keeps crashing: not reopened again"
+    title = title or f"{r['name']} keeps crashing: not reopened again"
     try:
-        b.reports.flag(r["squad"]["id"], r["squad"]["member"],
-                       {"id": FLAG_ID, "kind": "question", "to": "owner", "title": title[:120],
-                        "why": f"{why}. Reopen it from the app once you have looked."})
+        if not b.reports.flag(r["squad"]["id"], r["squad"]["member"],
+                                 {"id": FLAG_ID, "kind": "question", "to": "owner", "title": title[:80],
+                                  "why": f"{why}. Reopen it from the app once you have looked."}):
+            bus.log(f"revive: {key} not flagged: {r['name']} has too many open blockers")
     except Exception as e:  # noqa: BLE001
         bus.log(f"revive: cannot flag {key}: {e!r}")
 
@@ -111,6 +129,12 @@ def tick(b, now: float | None = None) -> list[dict]:
             past = con.execute("SELECT at, weight FROM revives WHERE session=? AND at>? ORDER BY at", (sid, cut)).fetchall()
             if past and past[-1]["at"] + BACKOFF[min(len(past), len(BACKOFF)) - 1] > now:
                 continue
+            item, grant, key = _item(b, con, r)
+            if grant is None:
+                _flag(b, con, sid, r, f"the start key that opened it ({key}) was removed from this host", now,
+                      f"{r['name']} crashed: not reopened, its start key is gone")
+                out.append({"id": sid, "stopped": "key"})
+                continue
             # dying soon after the last revive (or never coming up: last_seen before it) counts twice
             weight = 2 if past and st["last_seen"] - past[-1]["at"] < QUICK else 1
             used = sum(p["weight"] for p in past)
@@ -123,13 +147,13 @@ def tick(b, now: float | None = None) -> list[dict]:
             host = con.execute("SELECT COUNT(*) FROM revives WHERE host_event=1 AND at>?", (cut,)).fetchone()[0]
             if event and host >= cfg["revive_per_host"]:
                 _flag(b, con, "host", r, f"{host} reopens on this host in the last hour "
-                                         f"(revive_per_host {cfg['revive_per_host']})", now)
+                                         f"(revive_per_host {cfg['revive_per_host']})", now,
+                      f"Sessions on {b.net.host} keep crashing: reopening paused ({r['name']} waits)")
                 out.append({"id": sid, "stopped": "host"})
                 continue
             servers.add(st["socket"])
             con.execute("INSERT INTO revives(session, socket, at, weight, host_event) VALUES(?,?,?,?,?)",
                         (sid, st["socket"], now, weight, int(event)))
-            item, grant = _item(con, r)
             try:
                 plan = start.build(item, cfg, grant, b.net.host)
                 res = start.launch(plan, cfg["max_running"])
@@ -141,7 +165,7 @@ def tick(b, now: float | None = None) -> list[dict]:
                 bus.log(f"revive {sid[:8]} {r['name']}: {e!r}")
                 out.append({"id": sid, "refused": {"error": "failed"}})
                 continue
-            start.record_launch(con, plan, res)
+            start.record_launch(con, plan, res, key)
             bus.log(f"revive {sid[:8]} {r['name']}: reopened in {res['tmux']['pane']} "
                     f"(#{len(past) + 1} this hour, weight {weight})")
             out.append({"id": sid, "revived": res})

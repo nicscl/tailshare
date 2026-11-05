@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest import mock
 
-from tailshare import revive, start
+from tailshare import keys, revive, start
 from tests.test_dead import S1, S2, Base
 
 
@@ -83,11 +83,62 @@ class Revive(Base):
         self.agent(S1, ago=120)
         con = start._db()
         start.record_launch(con, {"session": S1, "options": {"effort": "high", "permission_mode": "plan"},
-                                  "skip": False}, {"session": S1})
+                                  "skip": False}, {"session": S1}, "")
         con.close()
         self.tick()
         self.assertEqual(self.launch.call_args.args[0]["options"],
                          {"effort": "high", "permission_mode": "plan", "resume": S1})
+
+    def skip_launch(self, key):
+        self.config(skip_permissions=True, kinds={"claude": {"bin": "/bin/echo", "options": ["resume", "skip_permissions"]}})
+        self.agent(S1, ago=120)
+        self.m.bus.store.db.executescript(keys.SCHEMA)
+        con = start._db()
+        start.record_launch(con, {"session": S1, "options": {"skip_permissions": True}, "skip": True},
+                            {"session": S1}, key)
+        con.close()
+
+    def key(self, kid, mode):
+        self.m.bus.store.x("INSERT INTO ssh_keys(id, pubkey, fingerprint, device, node, user, mode, approved_by, installed)"
+                           " VALUES(?,?,?,?,?,?,?,?,?)", kid, "ssh-ed25519 AAAA", "SHA256:x", "BMO", "n", "nick", mode, "me", 0)
+
+    def test_skip_only_while_its_start_key_still_may(self):
+        self.skip_launch("k1ae2c3b481a8")
+        self.key("k1ae2c3b481a8", "start-skip")
+        (r,) = self.tick()
+        self.assertIn("revived", r)
+        self.assertEqual(self.launch.call_args.args[0]["options"], {"skip_permissions": True, "resume": S1})
+        con = start._db()
+        self.assertEqual(con.execute("SELECT key FROM launched WHERE session=?", (S1,)).fetchone()[0], "k1ae2c3b481a8")
+
+    def test_a_narrowed_key_reopens_without_skip(self):
+        self.skip_launch("k1ae2c3b481a8")
+        self.key("k1ae2c3b481a8", "start")  # approved again as a safe start key
+        (r,) = self.tick()
+        self.assertEqual(r["refused"]["error"], "no_skip_grant")
+        self.launch.assert_not_called()
+
+    def test_a_removed_key_is_never_reopened_and_the_owner_hears(self):
+        self.skip_launch("k1ae2c3b481a8")
+        self.key("k1ae2c3b481a8", "start-skip")
+        self.m.bus.store.x("DELETE FROM ssh_keys")
+        self.m.bus.store.x("INSERT INTO revoked_keys(id, at) VALUES(?,?)", "k1ae2c3b481a8", 0)
+        with mock.patch("tailshare.bus.log") as log:
+            self.assertEqual(self.tick(), [{"id": S1, "stopped": "key"}])
+        self.launch.assert_not_called()
+        self.assertIn("k1ae2c3b481a8", log.call_args_list[0].args[0])
+        self.assertEqual(self.tick(700), [{"id": S1, "stopped": "key"}])  # still not
+
+    def test_one_started_before_launches_were_recorded_reopens_safe(self):
+        self.config(kinds={"claude": {"bin": "/bin/echo", "options": ["resume", "skip_permissions"]}})
+        self.agent(S1, ago=120)
+        con = start._db()
+        self.assertIsNone(con.execute("SELECT 1 FROM launched").fetchone())
+        con.close()
+        item, grant, key = revive._item(self.m.bus, start._db(), {"id": S1, "kind": "claude", "cwd": self.app,
+                                                                  "name": "AppDev"})
+        self.assertEqual((item["options"], grant, key), ({"resume": S1}, "safe", ""))
+        self.assertIn("revived", self.tick()[0])
 
     def test_a_refusal_is_counted_and_logged(self):
         self.config()

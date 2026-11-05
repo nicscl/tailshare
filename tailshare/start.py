@@ -872,7 +872,7 @@ CREATE TABLE IF NOT EXISTS confirms(key TEXT NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS member_starts(squad TEXT NOT NULL, member TEXT NOT NULL, instructions_sha256 TEXT NOT NULL,
   at REAL NOT NULL, PRIMARY KEY(squad, member));
 CREATE TABLE IF NOT EXISTS launched(session TEXT PRIMARY KEY, options TEXT NOT NULL, grant_ TEXT NOT NULL,
-  at REAL NOT NULL);
+  at REAL NOT NULL, key TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS revives(session TEXT NOT NULL, socket TEXT NOT NULL, at REAL NOT NULL,
   weight INTEGER NOT NULL, host_event INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS revive_flags(key TEXT PRIMARY KEY, at REAL NOT NULL);
@@ -902,14 +902,15 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
     return con
 
 
-def record_launch(con: sqlite3.Connection, plan: dict, result: dict) -> None:
-    """What a session was started with, so the revive watchdog reopens it the same way (revive.py)."""
+def record_launch(con: sqlite3.Connection, plan: dict, result: dict, key: str) -> None:
+    """What a session was started with, and by which start key, so the revive watchdog reopens it the same way
+    and never with more than that key may do now (revive.py)."""
     sid = str(result.get("session") or plan.get("session") or "").lower()
     if not sid:
         return  # a new Codex thread: its id is not known here
-    con.execute("INSERT OR REPLACE INTO launched(session, options, grant_, at) VALUES(?,?,?,?)",
+    con.execute("INSERT OR REPLACE INTO launched(session, options, grant_, at, key) VALUES(?,?,?,?,?)",
                 (sid, json.dumps(plan["options"], sort_keys=True), "skip" if plan["skip"] else "safe",
-                 time.time()))
+                 time.time(), key))
 
 
 def squad_session(name: str) -> str:
@@ -1036,7 +1037,7 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
         raise
     con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(result), pid))
     if not result.get("error"):
-        record_launch(con, plan, result)
+        record_launch(con, plan, result, key)
     if plan.get("squad"):
         con.execute("INSERT OR REPLACE INTO member_starts(squad, member, instructions_sha256, at) VALUES(?,?,?,?)",
                     (plan["squad"]["id"], plan["squad"]["member"], plan["instructions_sha256"], time.time()))

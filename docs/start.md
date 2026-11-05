@@ -284,9 +284,16 @@ once are just several items (at most 32).
 The bus looks every 30 s for a session it would list as dead (above) that is resumable now, whose agent was last seen
 within 15 minutes, and that did not end: no `SessionEnd`, no Close. That is a crash: tmux died, or its pane or
 server was killed. It reopens it as a device's Reopen would: a start that resumes it, in its own folder under its
-own name, re-checked against start.json now. It uses the options and permission grant the session was started with
-here (start.db `launched`; a session started before that was recorded gets only `resume`, without skipping).
-A squad member reopens as that member. Only Claude sessions reopen, as above.
+own name, re-checked against start.json now. It uses the options the session was started with here (start.db
+`launched`), and never more than the start key that approved that start may do now: it skips permissions only if it
+was started skipping and that key is still installed here as a skip key. A key approved again without skip makes the
+reopen refused (`no_skip_grant`); a key that was removed means no reopen at all, and the owner is told as past a
+cap (below). A session started before launches were recorded gets only `resume`, without skipping. A squad member
+reopens as that member. Only Claude sessions reopen, as above.
+
+A crash is anything that takes the pane away without the session ending: a tmux crash, a killed server, and also
+a `tmux kill-pane` or `kill-server` by hand. To stop one for good, end it (`/exit`, or Close from a device), or turn
+`revive` off.
 
 It is bounded so that a crash loop ends up with the owner:
 
@@ -296,7 +303,8 @@ It is bounded so that a crash loop ends up with the owner:
   as one;
 - past a cap, it stops reopening and tells the owner once an hour: a squad member gets a `to: owner` question
   blocker with id `revive` in its report, which shows in the board's Needs you; a single session gets a log line.
-  A Reopen from a device still works.
+  The blocker never pushes out the member's own open blockers: it replaces older resolved ones, and with 8 open
+  already it is only logged. A Reopen from a device still works.
 
 Every reopen, refusal and stop is a `revive …` line in tailshare.log. A refusal (`limit`, a folder now outside the
 roots) counts as a try, so it backs off too.
