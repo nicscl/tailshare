@@ -248,8 +248,9 @@ option also says `kind` (and `option`).
 
 `GET /bus/v1/sessions/dead` (devices of the machine's own tailnet user only, header `X-Tailshare: 1`) lists the agent
 sessions this machine ran in the last 7 days whose tmux pane is gone (or taken by a newer agent), newest first, a page
-at a time: `?limit=<n>` (1 to 200, default 50) and `?before=<last_seen>`, the `last_seen` of the last session of the
-previous page. `more` is true when older ones are left. Any of them can be reopened, on any page.
+at a time: `?limit=<n>` (1 to 200, default 50) and `?before=<last_seen>&before_id=<id>`, the `last_seen` and `id`
+of the last session of the previous page (ties on `last_seen` are ordered by `id`, descending; without `before_id`,
+all sessions at that `last_seen` count as already seen). `more` is true when older ones are left. Any of them can be reopened, on any page.
 
 ```json
 {"host": "macbook-air", "max_age": 604800, "limit": 50, "more": false, "sessions": [

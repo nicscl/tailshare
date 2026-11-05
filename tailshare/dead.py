@@ -56,10 +56,10 @@ def _pane_gone(t: dict, cache: dict) -> bool:
     return cache[k]
 
 
-def rows(db: Path | None = None, now: float | None = None, before: float | None = None,
+def rows(db: Path | None = None, now: float | None = None, before: tuple[float, str] | None = None,
          limit: int | None = LIMIT) -> list[dict]:
-    """The dead sessions, newest first, last seen before `before` (a page's last `last_seen`), at most `limit` (None:
-    all), with nothing about whether this host may reopen them."""
+    """The dead sessions, newest first (ties by id, descending), after `before` (a page's last (last_seen, id)) in
+    that order, at most `limit` (None: all), with nothing about whether this host may reopen them."""
     db = db or bus.STATE_DIR / "bus.db"
     now = time.time() if now is None else now
     try:
@@ -76,11 +76,12 @@ def rows(db: Path | None = None, now: float | None = None, before: float | None 
     live = [a for a in agents if is_live(a, now)]
     held = {(t["socket"], t["pane"]): a["last_seen"] for a in live if (t := bus.clean_tmux(_json(a["tmux"])))}
     out, cache = [], {}
+    agents.sort(key=lambda a: (round(float(a["last_seen"]), 3), (a["id"] or "").lower()), reverse=True)
     for a in agents:
         sid, t = session_id(a["harness"] or "", a["id"]), bus.clean_tmux(_json(a["tmux"]))
         if not sid or not t or is_live(a, now) or _managed_elsewhere(t):
             continue
-        if before is not None and round(float(a["last_seen"]), 3) >= before:
+        if before is not None and (round(float(a["last_seen"]), 3), sid) >= before:
             continue
         # gone, or a newer live agent sits in that pane now (pane ids start again at %0 on a new server)
         if not (_pane_gone(t, cache) or held.get((t["socket"], t["pane"]), 0) > a["last_seen"]):
@@ -111,16 +112,21 @@ def resumable(r: dict, cfg: dict | None) -> str:
     return ""
 
 
-def page(qs: dict) -> tuple[float | None, int]:
-    """`?before=<last_seen>&limit=<n>` of GET /sessions/dead."""
+def page(qs: dict) -> tuple[tuple[float, str] | None, int]:
+    """`?before=<last_seen>[&before_id=<id>]&limit=<n>` of GET /sessions/dead: the last row of the previous page.
+    Without before_id, every session seen at that same last_seen counts as on the previous page."""
+    import math
+
     try:
-        before = float(qs["before"]) if "before" in qs else None
+        ts = float(qs["before"]) if "before" in qs else None
         limit = int(qs.get("limit", LIMIT))
     except ValueError:
         raise bus.BusError("before is a last_seen, limit a number", 400) from None
-    if (before is not None and not before > 0) or not 1 <= limit <= LIMIT_MAX:
-        raise bus.BusError(f"before is a last_seen, limit 1 to {LIMIT_MAX}", 400)
-    return before, limit
+    bid = qs.get("before_id", "\uffff").lower()
+    if (ts is not None and not (math.isfinite(ts) and ts > 0)) or not 1 <= limit <= LIMIT_MAX \
+            or ("before_id" in qs and (ts is None or not _UUID.fullmatch(bid))):
+        raise bus.BusError(f"before is a last_seen, before_id its session id, limit 1 to {LIMIT_MAX}", 400)
+    return (None if ts is None else (round(ts, 3), bid)), limit
 
 
 def listing(host: str, db: Path | None = None, qs: dict | None = None) -> dict:

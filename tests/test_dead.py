@@ -97,19 +97,31 @@ class Listing(Base):
             self.agent(f"0b0e0f2a-1c2d-4e5f-8a9b-{i:012d}", ago=600 + i)
         seen, before = [], None
         while True:
-            d = dead.listing("air", qs={"limit": "3", **({"before": str(before)} if before else {})})
+            d = dead.listing("air", qs={"limit": "3", **({"before": str(before["last_seen"]),
+                                                           "before_id": before["id"]} if before else {})})
             seen += [r["id"] for r in d["sessions"]]
             if not d["more"]:
                 break
-            before = d["sessions"][-1]["last_seen"]
+            before = d["sessions"][-1]
         self.assertEqual(seen, [f"0b0e0f2a-1c2d-4e5f-8a9b-{i:012d}" for i in range(7)])
         self.assertEqual(dead.listing("air")["more"], False)
         self.assertEqual(dead.find("0b0e0f2a-1c2d-4e5f-8a9b-000000000006")[0]["id"],
                          "0b0e0f2a-1c2d-4e5f-8a9b-000000000006")
-        for bad in ({"limit": "0"}, {"limit": "201"}, {"limit": "x"}, {"before": "-1"}, {"before": "nan"}):
+        for bad in ({"limit": "0"}, {"limit": "201"}, {"limit": "x"}, {"before": "-1"}, {"before": "nan"},
+                    {"before": "inf"}, {"before_id": S1}, {"before": "1", "before_id": "x"}):
             with self.subTest(bad), self.assertRaises(bus.BusError) as c:
                 dead.listing("air", qs=bad)
             self.assertEqual(c.exception.code, 400)
+
+    def test_pages_split_a_tie(self):
+        with mock.patch("time.time", return_value=1_800_000_000.0):
+            for sid in (S1, S2, S3):
+                self.agent(sid, ago=600)
+            first = dead.listing("air", qs={"limit": "2"})["sessions"]
+            last = first[-1]
+            rest = dead.listing("air", qs={"limit": "2", "before": str(last["last_seen"]), "before_id": last["id"]})
+        self.assertEqual([r["id"] for r in first] + [r["id"] for r in rest["sessions"]], [S3, S2, S1])
+        self.assertFalse(rest["more"])
 
     def test_reasons(self):
         self.agent(S1, harness="codex")
