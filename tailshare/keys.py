@@ -115,10 +115,12 @@ def gate_log(msg: str) -> None:
             if os.fstat(fd).st_size > GATE_LOG_MAX and os.path.samestat(os.fstat(fd), os.stat(path)):
                 os.replace(path, path.with_name(path.name + ".1"))
                 os.close(fd)
+                fd = -1  # never closed twice: another thread may hold that number by now
                 fd = opened()
             os.write(fd, line.encode("utf-8", "replace"))
         finally:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
     except OSError:
         pass  # never stop an attach over the log
 
