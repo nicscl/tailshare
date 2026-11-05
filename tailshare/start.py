@@ -12,7 +12,8 @@ Nothing runs on a dry run. A plan is kept for PLAN_TTL, belongs to the key that 
 once: it is rebuilt at confirm and runs only if it is still exactly what the device showed.
 
 Starting is off unless ~/.tailshare/start.json exists (owned by this user, not writable by others). tailshare
-never writes that file and never starts sessions as root. See docs/start.md.
+writes it only when the owner asks: a device's start key (Face ID) or `tailshare start` in a person's terminal,
+and never to allow skipping. It never starts sessions as root. See docs/start.md.
 """
 
 from __future__ import annotations
@@ -125,24 +126,36 @@ def autos(kind: str, opts: dict) -> bool:
 # --------------------------------------------------------------------------- the host's config
 
 
-def load_config(path: Path | None = None) -> dict | None:
-    """The host's start.json, checked; None when starting is off here. Raises Refused for a file to fix."""
-    path = path or config_path()
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        return None
+_BY_HAND = {"action": "terminal"}  # only a person at the machine can fix it
+
+
+def _read_raw(path: Path) -> dict | None:
+    """start.json as written, checked to be this user's own plain file; None when there is none."""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         return None
     except OSError as e:
-        raise Refused("off", reason=f"cannot read start.json ({e.strerror})") from None
+        raise Refused("off", reason=f"cannot read start.json ({e.strerror})", fix=_BY_HAND) from None
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
-        raise Refused("off", reason="start.json must be a plain file of this user, not writable by group or others")
+        raise Refused("off", reason="start.json must be a plain file of this user, not writable by group or others",
+                      fix=_BY_HAND)
     try:
         d = json.loads(path.read_text())
     except (OSError, ValueError, UnicodeDecodeError):
-        raise Refused("off", reason="start.json is not valid JSON") from None
-    if not isinstance(d, dict) or d.get("enabled") is not True:
+        raise Refused("off", reason="start.json is not valid JSON", fix=_BY_HAND) from None
+    if not isinstance(d, dict):
+        raise Refused("off", reason="start.json must hold a JSON object", fix=_BY_HAND)
+    return d
+
+
+def load_config(path: Path | None = None) -> dict | None:
+    """The host's start.json, checked; None when starting is off here. Raises Refused for a file to fix."""
+    path = path or config_path()
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return None
+    d = _read_raw(path)
+    if d is None or d.get("enabled") is not True:
         return None
     roots = []
     for r in d.get("roots") or []:
@@ -162,6 +175,158 @@ def load_config(path: Path | None = None) -> dict | None:
     return {"roots": roots, "kinds": kinds, "skip_permissions": d.get("skip_permissions") is True,
             "auto": d.get("auto") is True,
             "max_running": mr if isinstance(mr, int) and not isinstance(mr, bool) and 0 < mr <= 100 else 12}
+
+
+# --------------------------------------------------------------------------- changing it from a device
+#
+# The owner's device may turn starting on and widen it a step at a time, with the start key (Face ID on each use,
+# never the plan key): `{"v":1,"enable":{}}`, `{"v":1,"add_root":{"folder":…}}`, `{"v":1,"allow":{"kind":…}}` or
+# `{"v":1,"allow":{"kind":…,"option":…}}`. Never skip_permissions, auto, bin, models or max_running: those stay a
+# person's at the machine (docs/start.md, "Turning it on").
+
+CONFIG_OPS = ("enable", "add_root", "allow")
+DEFAULT_OPTIONS = {  # every option but skip_permissions; permission modes stay inside the host's skip and auto
+    "claude": ["permission_mode", "model", "effort", "resume", "add_dirs"],
+    "codex": ["approval", "sandbox", "model", "effort", "resume", "add_dirs"],
+}
+NEVER_FROM_A_DEVICE = ("skip_permissions",)
+
+
+def defaults() -> dict:
+    """What `enable` writes on a machine with no start.json: ~/Projects as the root if it is a plain folder of
+    this user, both agents with every option but skipping, no skipping and no auto mode."""
+    try:
+        projects = [_squad_folder(os.path.join(_home(), "Projects"), "roots")]
+    except Refused:
+        projects = []
+    return {"enabled": True, "roots": projects, "max_running": 12,
+            "skip_permissions": False, "auto": False,
+            "kinds": {k: {"options": list(v)} for k, v in DEFAULT_OPTIONS.items()}}
+
+
+def change_config(op: str, arg: object, path: Path | None = None) -> None:
+    """One config change from a device's start key. Raises Refused with a fix when it cannot be made."""
+    path = path or config_path()
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise Refused("root", reason="tailshare never starts sessions as root")
+    if not isinstance(arg, dict):
+        raise Refused("bad_request", op)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    import fcntl
+
+    with open(path.parent / "start.json.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        d = _read_raw(path)
+        if op == "enable":
+            if arg:
+                raise Refused("bad_request", "enable", "takes no fields")
+            if d is None:
+                _write(path, defaults(), create=True)
+            elif d.get("enabled") is not True:
+                _write(path, {**d, "enabled": True})
+            return
+        if d is None:
+            raise Refused("off", reason="starting sessions is off on this host", fix={"action": "enable_start"})
+        if op == "add_root":
+            if set(arg) != {"folder"}:
+                raise Refused("bad_request", "add_root")
+            real = _squad_folder(arg["folder"], "add_root.folder")
+            roots = [r for r in d.get("roots") or [] if isinstance(r, str)] if isinstance(d.get("roots"), list) else []
+            have = [os.path.realpath(os.path.expanduser(r)) for r in roots]
+            if not any(real == h or real.startswith(h + os.sep) for h in have):
+                _write(path, {**d, "roots": roots + [real]})
+            return
+        kind, option = arg.get("kind"), arg.get("option")
+        if not set(arg) <= {"kind", "option"} or kind not in KINDS:
+            raise Refused("bad_request", "allow.kind")
+        if option is not None and (option not in KINDS[kind] or option in NEVER_FROM_A_DEVICE):
+            raise Refused("not_allowed" if option in NEVER_FROM_A_DEVICE else "bad_request", "allow.option",
+                          "only a person at this machine allows skipping permissions" if option in NEVER_FROM_A_DEVICE
+                          else "unknown option", **({"fix": _BY_HAND} if option in NEVER_FROM_A_DEVICE else {}))
+        kinds = d.get("kinds") if isinstance(d.get("kinds"), dict) else {}
+        entry = kinds.get(kind) if isinstance(kinds.get(kind), dict) else None
+        if entry is None:
+            entry = {"options": list(DEFAULT_OPTIONS[kind])}
+        elif option is None:
+            return
+        opts = entry.get("options") if isinstance(entry.get("options"), list) else []
+        if option is not None and option not in opts:
+            entry = {**entry, "options": opts + [option]}
+        if kinds.get(kind) != entry:
+            _write(path, {**d, "kinds": {**kinds, kind: entry}})
+
+
+def _write(path: Path, d: dict, create: bool = False) -> None:
+    """start.json, 0600, written whole: a temp file in the same folder, then renamed over it, or linked into place
+    when creating, so a file that appeared meanwhile is never replaced."""
+    tmp = path.with_name(f".start.json.{secrets.token_hex(6)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(d, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if create:
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                raise Refused("changed", reason="start.json appeared meanwhile; try again") from None
+        else:
+            os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def with_fix(out: dict) -> dict:
+    """A refusal with `fix`: what the device may offer as one tap (docs/start.md, "Fixes")."""
+    if "error" not in out or "fix" in out:
+        return out
+    e, f = out["error"], out.get("field", "")
+    if "folder" in out:
+        fix = {"action": "add_root", "folder": out["folder"]}
+    elif e == "off":
+        fix = {"action": {"roots": "add_root", "kinds": "allow_kind"}.get(f, "enable_start")}
+    elif e == "not_allowed" and f == "kind" and "kind" in out:
+        fix = {"action": "allow_kind", "kind": out["kind"]}
+    elif e == "not_allowed" and "option" in out and out["option"] not in NEVER_FROM_A_DEVICE:
+        fix = {"action": "allow_option", "kind": out["kind"], "option": out["option"]}
+    elif e in ("no_skip_grant", "not_installed", "no_tmux", "root") or (
+            e == "not_allowed" and f in ("options.skip_permissions", "options.permission_mode")):
+        fix = _BY_HAND
+    elif e == "no_bus":
+        fix = {"action": "terminal", "command": "tailshare install"}
+    elif e == "rate":
+        fix = {"action": "retry", "after": out.get("retry_after", 1)}
+    elif e == "limit":
+        fix = {"action": "close_sessions"}
+    elif e in ("expired", "changed", "unknown_plan"):
+        fix = {"action": "dry_run_again"}
+    elif e == "running" and f == "squad.member":
+        fix = {"action": "open_session"}
+    else:
+        fix = {"action": "none"}
+    return {**out, "fix": fix}
+
+
+def off_reason(path: Path | None = None) -> dict | None:
+    """Why the /hello start block is missing, for the owner's devices: {"error", "reason", "fix"}; None when on, or
+    on a tagged machine or as root, where a device cannot turn it on."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return None
+    try:
+        cfg = load_config(path)
+    except Refused as e:
+        return with_fix(e.out)
+    if not cfg:
+        return with_fix(Refused("off", reason="starting sessions is off on this host").out)
+    if not cfg["roots"]:
+        return with_fix(Refused("off", "roots", "no folder may be started in here yet").out)
+    if not cfg["kinds"]:
+        return with_fix(Refused("off", "kinds", "no agent may be started here yet").out)
+    return None
 
 
 def capabilities(path: Path | None = None, owner: str = "") -> dict | None:
@@ -316,6 +481,8 @@ def _squad_folder(value: object, field: str = "cwd") -> str:
         pass
     if rel[0].casefold() == "library" or rel[0].startswith("."):  # a repo's own .claude/worktrees is fine
         raise Refused("not_allowed", field, "a squad folder may not be in ~/Library or a hidden folder")
+    if any(part.casefold() == ".git" for part in rel):  # its hooks run code: never a session's folder
+        raise Refused("not_allowed", field, "a squad folder may not be in a .git folder")
     path = home
     for part in [""] + rel:
         path = os.path.join(path, part) if part else path
@@ -365,7 +532,7 @@ def _options(kind: str, raw: object, allowed: list[str], roots: list[str], model
         if k not in KINDS[kind]:
             raise Refused("bad_request", f, "unknown option")
         if k not in allowed:
-            raise Refused("not_allowed", f)
+            raise Refused("not_allowed", f, "this host does not allow this option", kind=kind, option=k)
         t = KINDS[kind][k]
         if t[0] == "enum" and v in t[1]:
             out[k] = v
@@ -532,7 +699,7 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
     if kind not in KINDS:
         raise Refused("bad_request", "kind")
     if kind not in cfg["kinds"]:
-        raise Refused("not_allowed", "kind")
+        raise Refused("not_allowed", "kind", "this host does not start this agent", kind=kind)
     try:
         cwd = _in_roots(item.get("cwd"), cfg["roots"], "cwd")
     except Refused as e:
@@ -796,9 +963,8 @@ def _dry_run(con: sqlite3.Connection, starts: list, cfg: dict, grant: str, key: 
     return out
 
 
-def confirm(con: sqlite3.Connection, ids: object, cfg: dict, grant: str, key: str, host: str) -> list[dict]:
-    if not isinstance(ids, list) or not 0 < len(ids) <= MAX_ITEMS or not all(isinstance(i, str) for i in ids):
-        raise Refused("bad_request", "confirm", f"1 to {MAX_ITEMS} plan ids")
+def _rate(con: sqlite3.Connection, key: str) -> None:
+    """Confirms, closes and config changes share one per-key rate: CONFIRMS_PER_MIN a minute."""
     now = time.time()
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -808,6 +974,12 @@ def confirm(con: sqlite3.Connection, ids: object, cfg: dict, grant: str, key: st
         con.execute("INSERT INTO confirms(key, at) VALUES(?,?)", (key, now))
     finally:
         con.execute("COMMIT")
+
+
+def confirm(con: sqlite3.Connection, ids: object, cfg: dict, grant: str, key: str, host: str) -> list[dict]:
+    if not isinstance(ids, list) or not 0 < len(ids) <= MAX_ITEMS or not all(isinstance(i, str) for i in ids):
+        raise Refused("bad_request", "confirm", f"1 to {MAX_ITEMS} plan ids")
+    _rate(con, key)
     out = []
     for pid in ids:
         try:
@@ -852,15 +1024,7 @@ def close(con: sqlite3.Connection, ids: object, key: str) -> list[dict]:
     same per-key rate as confirms. The bus does the closing (close_started), as it does the launching."""
     if not isinstance(ids, list) or not 0 < len(ids) <= MAX_ITEMS or not all(isinstance(i, str) for i in ids):
         raise Refused("bad_request", "close", f"1 to {MAX_ITEMS} session ids")
-    now = time.time()
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        recent = con.execute("SELECT at FROM confirms WHERE key=? AND at>? ORDER BY at", (key, now - 60)).fetchall()
-        if len(recent) >= CONFIRMS_PER_MIN:
-            raise Refused("rate", retry_after=max(1, int(recent[0]["at"] + 61 - now)))
-        con.execute("INSERT INTO confirms(key, at) VALUES(?,?)", (key, now))
-    finally:
-        con.execute("COMMIT")
+    _rate(con, key)
     out = []
     for sid in ids:
         try:
@@ -881,9 +1045,26 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             raise Refused("no_grant", reason="this key may not start sessions")
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             raise Refused("root", reason="tailshare never starts sessions as root")
+        if isinstance(doc, dict) and set(doc) & set(CONFIG_OPS):
+            if doc.get("v") != 1 or len(doc) != 2:
+                raise Refused("bad_request", reason="a config change goes alone: {\"v\":1, \"<change>\":{…}}")
+            if plan_only:
+                raise Refused("no_grant", reason="the plan key only makes plans: change the config with the start key")
+            op = next(o for o in CONFIG_OPS if o in doc)
+            con = _db(db)
+            try:
+                _rate(con, key)
+            finally:
+                con.close()
+            change_config(op, doc[op], cfg_path)
+            return {"v": 1, "ok": True, "start": capabilities(cfg_path, owner)}
         cfg = load_config(cfg_path)
-        if not cfg or not cfg["roots"] or not cfg["kinds"]:
-            raise Refused("off", reason="starting sessions is off on this host")
+        if not cfg:
+            raise Refused("off", reason="starting sessions is off on this host", fix={"action": "enable_start"})
+        if not cfg["roots"]:
+            raise Refused("off", "roots", "no folder may be started in here yet", fix={"action": "add_root"})
+        if not cfg["kinds"]:
+            raise Refused("off", "kinds", "no agent may be started here yet", fix={"action": "allow_kind"})
         cfg["owner"] = owner  # whose sessions' models are offered (seen_models)
         if not isinstance(doc, dict) or doc.get("v") != 1:
             raise Refused("bad_request", "v")
@@ -892,21 +1073,24 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             if doc.get("dry_run") is True and "confirm" not in doc and "close" not in doc:
                 n = running()
                 fit = None if n is None else max(0, cfg["max_running"] - n)
-                return {"v": 1, "results": dry_run(con, doc.get("starts"), cfg, grant, key, host, fit),
+                return {"v": 1, "results": [with_fix(r) for r in dry_run(con, doc.get("starts"), cfg, grant, key,
+                                                                          host, fit)],
                         **({"running": n} if n is not None else {}), "max_running": cfg["max_running"]}
             if "close" in doc and not {"starts", "confirm", "dry_run"} & set(doc):
                 if plan_only:
                     raise Refused("no_grant", reason="the plan key only makes plans: close with the start key")
-                return {"v": 1, "results": close(con, doc.get("close"), key)}
+                return {"v": 1, "results": [with_fix(r) for r in close(con, doc.get("close"), key)]}
             if "confirm" in doc and "starts" not in doc and "close" not in doc:
                 if plan_only:
                     raise Refused("no_grant", reason="the plan key only makes plans: confirm with the start key")
-                return {"v": 1, "results": confirm(con, doc.get("confirm"), cfg, grant, key, host)}
-            raise Refused("bad_request", reason="send either dry_run with starts, confirm, or close")
+                return {"v": 1, "results": [with_fix(r) for r in confirm(con, doc.get("confirm"), cfg, grant, key,
+                                                                          host)]}
+            raise Refused("bad_request", reason="send either dry_run with starts, confirm, close, or one of "
+                          + ", ".join(CONFIG_OPS))
         finally:
             con.close()
     except Refused as e:
-        return {"v": 1, **e.out}
+        return {"v": 1, **with_fix(e.out)}
 
 
 # --------------------------------------------------------------------------- launching, in the bus
@@ -1174,3 +1358,64 @@ def machine() -> tuple[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", host):
         raise Refused("no_bus", reason="the bus gave no usable machine name")
     return host, owner if isinstance(owner, str) and 0 < len(owner) <= 256 else ""
+
+
+# --------------------------------------------------------------------------- `tailshare start`, in your own terminal
+
+
+def _human_check(what: str) -> None:
+    from . import keys
+
+    agentish = [v for v in keys.AGENT_ENV if os.environ.get(v)]
+    if agentish:
+        raise ValueError(f"this looks like an AI agent's shell ({', '.join(agentish)} is set). Agents must not "
+                         f"{what}: ask the person to run it in their own terminal")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise ValueError(f"to {what} needs a person at a terminal")
+
+
+def cmd_start(args) -> None:
+    try:
+        _cmd_start(args)
+    except ValueError as e:
+        sys.exit(f"tailshare start: {e}")
+
+
+def _cmd_start(args) -> None:
+    how = getattr(args, "how", None)
+    if how is None:
+        caps, off = capabilities(), off_reason()
+        print(json.dumps(caps if caps else {"off": off}, indent=2))
+        return
+    if how == "enable":
+        op, arg, says = "enable", {}, (f"turn on starting sessions from your devices, with {config_path()}: "
+                                       + json.dumps(defaults(), indent=2) if not config_path().exists()
+                                       else f"set enabled: true in {config_path()}")
+    elif how == "add-root":
+        op, arg, says = "add_root", {"folder": os.path.abspath(args.folder)}, \
+            f"let your devices start sessions in {os.path.abspath(args.folder)} and below"
+    else:
+        op, arg = "allow", {"kind": args.kind, **({"option": args.option} if args.option else {})}
+        says = f"let your devices start {args.kind}" + (f" with its {args.option} option" if args.option else "")
+    _human_check("change start.json")
+    print(f"This will {says}.")
+    if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("No changes.")
+        return
+    try:
+        change_config(op, arg)
+    except Refused as e:
+        raise ValueError(str(e.out.get("reason") or e.out["error"])) from None
+    print("Done.")
+
+
+def add_parser(sub) -> None:
+    p = sub.add_parser("start", help="starting sessions from your devices: show, or turn on (docs/start.md)")
+    s = p.add_subparsers(dest="how")
+    s.add_parser("enable", help="turn it on, with safe defaults if there is no start.json (in your own terminal)")
+    q = s.add_parser("add-root", help="allow one more folder (in your own terminal)")
+    q.add_argument("folder")
+    q = s.add_parser("allow", help="allow an agent, or one of its options (in your own terminal)")
+    q.add_argument("kind", choices=sorted(KINDS))
+    q.add_argument("option", nargs="?")
+    p.set_defaults(fn=cmd_start)

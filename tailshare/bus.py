@@ -909,6 +909,10 @@ class Bus:
                 caps = start.capabilities(owner=self.net.user)
                 if caps:
                     out["start"] = caps
+                elif self.net.user:  # why not, and the one-tap fix (a tagged machine has no owner to turn it on)
+                    off = start.off_reason()
+                    if off:
+                        out["start_off"] = off
         return out
 
     def _pane_alive(self, t: dict) -> bool:
