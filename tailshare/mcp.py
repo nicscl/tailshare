@@ -196,7 +196,9 @@ def _tool(name: str, args: dict) -> str:
         fields = {k: args[k] for k in reports.FIELDS if k in args}
         if not fields:
             return json.dumps(agent.call(f"/report?agent={me['id']}"), indent=1)
-        return json.dumps(agent.call("/report", {"agent": me["id"], **fields})["report"], indent=1)
+        d = agent.call("/report", {"agent": me["id"], **fields})
+        return json.dumps({**d["report"], **({"cut": d["cut"], "note": f"titles over {reports.TITLE_MAX} characters "
+                                             "were shortened"} if d.get("cut") else {})}, indent=1)
     if name == "board":
         sid = (me.get("squad") or {}).get("id")
         if not sid:

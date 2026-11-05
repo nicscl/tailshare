@@ -361,6 +361,23 @@ class Squads:
                                json.dumps(tag, sort_keys=True), aid, time.time() - bus.LIVE)
         return {} if other else tag
 
+    def match_tag(self, aid: str, harness: str, cwd: str, session: str) -> dict:
+        """For a session started by hand (no tag in its environment): the member it is, if exactly one member of
+        the owner's squads is on this machine, of its kind, in its folder and has its session name (as a slug),
+        and no other live agent is it. Else {}. So `claude` started by hand and named after a member reports as it."""
+        want = bus.slug(session or "")
+        if not want or not cwd:
+            return {}
+        real = os.path.realpath(cwd)
+        hits = []
+        for sid in self.ids():
+            d = self.squad(sid) or {}
+            for m in d.get("members", []):
+                if not m.get("deleted") and m["host"] == self.bus.net.host and m["kind"] == harness \
+                        and bus.slug(m.get("name") or "") == want and os.path.realpath(m["folder"]) == real:
+                    hits.append({"id": sid, "member": m["id"]})
+        return self.check_tag(hits[0], aid, harness, cwd) if len(hits) == 1 else {}
+
     def ids(self, deleted: bool = False) -> list[str]:
         try:
             owner = self.owner

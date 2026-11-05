@@ -618,7 +618,11 @@ class Bus:
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:  # the tag's "no other live holder" and the write that takes it, as one step
-            squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
+            if self.squads:
+                squad = (self.squads.check_tag(squad, aid, harness, cwd) if squad
+                         else self.squads.match_tag(aid, harness, cwd, session))
+            else:
+                squad = {}
             row = self.store.one("SELECT address FROM agents WHERE id=?", aid)
             if row and row["address"].split(":")[0] == base:
                 address = row["address"]  # keep a collision suffix stable

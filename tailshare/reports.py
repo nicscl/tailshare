@@ -95,6 +95,21 @@ def task(v: object, field: str) -> dict:
     return out
 
 
+def cut_titles(body: dict) -> list[str]:
+    """Shorten over-long task titles in a write (now, next, done) in place, rather than refuse the write: to
+    TITLE_MAX with an ellipsis. The fields it cut, for the reply."""
+    out = []
+    for f in ("now", "next", "done"):
+        v = body.get(f)
+        for i, x in enumerate(v if isinstance(v, list) else []):
+            t = x if isinstance(x, str) else x.get("title") if isinstance(x, dict) else None
+            if isinstance(t, str) and len(t.strip()) > TITLE_MAX:
+                short = t.strip()[:TITLE_MAX - 1].rstrip() + "…"
+                v[i] = short if isinstance(x, str) else {**x, "title": short}
+                out.append(f"{f}.{i}.title")
+    return out
+
+
 def tasks(v: object, field: str, cap: int) -> list:
     if v is None:
         return []
@@ -218,6 +233,8 @@ class Reports:
         if extra:
             raise Bad(sorted(extra)[0], "not a report field")
         sq, m = self.whose(aid)
+        body = json.loads(json.dumps(body))  # cut_titles edits it
+        cut = cut_titles(body)
         sid, mid, now = sq["id"], m["id"], time.time()
         with self.store.lock:
             row = self._row(sid, mid)
@@ -243,7 +260,7 @@ class Reports:
                 raise Bad("report", "over 48 KB")
             self.store.x("INSERT OR REPLACE INTO reports(owner, squad, member, doc, agent, at) VALUES(?,?,?,?,?,?)",
                          self.squads.owner, sid, mid, json.dumps(doc), m["_agent"], now)
-        return {"report": self.view(sq, mid)}
+        return {"report": self.view(sq, mid), **({"cut": cut} if cut else {})}
 
     @staticmethod
     def _stamp_done(v: object, old: list, now: float) -> list:
