@@ -589,17 +589,19 @@ class Starting(unittest.TestCase):
     def test_a_squad_folder_outside_the_roots(self):
         home = (self.m.tmp / "home").resolve()
         work = home / "LoggiProjects" / "mono"
-        for d in (work, home / ".ssh" / "x", home / "Library" / "x", home / "open"):
+        for d in (work, home / ".ssh" / "x", home / "Library" / "x", home / "open" / "x"):
             d.mkdir(parents=True)
-        (home / "open").chmod(0o777)
+        (home / "open").chmod(0o777)  # the leaf is fine, a folder above it is not
         (home / "link").symlink_to(home / "LoggiProjects")
         (self.m.tmp / "elsewhere").mkdir()
-        p = mock.patch.dict(os.environ, {"HOME": str(home)})
+        p = mock.patch.object(start, "_home", return_value=str(home))
         p.start()
         self.addCleanup(p.stop)
         folders = {"ok": work, "sym": home / "link" / "mono", "dot": home / ".ssh" / "x", "lib": home / "Library" / "x",
-                   "home": home, "open": home / "open", "out": self.m.tmp / "elsewhere",
+                   "home": home, "open": home / "open" / "x", "out": self.m.tmp / "elsewhere",
                    "none": home / "nope"}
+        if os.path.isdir(home / "library"):  # a case-insensitive file system: ~/library is ~/Library
+            folders["lib_case"] = home / "library" / "x"
         self.m.put("sq3", name="Far", members=[{"id": k, **member(name=k.title(), folder=str(f), order=i)}
                                                for i, (k, f) in enumerate(folders.items())])
         plan = start.build({"squad": {"id": "sq3", "member": "ok"}}, self.cfg, "safe", "air")

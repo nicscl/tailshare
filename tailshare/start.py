@@ -277,20 +277,29 @@ def _in_roots(value: object, roots: list[str], field: str) -> str:
     if not os.path.isdir(real):
         raise Refused("not_allowed", field, "no such folder")
     if not any(real == r or real.startswith(r + os.sep) for r in roots):
-        raise Refused("not_allowed", field, "outside the folders this host allows")
+        raise Refused("not_allowed", field, "outside the folders this host allows", folder=real)
     return real
+
+
+def _home() -> str:
+    """This user's home folder from the password database, never $HOME (the gate runs under sshd)."""
+    import pwd
+
+    return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
 
 
 def _squad_folder(value: object, field: str = "cwd") -> str:
     """A squad member's folder outside start.json's roots. The squad is the owner's (signed writes, docs/squads.md),
     so its folder may start there, but only a plain folder of this user inside the home folder: exactly the path the
-    squad names (no symlink anywhere on it, no `..`), owned by this uid and not writable by group or others, not the
-    home folder itself, and not under a dot folder (~/.ssh, ~/.tailshare, ~/.claude...) or ~/Library."""
+    squad names (no symlink anywhere on it, no `..`), not the home folder itself, not ~/Library (in any case: APFS
+    ignores it) or under a hidden folder (~/.ssh, ~/.tailshare, ~/.claude...), and every folder from the home folder
+    down to it this user's own and not writable by group or others, so nobody else can swap a link in before tmux
+    starts there."""
     if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
         raise Refused("bad_request", field)
     if not os.path.isabs(value):
         raise Refused("bad_request", field, "must be an absolute path")
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = _home()
     real = os.path.realpath(value)
     if real != os.path.normpath(value) or value.rstrip("/") != os.path.normpath(value):
         raise Refused("not_allowed", field, "a squad folder outside the allowed folders must not go through a symlink")
@@ -299,11 +308,26 @@ def _squad_folder(value: object, field: str = "cwd") -> str:
     if not real.startswith(home + os.sep):
         raise Refused("not_allowed", field, "outside the folders this host allows, and not inside the home folder")
     rel = real[len(home) + 1:].split(os.sep)
-    if rel[0] == "Library" or any(part.startswith(".") for part in rel):
+    library = None
+    try:
+        lst = os.stat(os.path.join(home, "Library"))
+        library = (lst.st_dev, lst.st_ino)
+    except OSError:
+        pass
+    if rel[0].casefold() == "library" or any(part.startswith(".") for part in rel):
         raise Refused("not_allowed", field, "a squad folder may not be in ~/Library or a hidden folder")
-    st = os.stat(real)
-    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
-        raise Refused("not_allowed", field, "a squad folder must be this user's and not writable by others")
+    path = home
+    for part in [""] + rel:
+        path = os.path.join(path, part) if part else path
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise Refused("not_allowed", field, "a squad folder outside the allowed folders must not go through a "
+                          "symlink")
+        if (st.st_dev, st.st_ino) == library:
+            raise Refused("not_allowed", field, "a squad folder may not be in ~/Library or a hidden folder")
+        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            raise Refused("not_allowed", field, "a squad folder, and every folder above it in the home folder, must "
+                          "be this user's and not writable by others")
     return real
 
 
@@ -511,8 +535,8 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         raise Refused("not_allowed", "kind")
     try:
         cwd = _in_roots(item.get("cwd"), cfg["roots"], "cwd")
-    except Refused:
-        if squad is None:
+    except Refused as e:
+        if squad is None or "folder" not in e.out:  # only a folder outside the roots; any other refusal stands
             raise
         cwd = _squad_folder(item.get("cwd"))  # the owner's squad names it: docs/squads.md, "Starting a member"
     name = clean_name(item.get("name"))
