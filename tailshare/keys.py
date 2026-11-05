@@ -1025,12 +1025,12 @@ class Keys:
         log(f"installed {key_id} ({r['device']}, {r['fingerprint']}) mode={mode}{', squads' if squads else ''}, {by}")
         return {"host": self.host, "login": bus.LOGIN, "mode": mode, "key_id": key_id, "squads": bool(squads)}
 
-    def check_approval(self, payload: str, signature: str, sender: str | None = None, machine_pubkey: str = "") -> dict:
+    def check_approval(self, payload: str, signature: str, sender: str | None = None) -> dict:
         """The approval, if it may install here. `sender`: the machine that sent it (None: a person on this one).
         A person's approval is signed with a security key in allowed_signers. A machine's (`"by": "machine"`)
         is signed with its machine key, accepted only from that machine itself, and only when trusted_machines
         here names it: one direct edge, never relayed by another machine. Without that edge, a machine's approval
-        of a start key is still taken as an offer (`_offer`): verified with the sender's pinned machine key, it
+        of a start key is still taken as an offer (`_offer`): verified with the key pinned from the signer itself, it
         installs nothing until the device proves it holds the start key (docs/ssh-keys.md#approve-once)."""
         from .sessions import KEYS_NAMESPACE, verify
 
@@ -1048,7 +1048,7 @@ class Keys:
             if offer and head.get("mode") not in ("start", "start-skip"):
                 raise bus.BusError(f"approval refused: {self.host} does not trust {signer} (a person on {self.host} "
                                    f"can run `tailshare keys trust-machine {signer}`)", 403)
-            d = self._verify_offer(signer, payload, signature, machine_pubkey) if offer \
+            d = self._verify_offer(signer, payload, signature) if offer \
                 else verify(payload, signature, self.trusted, KEYS_NAMESPACE)
             d["_offer"] = offer
         else:
@@ -1187,8 +1187,7 @@ class Keys:
         else:
             try:
                 got = bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/install",
-                                  {"v": bus.PROTOCOL, "payload": payload, "signature": signature,
-                                   "machine_pubkey": self.machine_pub()}, timeout=20)
+                                  {"v": bus.PROTOCOL, "payload": payload, "signature": signature}, timeout=20)
                 if got.get("host") != h:
                     raise bus.BusError(f"answered as {got.get('host')!r}", 502)
                 self.store.x("INSERT OR REPLACE INTO key_installs(key_id, host, created, done, final, error)"
@@ -1238,7 +1237,7 @@ class Keys:
             raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
         d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""),
-                                sender=self.bus.net.host_for_ip(ip) or "", machine_pubkey=str(body.get("machine_pubkey") or ""))
+                                sender=self.bus.net.host_for_ip(ip) or "")
         if d["_offer"]:
             return self._stage(d)
         r = {k: d.get(k, "") for k in ("pubkey", "fingerprint", "device", "node", "user", "plan_pubkey")}
@@ -1246,41 +1245,59 @@ class Keys:
         return self.install_here(d["key_id"], r, d["mode"], by, d.get("squads") is True)
 
     # -- approve once, everywhere (docs/ssh-keys.md#approve-once) -------------------------
-    def _verify_offer(self, signer: str, payload: str, signature: str, machine_pubkey: str) -> dict:
+    def _fetch_machine_key(self, host: str) -> str | None:
+        """`host`'s machine key, from its own GET /keys/machine (served by its tailshare, as for trust-machine)."""
+        try:
+            return self.peer_machine({"host": host})["pubkey"]
+        except Exception as e:  # noqa: BLE001
+            log(f"could not fetch {host}'s machine key: {e}")
+            return None
+
+    def _verify_offer(self, signer: str, payload: str, signature: str) -> dict:
         """A start key approval signed by `signer`'s machine key, which this machine does not trust: checked with
-        the key pinned for signer the first time it sent one (taken from that machine itself, over the tailnet).
-        A different key later is refused until a person here forgets the old one."""
+        the key pinned for signer the first time it sent one, fetched from signer's own GET /keys/machine (never
+        from the request: any process on signer could send one). A different key later is refused until a person
+        here forgets the old one."""
         from .sessions import KEYS_NAMESPACE, verify
 
+        def check(pub: str) -> dict:
+            with tempfile.TemporaryDirectory() as tmp:
+                signers = Path(tmp) / "signers"
+                signers.write_text(machine_line(signer, pub))
+                return verify(payload, signature, signers, KEYS_NAMESPACE)
+
         row = self.store.one("SELECT pubkey, first FROM owner_machines WHERE host=?", signer)
-        try:
-            sent = parse_pubkey(machine_pubkey) if machine_pubkey else ""
-        except bus.BusError:
-            sent = ""
-        pub = row["pubkey"] if row else sent
-        if not pub.startswith(MACHINE_KEY_TYPE + " "):
-            raise bus.BusError("approval refused: an offer must come with the sender's machine key", 403)
-        if row and sent and sent != row["pubkey"]:
-            log(f"{signer}'s machine key changed: pinned {fingerprint(row['pubkey'])}, now {fingerprint(sent)}")
-            self._alert("Machine key changed", f"{signer} sent a start key signed with a new machine key. Nothing "
-                        f"was installed. If {signer} was reinstalled, run tailshare keys untrust-machine {signer}.")
-            raise bus.BusError(f"approval refused: {signer}'s machine key is not the one {self.host} pinned "
-                               f"{time.strftime('%Y-%m-%d', time.localtime(row['first']))}. If {signer} was "
-                               f"reinstalled, a person on {self.host} can run `tailshare keys untrust-machine {signer}` "
-                               "to forget the old key", 403, {"reason": "machine_key_changed", "host": signer})
-        with tempfile.TemporaryDirectory() as tmp:
-            signers = Path(tmp) / "signers"
-            signers.write_text(machine_line(signer, pub))
-            d = verify(payload, signature, signers, KEYS_NAMESPACE)
-        if not row:
-            with self.store.lock:
-                self.store.x("INSERT OR IGNORE INTO owner_machines(host, pubkey, first) VALUES(?,?,?)", signer, pub,
-                             time.time())
-                if self.store.one("SELECT pubkey FROM owner_machines WHERE host=?", signer)["pubkey"] != pub:
-                    raise bus.BusError(f"approval refused: {signer} sent two machine keys at once", 403,
-                                       {"reason": "machine_key_changed", "host": signer})
-            log(f"pinned {signer}'s machine key {fingerprint(pub)} for start key offers")
+        if row:
+            try:
+                return check(row["pubkey"])
+            except bus.BusError:
+                now = self._fetch_machine_key(signer)
+                if now and now != row["pubkey"]:
+                    log(f"{signer}'s machine key changed: pinned {fingerprint(row['pubkey'])}, now {fingerprint(now)}")
+                    self._alert("Machine key changed", f"{signer} has a new machine key. Nothing was installed. If "
+                                f"{signer} was reinstalled, run tailshare keys untrust-machine {signer}.")
+                    raise bus.BusError(
+                        f"approval refused: {signer}'s machine key is not the one {self.host} pinned "
+                        f"{time.strftime('%Y-%m-%d', time.localtime(row['first']))}. If {signer} was reinstalled, "
+                        f"a person on {self.host} can run `tailshare keys untrust-machine {signer}` to forget the old key",
+                        403, {"reason": "machine_key_changed", "host": signer}) from None
+                raise
+        pub = self._fetch_machine_key(signer)
+        if not pub:
+            raise bus.BusError(f"approval refused: {self.host} could not fetch {signer}'s machine key from {signer}", 403)
+        d = check(pub)
+        with self.store.lock:
+            self.store.x("INSERT OR IGNORE INTO owner_machines(host, pubkey, first) VALUES(?,?,?)", signer, pub, time.time())
+            if self.store.one("SELECT pubkey FROM owner_machines WHERE host=?", signer)["pubkey"] != pub:
+                raise bus.BusError(f"approval refused: {signer} answered with two machine keys at once", 403,
+                                   {"reason": "machine_key_changed", "host": signer})
+        log(f"pinned {signer}'s machine key {fingerprint(pub)} for start key offers")
         return d
+
+    def _machine_node(self, node: str, signer: str) -> bool:
+        """A node that runs tailshare is a machine, not a device: the signer, this one, or any that answered here."""
+        return node in (signer, self.host) or bool(
+            self.store.one("SELECT 1 FROM peers WHERE host=? AND last_ok IS NOT NULL", node))
 
     def _stage(self, d: dict) -> dict:
         """Keep an owner machine's start key approval as an offer: nothing goes into authorized_keys until the
@@ -1289,6 +1306,9 @@ class Keys:
         if problem:
             raise bus.BusError(problem, 409)
         key_id, plan = d["key_id"], d.get("plan_pubkey") or ""
+        if self._machine_node(d["node"], d["signer"]):
+            raise bus.BusError(f"approval refused: {d['node']} runs tailshare, so it is a machine, not a device; only "
+                               f"a person on {self.host} approves its keys here", 403, {"reason": "machine_node"})
         with self.store.lock:
             if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
                 raise bus.BusError(f"key {key_id} was revoked; enroll again", 409)
@@ -1326,6 +1346,8 @@ class Keys:
             raise no("not_owner", "only the owner's own devices redeem a start key approved on another machine")
         if node != offer["node"]:
             raise no("other_device", f"{offer['signer']} approved this key for {offer['node']}, not {node}")
+        if self._machine_node(node, offer["signer"]):
+            raise no("machine_node", f"{node} runs tailshare: a machine's keys need a person on {self.host}")
         if not isinstance(proof, dict) or set(proof) != {"time", "nonce", "hosts", "signature"}:
             raise no("bad_proof", "proof is {time, nonce, hosts, signature}")
         ts, nonce, hosts, sig = proof["time"], proof["nonce"], proof["hosts"], proof["signature"]

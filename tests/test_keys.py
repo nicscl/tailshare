@@ -174,6 +174,8 @@ class Flow(unittest.TestCase):
         self.pro_keys = self.machine_keys(self.pro, "pro")
         self.air.keys, self.pro.keys = self.air_keys, self.pro_keys
         self.air.store.x("INSERT INTO peers(host, ip, version, last_ok) VALUES('pro','127.0.0.1','t',?)", time.time())
+        self.air_key_now = self.air_keys  # what air's GET /keys/machine answers, as pro fetches it
+        self.pro_keys._fetch_machine_key = lambda h: self.air_key_now.machine_pub() if h == "air" and self.air_key_now else None
         _, self.phone_pub = keypair(self.tmp, "phone")
         self.srv = self.pro.listen("127.0.0.1", local=False)
 
@@ -845,8 +847,7 @@ class Flow(unittest.TestCase):
         r, _pub, _plan = self.start_pair()
         p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r["request_id"])
         payload = keys.approval_doc("air", "air", p, "k" + "7" * 12, "start", ["pro"], machine=True)
-        body = {"payload": payload, "signature": self.air_keys._machine_sign(payload),
-                "machine_pubkey": self.air_keys.machine_pub()}
+        body = {"payload": payload, "signature": self.air_keys._machine_sign(payload)}
         self.pro.net.usermap["100.64.0.66"] = "eve@example.com"
         self.pro.net.ipmap["100.64.0.66"] = "air"  # even claiming the name
         with self.assertRaises(bus.BusError) as cm:
@@ -856,8 +857,10 @@ class Flow(unittest.TestCase):
         with self.assertRaises(bus.BusError):
             self.pro_keys.install_from_peer("127.0.0.1", body)
         self.pro.net.user = OWNER
-        with self.assertRaises(bus.BusError):  # no machine key sent and none pinned
-            self.pro_keys.install_from_peer("127.0.0.1", {**body, "machine_pubkey": ""})
+        self.air_key_now = None
+        with self.assertRaises(bus.BusError):  # air's key could not be fetched from air, and none is pinned
+            self.pro_keys.install_from_peer("127.0.0.1", body)
+        self.air_key_now = self.air_keys
         self.assertTrue(self.pro_keys.install_from_peer("127.0.0.1", body)["staged"])
 
     def test_a_changed_machine_key_is_refused_until_a_person_forgets_it(self):
@@ -870,17 +873,41 @@ class Flow(unittest.TestCase):
         r2, _pub2, _plan2 = self.start_pair("2")
         p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r2["request_id"])
         payload = keys.approval_doc("air", "air", p, "k" + "8" * 12, "start", ["pro"], machine=True)
-        body = {"payload": payload, "signature": other._machine_sign(payload), "machine_pubkey": other.machine_pub()}
+        body = {"payload": payload, "signature": other._machine_sign(payload)}
+        with self.assertRaises(bus.BusError) as cm:  # a process on air signing with its own key: air still answers the old one
+            self.pro_keys.install_from_peer("127.0.0.1", body)
+        self.assertNotEqual(cm.exception.extra.get("reason"), "machine_key_changed")
+        self.air_key_now = other  # air reinstalled: a new key
         with self.assertRaises(bus.BusError) as cm:
             self.pro_keys.install_from_peer("127.0.0.1", body)
         self.assertEqual(cm.exception.extra.get("reason"), "machine_key_changed")
         self.assertEqual(len(alerts), 1)
-        with self.assertRaises(bus.BusError):  # nor without sending a key: the pinned one does not match
-            self.pro_keys.install_from_peer("127.0.0.1", {**body, "machine_pubkey": ""})
         self.assertTrue(self.pro_keys.untrust({"host": "air"})["removed"])
         payload = keys.approval_doc("air", "air", p, "k" + "9" * 12, "start", ["pro"], machine=True)
-        body = {"payload": payload, "signature": other._machine_sign(payload), "machine_pubkey": other.machine_pub()}
+        body = {"payload": payload, "signature": other._machine_sign(payload)}
         self.assertTrue(self.pro_keys.install_from_peer("127.0.0.1", body)["staged"])
+
+    def test_a_machine_is_not_a_device_an_offer_can_name(self):
+        """A taken-over owner machine makes its own start pair: it can never redeem it, from itself or another machine."""
+        r, _pub, _plan = self.start_pair()
+        p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r["request_id"])
+        for node in ("air", "pro", "prismo"):
+            self.pro.store.x("INSERT OR IGNORE INTO peers(host, ip, version, last_ok) VALUES('prismo','100.64.0.9','t',?)",
+                             time.time())
+            payload = keys.approval_doc("air", "air", {**p, "node": node}, "k" + "d" * 12, "start", ["pro"], machine=True)
+            with self.subTest(node), self.assertRaises(bus.BusError) as cm:
+                self.pro_keys.install_from_peer("127.0.0.1", {"payload": payload,
+                                                              "signature": self.air_keys._machine_sign(payload)})
+            self.assertEqual(cm.exception.extra.get("reason"), "machine_node")
+        # and an offer made before the node was seen running tailshare is refused at the proof
+        r2, pub2, plan2 = self.start_pair("2")
+        self.approve_here(r2, "start")
+        self.pro.store.x("INSERT OR IGNORE INTO peers(host, ip, version, last_ok) VALUES('iphone',?,'t',?)", PHONE,
+                         time.time())
+        with self.assertRaises(bus.BusError) as cm:
+            self.on_pro(pub2, plan2, self.proof("start2", pub2, plan2))
+        self.assertEqual(cm.exception.extra.get("reason"), "machine_node")
+        self.assertEqual(self.pro_keys.ls()["keys"], [])
 
     def test_a_security_key_approval_pro_cannot_check_becomes_an_offer(self):
         empty = self.tmp / "pro_signers"

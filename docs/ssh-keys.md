@@ -118,12 +118,16 @@ permissions, or anything for a device that is not yours.
 
 How it goes, for X where a person approved the pair and Y, another machine of the same owner:
 
-1. X sends Y the approval signed with X's machine key, as for a trusted machine, with X's machine public key.
+1. X sends Y the approval signed with X's machine key, as for a trusted machine.
 2. Y does not trust X, so it does not install it. It keeps it as an **offer** for 7 days, when all of these hold:
    - it came from X's own tailnet address, X belongs to Y's tailnet user, and neither is tagged;
-   - it is signed by X's machine key: the one Y pinned the first time X sent an offer. A different key later
-     is refused, and a Mac shows a notification. If X was reinstalled, `tailshare keys untrust-machine X` on
-     Y forgets the old key;
+   - it is signed by X's machine key: the one Y pinned the first time X sent an offer, fetched from X's own
+     `GET /keys/machine` (never taken from the request, which any process on X could send). When X later
+     answers with a different key, the offer is refused and a Mac shows a notification. If X was reinstalled,
+     `tailshare keys untrust-machine X` on Y forgets the old key;
+   - the device it names is not a machine: not X, not Y, and no node that answered Y as a tailshare server.
+     Otherwise a taken-over X could make a pair of its own and redeem it from itself. A device that also
+     runs tailshare (the iPad under iSH) gets its start key approved by a person on each machine;
    - it is for a start key and its plan key, for Y, within 15 minutes, with an unused nonce, for a key id
      never revoked on Y.
    The offer installs nothing. `tailshare keys ls` lists it under `offered`; X's answer for Y says `staged`.
@@ -159,8 +163,8 @@ tailshare-start-proof/1
 
 `hosts` may name several machines, so one Face ID covers every machine the app enrolls on at once; each
 machine checks it is named. The time must be within 60 s of the machine's clock (`expired` says its time), and
-a nonce works once per machine. Refusals are 403 with `reason`: `not_owner`, `other_device`, `bad_proof`,
-`expired`, `bad_signature`, `replayed` or `revoked`. A successful enroll answers `status: "approved"` with
+a nonce works once per machine. Refusals are 403 with `reason`: `not_owner`, `other_device`, `machine_node`,
+`bad_proof`, `expired`, `bad_signature`, `replayed` or `revoked`. A successful enroll answers `status: "approved"` with
 `approved_on`.
 
 ## Revoking
