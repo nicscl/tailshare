@@ -7,7 +7,8 @@ machine until that machine's own config turns it on, and it needs a separate key
 ## Turning it on
 
 Starting is off unless `~/.tailshare/start.json` exists, belongs to you, is a regular file (not a symlink) and
-is not writable by group or others. Nothing syncs it: each machine has its own. You do not have to write it by
+is not writable by group or others, in a `~/.tailshare` that is your own real folder, also not writable by group or
+others (else anyone who could write there could swap the file). Nothing syncs it: each machine has its own. You do not have to write it by
 hand. Either of these writes it for you:
 
 - the app, with a start key already installed on that machine: one tap on the `enable_start` fix (below), which
@@ -19,7 +20,7 @@ On a machine with no start.json, enabling writes these defaults, mode 0600: your
 (if it is a plain folder of yours; else none, and the next fix is `add_root`), Claude and Codex with every option
 except `skip_permissions`, `skip_permissions` and `auto` off, `max_running` 12. On a machine whose start.json says
 `"enabled": false`, it only sets `enabled` back to true. Both are written whole (a temp file renamed into place,
-never through a symlink) under a lock.
+never through a symlink) under a lock file that is never followed through a symlink either.
 
 ### Changing it from a device
 
@@ -34,6 +35,8 @@ With the start key (Face ID; the plan key is refused with `no_grant`), a device 
 | `{"allow": {"kind": "claude", "option": "effort"}}` | allows one more option of an allowed agent |
 
 The answer is `{"v":1, "ok":true, "start":{…}}` with the new /hello `start` block, or a refusal with a `fix`.
+When the change left starting still unusable (`start` is null, e.g. enabled but no root yet), the answer also
+carries `start_off` with the next fix, so the app can offer it without asking /hello again.
 Changes count against the key's confirm rate. A device never changes `skip_permissions`, `auto`, `bin`,
 `models` or `max_running`, and never allows the `skip_permissions` option (`not_allowed`, fix `terminal`):
 skipping stays a person's choice at the machine.

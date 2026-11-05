@@ -177,6 +177,31 @@ class FromADevice(Base):
         self.assertEqual(sorted(p.name for p in self.state.iterdir() if "start.json" in p.name and p.name != "start.json"
                                 and not p.name.endswith(".lock")), [])  # no temp file left
 
+    def test_the_answer_says_what_is_still_missing(self):
+        self.path.unlink()
+        (self.home / "Projects").rmdir()  # no ~/Projects: enable writes no root
+        out = self.op("enable")
+        self.assertTrue(out["ok"], out)
+        self.assertIsNone(out["start"])
+        self.assertEqual(out["start_off"]["fix"], {"action": "add_root"})
+        out = self.op("add_root", {"folder": str(self.home / "work" / "repo")})
+        self.assertIsNotNone(out["start"])
+        self.assertNotIn("start_off", out)
+
+    def test_a_folder_others_can_write_to_or_a_linked_lock(self):
+        self.state.chmod(0o775)
+        try:
+            for out in (self.op("enable"), self.call({"v": 1, "dry_run": True, "starts": [self.item()]})):
+                self.assertEqual((out["error"], out["fix"]), ("off", {"action": "terminal"}), out)
+            self.assertIn("not writable by group", start.off_reason()["reason"])
+        finally:
+            self.state.chmod(0o700)
+        target = self.tmp / "elsewhere"
+        (self.state / "start.json.lock").symlink_to(target)
+        out = self.op("allow", {"kind": "claude", "option": "model"})
+        self.assertEqual((out["error"], out["fix"]), ("off", {"action": "terminal"}), out)
+        self.assertFalse(target.exists())
+
     def test_enable_turns_a_disabled_file_back_on_and_keeps_the_rest(self):
         d = self.config(enabled=False, max_running=7)
         self.assertTrue(self.op("enable")["ok"])
