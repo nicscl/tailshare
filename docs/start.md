@@ -66,6 +66,9 @@ machine sends neither.
 - `max_running`: how many tailshare-started agents may run at once (1 to 100, default 12).
 - `skip_permissions`: whether a session may run with permissions skipped at all (see below). Default false.
 - `auto`: whether a Claude session may run in auto mode (`permission_mode: auto`, see below). Default false.
+- `revive`: whether the bus reopens a started session whose pane died without the session ending (see "Revive",
+  below). Default true; `false` turns it off. `revive_per_session` (0 to 100, default 3) and `revive_per_host` (0 to
+  1000, default 10) cap the reopens an hour.
 
 tailshare running as root never starts anything.
 
@@ -275,6 +278,36 @@ To reopen one, a device sends an ordinary start item with `options.resume` set t
 `cwd` and `name` the recorded `name`; it is signed, dry-run and confirmed like any start and runs on its own server.
 A squad member reopens as that member (its squad's tmux session, `TAILSHARE_SQUAD`/`TAILSHARE_MEMBER`). Several at
 once are just several items (at most 32).
+
+## Revive
+
+The bus looks every 30 s for a session it would list as dead (above) that is resumable now, whose agent was last seen
+within 15 minutes, and that did not end: no `SessionEnd`, no Close. That is a crash: tmux died, or its pane or
+server was killed. It reopens it as a device's Reopen would: a start that resumes it, in its own folder under its
+own name, re-checked against start.json now. It uses the options the session was started with here (start.db
+`launched`), and never more than the start key that approved that start may do now: it skips permissions only if it
+was started skipping and that key is still installed here as a skip key. A key approved again without skip makes the
+reopen refused (`no_skip_grant`); a key that was removed means no reopen at all, and the owner is told as past a
+cap (below). A session started before launches were recorded gets only `resume`, without skipping. A squad member
+reopens as that member. Only Claude sessions reopen, as above.
+
+A crash is anything that takes the pane away without the session ending: a tmux crash, a killed server, and also
+a `tmux kill-pane` or `kill-server` by hand. To stop one for good, end it (`/exit`, or Close from a device), or turn
+`revive` off.
+
+It is bounded so that a crash loop ends up with the owner:
+
+- backoff: a session's 2nd reopen in an hour waits 30 s after its 1st, the 3rd 2 min, then 10 min;
+- `revive_per_session` reopens of one session an hour, where dying within 2 min of a reopen (or never coming up)
+  counts twice; `revive_per_host` an hour on the host, where every session on one tmux server dying at once counts
+  as one;
+- past a cap, it stops reopening and tells the owner once an hour: a squad member gets a `to: owner` question
+  blocker with id `revive` in its report, which shows in the board's Needs you; a single session gets a log line.
+  The blocker never pushes out the member's own open blockers: it replaces older resolved ones, and with 8 open
+  already it is only logged. A Reopen from a device still works.
+
+Every reopen, refusal and stop is a `revive …` line in tailshare.log. A refusal (`limit`, a folder now outside the
+roots) counts as a try, so it backs off too.
 
 ## Closing a session
 

@@ -245,6 +245,26 @@ class Reports:
                          self.squads.owner, sid, mid, json.dumps(doc), m["_agent"], now)
         return {"report": self.view(sq, mid)}
 
+    def flag(self, sid: str, mid: str, b: dict) -> bool:
+        """A blocker this host puts in a member's report itself, while its agent is down (the revive watchdog): it
+        replaces one with the same id, and the agent's own next blockers write replaces it. Room is made by dropping
+        the oldest resolved blockers, never an open one; with OPEN_MAX open already it is not added (False)."""
+        b = blocker(b, "blocker")
+        b.pop("resolved")
+        b = {**b, "at": time.time(), "resolved_at": None}
+        with self.store.lock:
+            row = self._row(sid, mid)
+            doc = json.loads(row["doc"]) if row else {}
+            keep = [x for x in doc.get("blockers") or [] if isinstance(x, dict) and x.get("id") != b["id"]]
+            if sum(1 for x in keep if not x.get("resolved_at")) >= OPEN_MAX:
+                return False
+            while len(keep) >= OPEN_MAX + RESOLVED_MAX:
+                keep.remove(next(x for x in keep if x.get("resolved_at")))
+            doc["blockers"] = keep + [b]
+            self.store.x("INSERT OR REPLACE INTO reports(owner, squad, member, doc, agent, at) VALUES(?,?,?,?,?,?)",
+                         self.squads.owner, sid, mid, json.dumps(doc), row["agent"] if row else "", time.time())
+        return True
+
     @staticmethod
     def _stamp_done(v: object, old: list, now: float) -> list:
         """done[] with the time each task first showed up as done: kept for a task already there, now for a new one."""

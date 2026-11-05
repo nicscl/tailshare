@@ -1,6 +1,7 @@
 """Agent reports: a member writes only its own, every field is cleaned and capped, what it may raise follows the
 squad tree when read, and only the owner's devices read them. Temp state and loopback buses only."""
 
+import json
 import time
 import unittest
 from unittest import mock
@@ -126,6 +127,18 @@ class Blockers(Base):
         self.bad("m0", blockers=[self.q(id=f"b{i}") for i in range(reports.OPEN_MAX + 1)])
         r = self.write("m0", blockers=[self.q(why="line 1\nline\u202e 2", options=["Use ⌥⌘N", "/clear"])])
         self.assertEqual((r["blockers"][0]["why"], r["blockers"][0]["options"]), ("line 1\nline 2", ["Use ⌥⌘N", "/clear"]))
+
+    def test_a_host_flag_never_pushes_out_an_open_blocker(self):
+        open_ = [self.q(id=f"o{i}") for i in range(reports.OPEN_MAX - 1)]
+        done = [self.q(id=f"d{i}", resolved=True) for i in range(reports.RESOLVED_MAX + 1)]
+        self.write("m0", blockers=done[:reports.RESOLVED_MAX] + open_)
+        self.assertTrue(self.r.flag("sq", "m0", self.q(id="revive", title="Dev keeps crashing")))
+        bs = json.loads(self.r._row("sq", "m0")["doc"])["blockers"]
+        self.assertEqual(len(bs), reports.OPEN_MAX + reports.RESOLVED_MAX)
+        self.assertEqual(sum(1 for b in bs if not b["resolved_at"]), reports.OPEN_MAX)  # every open one kept, plus it
+        self.assertFalse(self.r.flag("sq", "m0", self.q(id="revive2")))  # OPEN_MAX open: not added
+        self.assertTrue(self.r.flag("sq", "m0", self.q(id="revive", title="again")))  # replacing its own is fine
+        self.write("m0", now=["still writes"])  # the agent's own next write is not refused for it
 
     def test_resolving(self):
         t0 = time.time()

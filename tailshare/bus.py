@@ -1182,8 +1182,10 @@ class Bus:
 
     # -- running --------------------------------------------------------------
     def _loop(self) -> None:
+        from . import revive
+
         was_online: set[str] = set()
-        last_hello = 0.0
+        last_hello = last_revive = 0.0
         while True:
             self.kick.wait(5)
             self.kick.clear()
@@ -1207,6 +1209,12 @@ class Bus:
                     self._pruned = now
             except Exception as e:  # noqa: BLE001
                 log(f"delivery loop: {e!r}")
+            if time.time() - last_revive >= revive.CHECK:
+                last_revive = time.time()
+                try:
+                    revive.tick(self)
+                except Exception as e:  # noqa: BLE001
+                    log(f"revive: {e!r}")
 
     def listen(self, addr: str, local: bool) -> ThreadingHTTPServer:
         srv = ThreadingHTTPServer((addr, self.port), _Handler)
