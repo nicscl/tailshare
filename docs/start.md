@@ -7,8 +7,40 @@ machine until that machine's own config turns it on, and it needs a separate key
 ## Turning it on
 
 Starting is off unless `~/.tailshare/start.json` exists, belongs to you, is a regular file (not a symlink) and
-is not writable by group or others. tailshare never writes it and nothing syncs it: you write it on each
-machine that should accept starts.
+is not writable by group or others. Nothing syncs it: each machine has its own. You do not have to write it by
+hand. Either of these writes it for you:
+
+- the app, with a start key already installed on that machine: one tap on the `enable_start` fix (below), which
+  asks for Face ID like any start;
+- `tailshare start enable` in your own terminal on that machine (it refuses in an AI agent's shell and without a
+  terminal, and asks before changing anything). `tailshare start` alone shows what the machine takes, or why not.
+
+On a machine with no start.json, enabling writes these defaults, mode 0600: your `~/Projects` as the only root
+(if it is a plain folder of yours; else none, and the next fix is `add_root`), Claude and Codex with every option
+except `skip_permissions`, `skip_permissions` and `auto` off, `max_running` 12. On a machine whose start.json says
+`"enabled": false`, it only sets `enabled` back to true. Both are written whole (a temp file renamed into place,
+never through a symlink) under a lock.
+
+### Changing it from a device
+
+With the start key (Face ID; the plan key is refused with `no_grant`), a device sends one change alone, `{"v":1,
+"<change>": {…}}`, on the same `tailshare-start` channel as a dry run:
+
+| change | does |
+|---|---|
+| `{"enable": {}}` | turns starting on, as above |
+| `{"add_root": {"folder": "/Users/me/Work"}}` | adds a root: an absolute folder held to the same rules as a squad folder outside the roots (docs/squads.md, "Starting a member"): a plain folder of this user in the home folder, not the home folder, `~/Library`, a hidden folder of the home folder or a `.git` folder, with no symlink on the path and nobody else able to write to it or a folder above it. Nothing changes if a root already covers it. |
+| `{"allow": {"kind": "codex"}}` | allows an agent, with every option but `skip_permissions` |
+| `{"allow": {"kind": "claude", "option": "effort"}}` | allows one more option of an allowed agent |
+
+The answer is `{"v":1, "ok":true, "start":{…}}` with the new /hello `start` block, or a refusal with a `fix`.
+Changes count against the key's confirm rate. A device never changes `skip_permissions`, `auto`, `bin`,
+`models` or `max_running`, and never allows the `skip_permissions` option (`not_allowed`, fix `terminal`):
+skipping stays a person's choice at the machine.
+
+On the owner's devices, a machine where starting is off sends `start_off` in /hello in place of `start`: the
+refusal it would give, with its fix, e.g. `{"error":"off","reason":"…","fix":{"action":"enable_start"}}`. A tagged
+machine sends neither.
 
 ```json
 {
@@ -191,6 +223,26 @@ so the app can label it. Without `auto: true` it is refused (`not_allowed`, fiel
 | `root` | tailshare runs as root here |
 | `failed` | tmux refused; `reason` says why |
 | `no_bus` | the bus is not running on this host (or did not say its name), so nothing was planned or launched |
+
+### Fixes
+
+Every refusal, at the top or in a result, carries `fix`: what the app may offer as one tap. `action` is one of:
+
+| action | the app | from |
+|---|---|---|
+| `enable_start` | sends `{"enable":{}}` | `off` with no start.json, or `"enabled": false` |
+| `add_root` | sends `{"add_root":{"folder": fix.folder}}`; without `folder`, asks for one first | a folder or `add_dirs` entry outside the roots, or `off` with field `roots` |
+| `allow_kind` | sends `{"allow":{"kind": fix.kind}}`; without `kind`, asks which | `not_allowed` kind, or `off` with field `kinds` |
+| `allow_option` | sends `{"allow":{"kind": fix.kind, "option": fix.option}}` | `not_allowed` option |
+| `retry` | waits `fix.after` seconds | `rate` |
+| `dry_run_again` | dry-runs the same starts again | `expired`, `unknown_plan`, `changed` |
+| `close_sessions` | offers to close running sessions | `limit` |
+| `open_session` | opens the running member | `running` for a squad member |
+| `terminal` | says it needs the person at that machine; `fix.command` when there is one | skipping or auto mode the machine or key does not allow, `not_installed`, `no_tmux`, `root`, `no_bus` (`tailshare install`), a start.json that is not sound |
+| `none` | shows `reason` | anything else (a malformed request, a folder that does not exist) |
+
+A refusal outside the roots also says `folder`: the resolved path, as the device sent it. A `not_allowed` kind or
+option also says `kind` (and `option`).
 
 ## Reopening a dead session
 

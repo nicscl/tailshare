@@ -293,7 +293,8 @@ class Close(Base):
             self.assertEqual(out["results"], [{"session_id": S1, "closed": True,
                                                "tmux": {"socket": sock, "pane": pane}}])
             self.assertEqual(start.handle({"v": 1, "close": ["nope"]}, "safe", key, "air", cfg_path, db)["results"],
-                             [{"session_id": "nope", "error": "bad_request", "field": "close", "reason": "a session id"}])
+                             [{"session_id": "nope", "error": "bad_request", "field": "close", "reason": "a session id",
+                              "fix": {"action": "none"}}])
             for _ in range(start.CONFIRMS_PER_MIN - 2):  # with the two above
                 start.handle({"v": 1, "close": [S2]}, "safe", key, "air", cfg_path, db)
             self.assertEqual(start.handle(doc, "safe", key, "air", cfg_path, db)["error"], "rate")

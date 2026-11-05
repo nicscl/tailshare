@@ -139,6 +139,116 @@ class Config(Base):
         self.assertEqual(start.folders(), [str(self.root / "app"), str(self.root / "lib"), str(self.root / "app" / "src")])
 
 
+class FromADevice(Base):
+    """A device's start key turns starting on and widens it a step at a time; never skipping (docs/start.md)."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp / "home"
+        (self.home / "Projects").mkdir(parents=True)
+        (self.home / "work" / "repo").mkdir(parents=True)
+        (self.home / ".ssh").mkdir()
+        p = mock.patch.object(start, "_home", return_value=str(self.home))
+        p.start()
+        self.addCleanup(p.stop)
+        self.path = self.state / "start.json"
+
+    def op(self, name, arg=None, key=KEY, plan_only=False):
+        return start.handle({"v": 1, name: {} if arg is None else arg}, "safe", key, "air", plan_only=plan_only,
+                            owner="nick@example.com")
+
+    def test_enable_writes_the_defaults_once(self):
+        self.path.unlink()
+        self.assertEqual(self.call({"v": 1, "dry_run": True, "starts": [self.item()]})["fix"],
+                         {"action": "enable_start"})
+        self.assertEqual(start.off_reason()["fix"], {"action": "enable_start"})
+        out = self.op("enable")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["start"]["kinds"], ["claude", "codex"])
+        self.assertFalse(out["start"]["skip"])
+        self.assertEqual(oct(self.path.stat().st_mode & 0o777), "0o600")
+        d = json.loads(self.path.read_text())
+        self.assertEqual((d["roots"], d["skip_permissions"], d["auto"]), ([str(self.home / "Projects")], False, False))
+        self.assertNotIn("skip_permissions", d["kinds"]["claude"]["options"] + d["kinds"]["codex"]["options"])
+        self.assertIsNone(start.off_reason())
+        before = self.path.read_text()
+        self.assertTrue(self.op("enable")["ok"])  # on already: nothing changes
+        self.assertEqual(self.path.read_text(), before)
+        self.assertEqual(sorted(p.name for p in self.state.iterdir() if "start.json" in p.name and p.name != "start.json"
+                                and not p.name.endswith(".lock")), [])  # no temp file left
+
+    def test_enable_turns_a_disabled_file_back_on_and_keeps_the_rest(self):
+        d = self.config(enabled=False, max_running=7)
+        self.assertTrue(self.op("enable")["ok"])
+        self.assertEqual(json.loads(self.path.read_text()), {**d, "enabled": True})
+
+    def test_only_the_start_key_and_a_sound_file(self):
+        self.path.unlink()
+        self.assertEqual(self.op("enable", plan_only=True)["error"], "no_grant")
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.op("enable", {"roots": ["/"]})["error"], "bad_request")
+        self.assertEqual(start.handle({"v": 1, "enable": {}, "starts": []}, "safe", KEY, "air")["error"], "bad_request")
+        self.config()
+        self.path.chmod(0o620)
+        out = self.op("allow", {"kind": "codex"})
+        self.assertEqual((out["error"], out["fix"]), ("off", {"action": "terminal"}))
+        self.path.unlink()
+        (self.tmp / "elsewhere.json").write_text("{}")
+        self.path.symlink_to(self.tmp / "elsewhere.json")
+        self.assertEqual(self.op("enable")["error"], "off")  # never through a symlink
+        self.assertEqual((self.tmp / "elsewhere.json").read_text(), "{}")
+        self.assertEqual(start.handle({"v": 1, "enable": {}}, "nope", KEY, "air")["error"], "no_grant")
+
+    def test_add_root(self):
+        p = mock.patch.object(start, "CONFIRMS_PER_MIN", 100)
+        p.start()
+        self.addCleanup(p.stop)
+        self.config(roots=[])
+        out = self.call({"v": 1, "dry_run": True, "starts": [self.item()]})
+        self.assertEqual((out["error"], out["field"], out["fix"]), ("off", "roots", {"action": "add_root"}))
+        repo = str((self.home / "work" / "repo").resolve())
+        self.assertTrue(self.op("add_root", {"folder": repo})["ok"])
+        self.assertTrue(self.op("add_root", {"folder": repo})["ok"])
+        self.assertEqual(json.loads(self.path.read_text())["roots"], [repo])  # once
+        (self.home / "work" / "repo" / ".git" / "hooks").mkdir(parents=True)
+        for bad in (str(self.home / ".ssh"), str(self.home), "/", "relative", repo + "/.git/hooks"):
+            self.assertIn(self.op("add_root", {"folder": bad})["error"], ("not_allowed", "bad_request"), bad)
+        self.assertEqual(self.op("add_root", {"folder": repo, "x": 1})["error"], "bad_request")
+        self.assertEqual(json.loads(self.path.read_text())["roots"], [repo])
+        self.path.unlink()
+        self.assertEqual(self.op("add_root", {"folder": repo})["fix"], {"action": "enable_start"})
+
+    def test_allow_kind_and_option_never_skip(self):
+        self.config(kinds={"claude": {"bin": str(self.bin / "claude"), "options": ["model"]}})
+        r = self.dry(self.item(kind="codex"))[0]
+        self.assertEqual(r["fix"], {"action": "allow_kind", "kind": "codex"})
+        r = self.dry(self.item(options={"effort": "high"}))[0]
+        self.assertEqual(r["fix"], {"action": "allow_option", "kind": "claude", "option": "effort"})
+        self.assertTrue(self.op("allow", {"kind": "codex"})["ok"])
+        self.assertTrue(self.op("allow", {"kind": "claude", "option": "effort"})["ok"])
+        d = json.loads(self.path.read_text())
+        self.assertEqual(d["kinds"]["claude"], {"bin": str(self.bin / "claude"), "options": ["model", "effort"]})
+        self.assertEqual(d["kinds"]["codex"]["options"], start.DEFAULT_OPTIONS["codex"])
+        out = self.op("allow", {"kind": "claude", "option": "skip_permissions"})
+        self.assertEqual((out["error"], out["fix"]), ("not_allowed", {"action": "terminal"}))
+        self.assertEqual(self.op("allow", {"kind": "nope"})["error"], "bad_request")
+        self.assertEqual(self.op("allow", {"kind": "claude", "option": "nope"})["error"], "bad_request")
+        self.assertEqual(json.loads(self.path.read_text())["skip_permissions"], True)  # as the person wrote it
+
+    def test_every_refusal_has_a_fix(self):
+        r = self.dry(self.item(cwd=str(self.tmp)))[0]
+        self.assertEqual(r["fix"], {"action": "add_root", "folder": str(self.tmp)})
+        self.config(skip_permissions=False)
+        r = self.dry(self.item(options={"skip_permissions": True}))[0]
+        self.assertEqual(r["fix"], {"action": "terminal"})
+        self.assertEqual(self.dry(self.item(name=""))[0]["fix"], {"action": "none"})
+        self.assertEqual(self.confirm("0" * 32)["results"][0]["fix"], {"action": "dry_run_again"})
+        for _ in range(start.CONFIRMS_PER_MIN):
+            self.op("enable")
+        out = self.op("enable")
+        self.assertEqual((out["error"], out["fix"]["action"]), ("rate", "retry"))
+
+
 class Plans(Base):
     def refused(self, item, grant="safe"):
         r = self.dry(item, grant=grant)[0]
