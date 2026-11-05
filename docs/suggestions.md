@@ -40,6 +40,10 @@ same nonce, from the same agent (its address, so it survives a resume), in the s
 
 CLI: `tailshare squad suggest … --nonce <key>`; MCP: the `squad` tool's `nonce`.
 
+The nonce is not a secret: every view shows it. "The same agent" is its address, and an address is reused once
+the session holding it is no longer running, so a later session with the same name that reads the nonce can
+replace that pending suggestion. Nothing applies without the owner either way: the owner sees the replacement.
+
 `base` is the top-level `version` from `GET /squads/<id>` (beside `squad`, not inside it).
 It is the squad's checksum, the one machines already compare (`squad_sums` in /hello), so it is the same on every machine of the
 owner. If `base` is not the current version, the suggestion is refused with 409 `stale`.
@@ -74,7 +78,7 @@ Answer: `200 {suggestion}`.
 **Limits.**
 - Per squad: 20 pending. Stale suggestions do not consume pending quotas.
 - Per agent: 3 pending across squads, and 10 new suggestions an hour (including ones now stale). One that
-  replaces a pending one does not add to the 3.
+  replaces a pending one does not add to the 3, but it does count toward the 10 an hour.
 - A suggestion expires 7 days after it is made.
 - A second suggestion with the same `base` and `ops` as a pending one returns that pending one.
 
