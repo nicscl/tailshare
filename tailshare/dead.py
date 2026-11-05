@@ -112,9 +112,13 @@ def rows(db: Path | None = None, now: float | None = None) -> list[dict]:
         if not (_pane_gone(t, cache) or held.get((t["socket"], t["pane"]), 0) > a["last_seen"]):
             continue
         name = _clean(a["session"] or "", 256)
+        st = _json(a["state"])
+        ended = isinstance(st, dict) and st.get("v") == "ended"  # SessionEnd or Close; else its pane just went
+        at = st.get("at") if ended else None
         out.append({"id": sid, "kind": a["harness"], "address": a["address"], "name": name,
                     "folder": Path(a["cwd"] or "").name, "cwd": a["cwd"] or "", "title": _clean(name, TITLE_MAX),
-                    "squad": squad or None, "last_seen": round(float(a["last_seen"]), 3)})
+                    "squad": squad or None, "last_seen": round(float(a["last_seen"]), 3), "ended": ended,
+                    **({"ended_at": round(float(at), 3)} if isinstance(at, (int, float)) else {})})
         if len(out) >= LIMIT:
             break
     return out

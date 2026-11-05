@@ -258,8 +258,12 @@ sessions this machine ran in the last 7 days whose tmux pane is gone (or taken b
 {"host": "macbook-air", "max_age": 604800, "limit": 50, "sessions": [
   {"id": "<session uuid>", "kind": "claude", "address": "macbook-air/claude/app/appdev", "name": "AppDev",
    "folder": "app", "cwd": "/Users/me/projects/app", "title": "AppDev", "squad": {"id": "…", "member": "…"} | null,
-   "last_seen": 1793390000.0, "resumable": true}]}
+   "last_seen": 1793390000.0, "ended": false, "resumable": true}]}
 ```
+
+- `ended` is true when the session ended (its SessionEnd hook, or Close from a device), with `ended_at`, epoch
+  seconds. It is false when the pane went without that: a crash, a killed server or a `kill-pane`, which is what
+  the revive watchdog reopens. Older tailshare leaves it out.
 
 - `last_seen` is epoch seconds. `name` is the session's name (`--name` or `/rename`), which a reopen keeps; `title`
   is the same, at most 120 characters.
