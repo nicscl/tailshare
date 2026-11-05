@@ -219,8 +219,9 @@ def defaults() -> dict:
             "kinds": {k: {"options": list(v)} for k, v in DEFAULT_OPTIONS.items()}}
 
 
-def change_config(op: str, arg: object, path: Path | None = None) -> None:
-    """One config change from a device's start key. Raises Refused with a fix when it cannot be made."""
+def change_config(op: str, arg: object, path: Path | None = None, by_person: bool = False) -> None:
+    """One config change from a device's start key (`by_person`: from `tailshare start` in a person's terminal, the
+    only way to `lock` or `unlock`). Raises Refused with a fix when it cannot be made."""
     path = path or config_path()
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         raise Refused("root", reason="tailshare never starts sessions as root")
@@ -237,6 +238,17 @@ def change_config(op: str, arg: object, path: Path | None = None) -> None:
     with os.fdopen(fd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         d = _read_raw(path)
+        if op in ("lock", "unlock"):
+            if not by_person:
+                raise Refused("not_allowed", op, "only a person at this machine locks or unlocks start.json", fix=_BY_HAND)
+            if op == "lock" and (d is None or d.get("locked") is not True):
+                _write(path, {**(d or {"enabled": False}), "locked": True}, create=d is None)
+            elif op == "unlock" and d is not None and "locked" in d:
+                _write(path, {k: v for k, v in d.items() if k != "locked"})
+            return
+        if not by_person and d is not None and d.get("locked") is True:
+            raise Refused("not_allowed", "locked", "a person at this machine locked start.json: only "
+                          "`tailshare start unlock` there lets devices change it again", fix=_BY_HAND)
         if op == "enable":
             if arg:
                 raise Refused("bad_request", "enable", "takes no fields")
@@ -1412,6 +1424,10 @@ def _cmd_start(args) -> None:
         op, arg, says = "enable", {}, (f"turn on starting sessions from your devices, with {config_path()}: "
                                        + json.dumps(defaults(), indent=2) if not config_path().exists()
                                        else f"set enabled: true in {config_path()}")
+    elif how in ("lock", "unlock"):
+        op, arg = how, {}
+        says = ("stop your devices from changing start.json (enable, add-root, allow); you can still change it here"
+                if how == "lock" else "let your devices change start.json again")
     elif how == "add-root":
         op, arg, says = "add_root", {"folder": os.path.abspath(args.folder)}, \
             f"let your devices start sessions in {os.path.abspath(args.folder)} and below"
@@ -1424,7 +1440,7 @@ def _cmd_start(args) -> None:
         print("No changes.")
         return
     try:
-        change_config(op, arg)
+        change_config(op, arg, by_person=True)
     except Refused as e:
         raise ValueError(str(e.out.get("reason") or e.out["error"])) from None
     print("Done.")
@@ -1434,6 +1450,8 @@ def add_parser(sub) -> None:
     p = sub.add_parser("start", help="starting sessions from your devices: show, or turn on (docs/start.md)")
     s = p.add_subparsers(dest="how")
     s.add_parser("enable", help="turn it on, with safe defaults if there is no start.json (in your own terminal)")
+    s.add_parser("lock", help="stop devices from changing start.json, even turning it back on (in your own terminal)")
+    s.add_parser("unlock", help="let devices change start.json again (in your own terminal)")
     q = s.add_parser("add-root", help="allow one more folder (in your own terminal)")
     q.add_argument("folder")
     q = s.add_parser("allow", help="allow an agent, or one of its options (in your own terminal)")

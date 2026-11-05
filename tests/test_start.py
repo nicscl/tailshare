@@ -202,6 +202,28 @@ class FromADevice(Base):
         self.assertEqual((out["error"], out["fix"]), ("off", {"action": "terminal"}), out)
         self.assertFalse(target.exists())
 
+    def test_a_locked_file_only_a_person_changes(self):
+        self.config(enabled=False)
+        start.change_config("lock", {}, by_person=True)
+        for name, arg in (("enable", None), ("add_root", {"folder": str(self.home / "work" / "repo")}),
+                          ("allow", {"kind": "codex"})):
+            out = self.op(name, arg)
+            self.assertEqual((out["error"], out["fix"]), ("not_allowed", {"action": "terminal"}), (name, out))
+        for name in ("lock", "unlock"):  # not a device's change at all
+            self.assertNotIn("ok", self.op(name))
+            with self.assertRaises(start.Refused):
+                start.change_config(name, {})
+        d = json.loads(self.path.read_text())
+        self.assertEqual((d["enabled"], d["locked"]), (False, True))
+        start.change_config("enable", {}, by_person=True)  # the person at the machine still can
+        start.change_config("unlock", {}, by_person=True)
+        self.assertNotIn("locked", json.loads(self.path.read_text()))
+        self.assertTrue(self.op("allow", {"kind": "codex"})["ok"])
+        self.path.unlink()  # locking a machine with no start.json keeps it off
+        start.change_config("lock", {}, by_person=True)
+        self.assertEqual(json.loads(self.path.read_text()), {"enabled": False, "locked": True})
+        self.assertEqual(self.op("enable")["error"], "not_allowed")
+
     def test_enable_turns_a_disabled_file_back_on_and_keeps_the_rest(self):
         d = self.config(enabled=False, max_running=7)
         self.assertTrue(self.op("enable")["ok"])

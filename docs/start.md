@@ -45,6 +45,12 @@ On the owner's devices, a machine where starting is off sends `start_off` in /he
 refusal it would give, with its fix, e.g. `{"error":"off","reason":"…","fix":{"action":"enable_start"}}`. A tagged
 machine sends neither.
 
+**Locked (proposal, not merged).** `tailshare start lock`, in your own terminal, sets `"locked": true` in
+start.json (creating `{"enabled": false, "locked": true}` if there is none). Devices then cannot change it at all,
+not even `enable` on a machine you turned off: the refusal is `not_allowed` with the `terminal` fix. You can still
+change it from that terminal; `tailshare start unlock` lets devices change it again. A device can never lock or
+unlock.
+
 ```json
 {
   "enabled": true,
