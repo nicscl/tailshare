@@ -186,10 +186,11 @@ def load_config(path: Path | None = None) -> dict | None:
 #
 # The owner's device may turn starting on and widen it a step at a time, with the start key (Face ID on each use,
 # never the plan key): `{"v":1,"enable":{}}`, `{"v":1,"add_root":{"folder":…}}`, `{"v":1,"allow":{"kind":…}}` or
-# `{"v":1,"allow":{"kind":…,"option":…}}`. Never skip_permissions, auto, bin, models or max_running: those stay a
+# `{"v":1,"allow":{"kind":…,"option":…}}`, and `{"v":1,"revive":{"on":true|false}}` (the revive watchdog: it
+# never reopens with more than the start key that approved a session may do now). Never skip_permissions, auto, bin, models or max_running: those stay a
 # person's at the machine (docs/start.md, "Turning it on").
 
-CONFIG_OPS = ("enable", "add_root", "allow")
+CONFIG_OPS = ("enable", "add_root", "allow", "revive")
 DEFAULT_OPTIONS = {  # every option but skip_permissions; permission modes stay inside the host's skip and auto
     "claude": ["permission_mode", "model", "effort", "resume", "add_dirs"],
     "codex": ["approval", "sandbox", "model", "effort", "resume", "add_dirs"],
@@ -232,6 +233,12 @@ def change_config(op: str, arg: object, path: Path | None = None) -> None:
             return
         if d is None:
             raise Refused("off", reason="starting sessions is off on this host", fix={"action": "enable_start"})
+        if op == "revive":
+            if set(arg) != {"on"} or not isinstance(arg["on"], bool):
+                raise Refused("bad_request", "revive.on", "takes {\"on\": true|false}")
+            if (d.get("revive") is not False) != arg["on"]:
+                _write(path, {**d, "revive": arg["on"]})
+            return
         if op == "add_root":
             if set(arg) != {"folder"}:
                 raise Refused("bad_request", "add_root")
@@ -334,6 +341,37 @@ def off_reason(path: Path | None = None) -> dict | None:
     return None
 
 
+def revive_stopped() -> list[dict]:
+    """Sessions the revive watchdog stopped reopening (revive.py), for the owner's devices: the last 24 hours, until
+    the session is reopened or ends. why: session (its hourly cap), host (the host's), key (its start key)."""
+    try:
+        con = _db()
+        try:
+            return [dict(r) for r in con.execute("SELECT session, name, crashes, at, why FROM revive_stopped ORDER BY at")]
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return []
+
+
+def revived(sessions: list[str], now: float | None = None) -> dict[str, dict]:
+    """{session: {at, count}} for sessions the watchdog reopened: the last reopen, and how many in the last hour."""
+    now = time.time() if now is None else now
+    if not sessions:
+        return {}
+    try:
+        con = _db()
+        try:
+            q = ",".join("?" * len(sessions))
+            rows = con.execute(f"SELECT session, MAX(at) AS at, SUM(at>?) AS n FROM revives WHERE session IN ({q}) "
+                               "GROUP BY session", (now - 3600, *sessions)).fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return {}
+    return {r["session"]: {"at": r["at"], "count": int(r["n"] or 0)} for r in rows}
+
+
 def capabilities(path: Path | None = None, owner: str = "") -> dict | None:
     """The /hello `start` block for the owner's devices: what this host takes, never its folders."""
     try:
@@ -344,6 +382,9 @@ def capabilities(path: Path | None = None, owner: str = "") -> dict | None:
         return None
     out = {"kinds": sorted(cfg["kinds"]), "options": {k: v["options"] for k, v in sorted(cfg["kinds"].items())},
            "skip": cfg["skip_permissions"], "revive": cfg["revive"]}
+    stopped = revive_stopped()
+    if stopped:  # absent: none
+        out["revive_stopped"] = stopped
     if "permission_mode" in cfg["kinds"].get("claude", {}).get("options", []):
         # the values a device may pick: auto only where this host allows it, bypassPermissions only with skip
         out["permission_modes"] = {"claude": [m for m in KINDS["claude"]["permission_mode"][1]
@@ -876,6 +917,8 @@ CREATE TABLE IF NOT EXISTS launched(session TEXT PRIMARY KEY, options TEXT NOT N
 CREATE TABLE IF NOT EXISTS revives(session TEXT NOT NULL, socket TEXT NOT NULL, at REAL NOT NULL,
   weight INTEGER NOT NULL, host_event INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS revive_flags(key TEXT PRIMARY KEY, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS revive_stopped(session TEXT PRIMARY KEY, name TEXT NOT NULL, crashes INTEGER NOT NULL,
+  at REAL NOT NULL, why TEXT NOT NULL);
 """
 
 
@@ -898,6 +941,7 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
                 (now, now - KEEP))
     con.execute("DELETE FROM confirms WHERE at<?", (now - 60,))
     con.execute("DELETE FROM revives WHERE at<?", (now - 86400,))
+    con.execute("DELETE FROM revive_stopped WHERE at<?", (now - 86400,))
     con.execute("DELETE FROM launched WHERE at<?", (now - 30 * 86400,))
     return con
 
