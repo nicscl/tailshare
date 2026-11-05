@@ -75,7 +75,7 @@ class Writing(Base):
     def test_cleaning_and_caps(self):
         r = self.write("m2", bio="ok\u202e\x07\nline\u2028two", now=["a\u200f\tb\u2028c\u2029d\u3000e"])
         self.assertEqual((r["bio"], r["now"][0]["title"]), ("ok\nline\ntwo", "abcd\u3000e"))
-        for f in [{"bio": "x" * 601}, {"now": ["a"] * 4}, {"next": ["a"] * 6}, {"now": [""]}, {"now": ["x" * 81]},
+        for f in [{"bio": "x" * 601}, {"now": ["a"] * 4}, {"next": ["a"] * 6}, {"now": [""]},
                   {"now": [{"title": "a", "extra": 1}]}, {"bio": 3}, {"notes": "x" * 8193},
                   {"waiting_on": {"member": "m0"}}, {"waiting_on": {"member": "../x", "text": "t"}},
                   {"waiting_on": {"member": "m2", "text": "me"}}, {"waiting_on": "owner"}, {"done": ["d"] * 21}]:
@@ -102,6 +102,27 @@ class Writing(Base):
         self.assertEqual(r["done"][0]["at"], first)  # echoed back, it keeps its time
         with mock.patch.object(time, "time", return_value=t0 + reports.KEEP + 60):
             self.assertEqual(self.r.view(self.m.squads.squad("sq"), "m2")["done"], [])  # only the last 24 h
+
+
+    def test_an_over_long_task_title_is_shortened_not_refused(self):
+        d = self.r.route("POST", "/report", {"agent": "s-m2", "now": ["x" * 95, {"title": "ok"}], "next": ["y" * 81]},
+                         True, "127.0.0.1", {})
+        self.assertEqual(d["cut"], ["now.0.title", "next.0.title"])
+        t = d["report"]["now"][0]["title"]
+        self.assertEqual((len(t), t[-1], d["report"]["now"][1]["title"]), (reports.TITLE_MAX, "…", "ok"))
+        self.assertNotIn("cut", self.r.route("POST", "/report", {"agent": "s-m2", "now": ["short"]}, True, "127.0.0.1", {}))
+        self.assertIn("bio", self.bad("m2", bio="b" * (reports.BIO_MAX + 1))["field"])  # other limits still refuse
+
+    def test_a_session_started_by_hand_reports_as_the_member_it_is_named_after(self):
+        self.m.bus.store.x("UPDATE agents SET last_seen=0 WHERE id='s-m3'")  # Solo's tagged session is gone
+        self.assertEqual(reg(self.m.bus, "h1", "x", session="Solo", cwd="/u/manager")["squad"] or {}, {})  # not its folder
+        self.assertEqual(reg(self.m.bus, "h2", "x", session="Someone", cwd="/u/solo")["squad"] or {}, {})  # not its name
+        self.assertEqual(reg(self.m.bus, "h3", "x", session="Solo", cwd="/u/solo", harness="codex")["squad"] or {}, {})
+        self.assertEqual(reg(self.m.bus, "h4", "x", session="solo", cwd="/u/solo")["squad"], {"id": "sq", "member": "m3"})
+        self.assertEqual(self.r.route("POST", "/report", {"agent": "h4", "now": ["by hand"]}, True, "127.0.0.1",
+                                      {})["report"]["member"], "m3")
+        self.assertEqual(reg(self.m.bus, "h5", "x", session="Solo", cwd="/u/solo")["squad"] or {}, {})  # h4 is it now
+        self.assertEqual(reg(self.m.bus, "h6", "x", session="Remote", cwd="/u/remote")["squad"] or {}, {})  # on pro
 
 
 class Blockers(Base):
@@ -269,6 +290,19 @@ class Cli(unittest.TestCase):
         self.assertIsNone(reports_cli._who("none"))
         with self.assertRaises(ValueError):
             reports_cli._who("owner")
+
+    def test_short_output_after_a_write(self):
+        r = {"now": [{"title": "A"}], "next": [{"title": "B"}], "done": [{"title": "C", "at": 0}],
+             "blockers": [{"id": "q1", "kind": "question", "to": "owner", "title": "Open?", "options": ["yes", "no"],
+                           "resolved_at": None},
+                          {"id": "q0", "kind": "question", "to": "owner", "title": "Old", "options": ["x"], "why": "w",
+                           "resolved_at": 1}]}
+        self.assertEqual(reports_cli.format_short(r, "set now"),
+                         "✓ set now\n  now: A\n  next: B\n  open blocker q1 (to owner): Open?")
+        p = __import__("argparse").ArgumentParser()
+        reports_cli.add_parser(p.add_subparsers())
+        self.assertTrue(p.parse_args(["report", "set", "--now", "x", "--full"]).full)
+        self.assertFalse(p.parse_args(["report", "done", "x"]).full)
 
     def test_how_names_only_real_commands(self):
         p = __import__("argparse").ArgumentParser()

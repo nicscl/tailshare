@@ -31,8 +31,12 @@ def _mine(me: dict) -> dict:
     return agent.call(f"/report?agent={me['id']}")
 
 
-def _write(me: dict, fields: dict) -> dict:
-    return agent.call("/report", {"agent": me["id"], **fields})["report"]
+def _write(me: dict, fields: dict, args, what: str) -> None:
+    """Write, then say what changed and what is open now (the whole report with --full)."""
+    d = agent.call("/report", {"agent": me["id"], **fields})
+    for f in d.get("cut") or []:
+        print(f"note: {f} was over 80 characters, so it was shortened", file=sys.stderr)
+    print(format_report(d["report"]) if getattr(args, "full", False) else format_short(d["report"], what))
 
 
 def _task(s: str) -> dict:
@@ -94,6 +98,16 @@ def format_report(r: dict) -> str:
     return "\n".join(out)
 
 
+def format_short(r: dict, what: str) -> str:
+    """✓ what changed, then only what is current: now, next and open blockers (no resolved ones, no options)."""
+    out = [f"✓ {what}"]
+    for k in ("now", "next"):
+        out += [f"  {k}: {t['title']}" for t in r.get(k) or []]
+    out += [f"  open blocker {b['id']} (to {b['to']}): {b['title']}" for b in r.get("blockers") or []
+            if not b.get("resolved_at")]
+    return "\n".join(out)
+
+
 @_run
 def cmd_show(args):
     d = _mine(_me())
@@ -121,7 +135,7 @@ def cmd_set(args):
         f["notes"] = _read(args.notes_file)
     if not f:
         raise ValueError("nothing to set: see `tailshare report set -h`")
-    print(format_report(_write(me, f)))
+    _write(me, f, args, "set " + ", ".join(f))
 
 
 @_run
@@ -131,7 +145,7 @@ def cmd_done(args):
     t = _task(args.task)
     now = [x for x in r.get("now") or [] if x["title"] != t["title"]]
     done = [x for x in r.get("done") or [] if x["title"] != t["title"]] + [t]
-    print(format_report(_write(me, {"now": now, "done": done[-20:]})))
+    _write(me, {"now": now, "done": done[-20:]}, args, f"done: {t['title']}")
 
 
 @_run
@@ -151,8 +165,10 @@ def cmd_block(args):
         b.update(kind="approval", approval={"type": "key_enroll", "host": host, "request_id": rid})
     if args.structure:
         b.update(kind="approval", approval={"type": "squad_structure", "reports_to": json.loads(_read(args.structure))})
-    rest = [x for x in _blockers(me) if x["id"] != args.id]
-    print(format_report(_write(me, {"blockers": rest + [b]})))
+    have = _blockers(me)
+    rest = [x for x in have if x["id"] != args.id]
+    _write(me, {"blockers": rest + [b]}, args, f"blocker {args.id} {'updated' if len(rest) < len(have) else 'raised'}, "
+                                               f"to {args.to}")
 
 
 @_run
@@ -165,7 +181,7 @@ def cmd_resolve(args):
         bs = [x for x in bs if x["id"] != args.id]
     else:
         bs = [{**x, "resolved": True} if x["id"] == args.id else x for x in bs]
-    print(format_report(_write(me, {"blockers": bs})))
+    _write(me, {"blockers": bs}, args, f"blocker {args.id} {'dropped' if args.drop else 'resolved'}")
 
 
 @_run
@@ -196,9 +212,11 @@ def add_parser(sub) -> None:
     q.add_argument("--waiting-on", help='MEMBER:TEXT, owner:TEXT, or "none"')
     q.add_argument("--notes-file", help="Markdown notes (leads), or - for stdin")
     q.add_argument("--json", help="fields as JSON, from a file or - for stdin")
+    q.add_argument("--full", action="store_true", help="print the whole report after")
     q.set_defaults(fn=cmd_set)
     q = s.add_parser("done", help="move a task to done")
     q.add_argument("task")
+    q.add_argument("--full", action="store_true", help="print the whole report after")
     q.set_defaults(fn=cmd_done)
     q = s.add_parser("block", help="raise a blocker (or update one with the same id)")
     q.add_argument("id")
@@ -209,10 +227,12 @@ def add_parser(sub) -> None:
     q.add_argument("--for", dest="for_", help="MEMBER:BLOCKER, when a lead relays a member's blocker")
     q.add_argument("--key", help="HOST:REQUEST_ID: a key the owner should approve on that machine")
     q.add_argument("--structure", help='a {member: lead|null} JSON file (or -): a proposed tree, from a top member')
+    q.add_argument("--full", action="store_true", help="print the whole report after")
     q.set_defaults(fn=cmd_block)
     q = s.add_parser("resolve", help="mark a blocker resolved")
     q.add_argument("id")
     q.add_argument("--drop", action="store_true", help="remove it instead")
+    q.add_argument("--full", action="store_true", help="print the whole report after")
     q.set_defaults(fn=cmd_resolve)
     q = s.add_parser("ls", help="your squad's reports, from every machine")
     q.add_argument("--squad")

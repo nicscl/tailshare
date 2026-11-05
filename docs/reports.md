@@ -7,8 +7,13 @@ instead of every session.
 ## Writing one
 
 A member writes only its own report, through the local bus. The bus finds the member from the agent's squad tag
-(see "Agents" in squads.md), never from the request. An agent that `tailshare start` didn't start as a member, or
-that isn't running, gets `409 not_a_member`.
+(see "Agents" in squads.md), never from the request. An agent that isn't running, or isn't a member, gets
+`409 not_a_member`.
+
+A session started by hand (plain `claude` or `codex`, so no tag in its environment) still counts as a member when
+exactly one member of the owner's squads matches it on this machine. The match needs the same kind, the same folder
+(real path) and the same name: the session's name, as a slug, equals the member's. The same check as a tag then
+applies, so no other live agent may already be that member. Name the session after its member (`/rename`) to report.
 
 ```
 tailshare report set --bio "AppDev: the iOS app." --now "Squad page https://github.com/nicscl/tailshare-hive/pull/253" --next "Blockers UI"
@@ -17,6 +22,10 @@ tailshare report block key-air --title "Enroll my key on air" --key air:3f2a91c0
 tailshare report resolve key-air
 tailshare report ls              # the whole squad, from every machine
 ```
+
+After a write the CLI prints one `✓` line for what changed, then your `now` and `next` tasks and your open blockers.
+Add `--full` to print the whole report, as `tailshare report` does. A task title over 80 characters is cut to 80, ending
+in `…`, rather than refused. The reply lists the fields it cut under `cut`, and the CLI prints a note for each one.
 
 The `report` MCP tool takes the same fields as JSON. With `squad: true` it reads the squad's reports instead.
 `tailshare start` appends a short "## Reporting" block to a member's instructions that says all this.
@@ -32,7 +41,7 @@ Fields, all optional. A write replaces the fields it names and keeps the others:
 | field | shape |
 |---|---|
 | `bio` | text, ≤ 600 characters |
-| `now`, `next`, `done` | up to 3, 5 and 20 tasks: `"title"` or `{title ≤ 80, url}` |
+| `now`, `next`, `done` | up to 3, 5 and 20 tasks: `"title"` or `{title ≤ 80, url}`; longer titles are cut |
 | `waiting_on` | `{member: <member id> \| "owner", text ≤ 120}` or `null` |
 | `blockers` | up to 8 open (see below) |
 | `notes` | Markdown, ≤ 8 KB. Shown only for a lead |
