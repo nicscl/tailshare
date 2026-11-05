@@ -589,7 +589,7 @@ class Starting(unittest.TestCase):
     def test_a_squad_folder_outside_the_roots(self):
         home = (self.m.tmp / "home").resolve()
         work = home / "LoggiProjects" / "mono"
-        for d in (work, home / ".ssh" / "x", home / "Library" / "x", home / "open" / "x"):
+        for d in (work / ".claude" / "worktrees" / "a", home / ".ssh" / "x", home / "Library" / "x", home / "open" / "x"):
             d.mkdir(parents=True)
         (home / "open").chmod(0o777)  # the leaf is fine, a folder above it is not
         (home / "link").symlink_to(home / "LoggiProjects")
@@ -597,7 +597,7 @@ class Starting(unittest.TestCase):
         p = mock.patch.object(start, "_home", return_value=str(home))
         p.start()
         self.addCleanup(p.stop)
-        folders = {"ok": work, "sym": home / "link" / "mono", "dot": home / ".ssh" / "x", "lib": home / "Library" / "x",
+        folders = {"ok": work, "wt": work / ".claude" / "worktrees" / "a", "sym": home / "link" / "mono", "dot": home / ".ssh" / "x", "lib": home / "Library" / "x",
                    "home": home, "open": home / "open" / "x", "out": self.m.tmp / "elsewhere",
                    "none": home / "nope"}
         if os.path.isdir(home / "library"):  # a case-insensitive file system: ~/library is ~/Library
@@ -606,11 +606,13 @@ class Starting(unittest.TestCase):
                                                for i, (k, f) in enumerate(folders.items())])
         plan = start.build({"squad": {"id": "sq3", "member": "ok"}}, self.cfg, "safe", "air")
         self.assertEqual(plan["cwd"], str(work))  # the squad names it: startable though outside roots
+        plan = start.build({"squad": {"id": "sq3", "member": "wt"}}, self.cfg, "safe", "air")
+        self.assertEqual(plan["cwd"], str(work / ".claude" / "worktrees" / "a"))  # a repo's own worktree
         with self.assertRaises(start.Refused) as c:  # the same folder without the squad: roots apply
             start.build({"kind": "claude", "cwd": str(work), "name": "x"}, self.cfg, "safe", "air")
         self.assertEqual((c.exception.out["error"], c.exception.out["field"]), ("not_allowed", "cwd"))
         for k in folders:
-            if k == "ok":
+            if k in ("ok", "wt"):
                 continue
             with self.assertRaises(start.Refused, msg=k) as c:
                 start.build({"squad": {"id": "sq3", "member": k}}, self.cfg, "safe", "air")

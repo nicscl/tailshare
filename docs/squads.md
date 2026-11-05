@@ -79,8 +79,10 @@ the request may not also set `kind`, `cwd`, `name`, `instructions` or `options`:
 The member's folder may be outside this machine's `roots`: the squad is the owner's (every write to it is signed,
 below), so a folder it names counts as the owner's choice. Outside the roots it must be a plain folder of this
 machine's user, checked again at confirm: exactly the path the squad names, with no symlink anywhere on it; inside
-the home folder but not the home folder itself, and so never `/`; not in `~/Library` or under a hidden folder
-(`~/.ssh`, `~/.tailshare`, `~/.claude`…); a folder owned by this user and not writable by group or others.
+the home folder but not the home folder itself, and so never `/`; not in `~/Library` (in any letter case) or in a
+hidden folder of the home folder (`~/.ssh`, `~/.tailshare`, `~/.claude`…), though a repository's own
+`.claude/worktrees/…` is fine; and it, and every folder above it up to the home folder, owned by this user and
+not writable by group or others.
 Otherwise it is refused `not_allowed`, field `cwd`, with the reason. This applies only to a start that names the
 squad member: a free start, and the member's `add_dirs`, stay inside the roots.
 

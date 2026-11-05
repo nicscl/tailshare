@@ -291,8 +291,8 @@ def _home() -> str:
 def _squad_folder(value: object, field: str = "cwd") -> str:
     """A squad member's folder outside start.json's roots. The squad is the owner's (signed writes, docs/squads.md),
     so its folder may start there, but only a plain folder of this user inside the home folder: exactly the path the
-    squad names (no symlink anywhere on it, no `..`), not the home folder itself, not ~/Library (in any case: APFS
-    ignores it) or under a hidden folder (~/.ssh, ~/.tailshare, ~/.claude...), and every folder from the home folder
+    squad names (no symlink anywhere on it, no `..`), not the home folder itself, not in ~/Library (in any case:
+    APFS ignores it) or a hidden folder of the home folder (~/.ssh, ~/.tailshare, ~/.claude...), and every folder from the home folder
     down to it this user's own and not writable by group or others, so nobody else can swap a link in before tmux
     starts there."""
     if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
@@ -314,7 +314,7 @@ def _squad_folder(value: object, field: str = "cwd") -> str:
         library = (lst.st_dev, lst.st_ino)
     except OSError:
         pass
-    if rel[0].casefold() == "library" or any(part.startswith(".") for part in rel):
+    if rel[0].casefold() == "library" or rel[0].startswith("."):  # a repo's own .claude/worktrees is fine
         raise Refused("not_allowed", field, "a squad folder may not be in ~/Library or a hidden folder")
     path = home
     for part in [""] + rel:
