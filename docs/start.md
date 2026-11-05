@@ -247,18 +247,19 @@ option also says `kind` (and `option`).
 ## Reopening a dead session
 
 `GET /bus/v1/sessions/dead` (devices of the machine's own tailnet user only, header `X-Tailshare: 1`) lists the agent
-sessions this machine ran in the last 7 days whose tmux pane is gone (or taken by a newer agent), newest first, at most
-50:
+sessions this machine ran in the last 7 days whose tmux pane is gone (or taken by a newer agent), newest first, a page
+at a time: `?limit=<n>` (1 to 200, default 50) and `?before=<last_seen>`, the `last_seen` of the last session of the
+previous page. `more` is true when older ones are left. Any of them can be reopened, on any page.
 
 ```json
-{"host": "macbook-air", "max_age": 604800, "limit": 50, "sessions": [
+{"host": "macbook-air", "max_age": 604800, "limit": 50, "more": false, "sessions": [
   {"id": "<session uuid>", "kind": "claude", "address": "macbook-air/claude/app/appdev", "name": "AppDev",
    "folder": "app", "cwd": "/Users/me/projects/app", "title": "AppDev", "squad": {"id": "…", "member": "…"} | null,
    "last_seen": 1793390000.0, "resumable": true}]}
 ```
 
 - `last_seen` is epoch seconds. `name` is the session's name (`--name` or `/rename`), which a reopen keeps; `title`
-  is the same, at most 120 characters.
+  is the same (both at most 256 characters; devices cut it for display).
 - Only sessions with an id to resume by (Claude's session uuid, Codex's thread id), never an agent that is online,
   and never one on a `ts-*` server that `tailshare start` did not make (ts-agents brings those back itself).
 - `resumable: false` comes with a `reason`: `kind` (only Claude sessions reopen), `off` (starting is off here, or

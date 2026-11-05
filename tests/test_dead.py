@@ -89,6 +89,27 @@ class Listing(Base):
         got = self.ids()
         self.assertEqual(len(got), dead.LIMIT)
         self.assertEqual(got[0], "0b0e0f2a-1c2d-4e5f-8a9b-000000000000")
+        self.assertTrue(dead.listing("air")["more"])
+        self.assertIsNotNone(dead.find(f"0b0e0f2a-1c2d-4e5f-8a9b-{dead.LIMIT + 4:012d}")[0])  # past the first page
+
+    def test_pages(self):
+        for i in range(7):
+            self.agent(f"0b0e0f2a-1c2d-4e5f-8a9b-{i:012d}", ago=600 + i)
+        seen, before = [], None
+        while True:
+            d = dead.listing("air", qs={"limit": "3", **({"before": str(before)} if before else {})})
+            seen += [r["id"] for r in d["sessions"]]
+            if not d["more"]:
+                break
+            before = d["sessions"][-1]["last_seen"]
+        self.assertEqual(seen, [f"0b0e0f2a-1c2d-4e5f-8a9b-{i:012d}" for i in range(7)])
+        self.assertEqual(dead.listing("air")["more"], False)
+        self.assertEqual(dead.find("0b0e0f2a-1c2d-4e5f-8a9b-000000000006")[0]["id"],
+                         "0b0e0f2a-1c2d-4e5f-8a9b-000000000006")
+        for bad in ({"limit": "0"}, {"limit": "201"}, {"limit": "x"}, {"before": "-1"}, {"before": "nan"}):
+            with self.subTest(bad), self.assertRaises(bus.BusError) as c:
+                dead.listing("air", qs=bad)
+            self.assertEqual(c.exception.code, 400)
 
     def test_reasons(self):
         self.agent(S1, harness="codex")
