@@ -586,6 +586,34 @@ class Starting(unittest.TestCase):
             start.build({"squad": {"id": "sq1", "member": "m1"}}, self.cfg, "safe", "air")
         self.assertEqual(c.exception.out["error"], "running")
 
+    def test_a_squad_folder_outside_the_roots(self):
+        home = (self.m.tmp / "home").resolve()
+        work = home / "LoggiProjects" / "mono"
+        for d in (work, home / ".ssh" / "x", home / "Library" / "x", home / "open"):
+            d.mkdir(parents=True)
+        (home / "open").chmod(0o777)
+        (home / "link").symlink_to(home / "LoggiProjects")
+        (self.m.tmp / "elsewhere").mkdir()
+        p = mock.patch.dict(os.environ, {"HOME": str(home)})
+        p.start()
+        self.addCleanup(p.stop)
+        folders = {"ok": work, "sym": home / "link" / "mono", "dot": home / ".ssh" / "x", "lib": home / "Library" / "x",
+                   "home": home, "open": home / "open", "out": self.m.tmp / "elsewhere",
+                   "none": home / "nope"}
+        self.m.put("sq3", name="Far", members=[{"id": k, **member(name=k.title(), folder=str(f), order=i)}
+                                               for i, (k, f) in enumerate(folders.items())])
+        plan = start.build({"squad": {"id": "sq3", "member": "ok"}}, self.cfg, "safe", "air")
+        self.assertEqual(plan["cwd"], str(work))  # the squad names it: startable though outside roots
+        with self.assertRaises(start.Refused) as c:  # the same folder without the squad: roots apply
+            start.build({"kind": "claude", "cwd": str(work), "name": "x"}, self.cfg, "safe", "air")
+        self.assertEqual((c.exception.out["error"], c.exception.out["field"]), ("not_allowed", "cwd"))
+        for k in folders:
+            if k == "ok":
+                continue
+            with self.assertRaises(start.Refused, msg=k) as c:
+                start.build({"squad": {"id": "sq3", "member": k}}, self.cfg, "safe", "air")
+            self.assertEqual((c.exception.out["error"], c.exception.out.get("field")), ("not_allowed", "cwd"), k)
+
     def test_a_claude_member_gets_a_session_id(self):
         con = start._db(self.m.tmp / "start.db")
         self.addCleanup(con.close)
