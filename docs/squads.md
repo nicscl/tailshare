@@ -74,8 +74,17 @@ A start request ([start.md](start.md)) may name a member instead of spelling out
 
 The machine reads the member from its own copy of the squad. The member's `host` must be this machine, and
 the request may not also set `kind`, `cwd`, `name`, `instructions` or `options`: those come from the squad. A
-`prompt` in the request replaces the squad's. The folder must still be inside this machine's `roots`, and
-every option must still be allowed by its `start.json`: a squad never widens what a machine accepts.
+`prompt` in the request replaces the squad's. Every option must still be allowed by this machine's `start.json`.
+
+The member's folder may be outside this machine's `roots`: the squad is the owner's (every write to it is signed,
+below), so a folder it names counts as the owner's choice. Outside the roots it must be a plain folder of this
+machine's user, checked again at confirm: exactly the path the squad names, with no symlink anywhere on it; inside
+the home folder but not the home folder itself, and so never `/`; not in `~/Library` (in any letter case) or in a
+hidden folder of the home folder (`~/.ssh`, `~/.tailshare`, `~/.claude`…), though a repository's own
+`.claude/worktrees/…` is fine; and it, and every folder above it up to the home folder, owned by this user and
+not writable by group or others.
+Otherwise it is refused `not_allowed`, field `cwd`, with the reason. This applies only to a start that names the
+squad member: a free start, and the member's `add_dirs`, stay inside the roots.
 
 The session runs in tmux session `squad-<name>`, one window per member, with `TAILSHARE_SQUAD` and
 `TAILSHARE_MEMBER` set, and registers on the bus as that member. The bus keeps an agent's squad tag only if

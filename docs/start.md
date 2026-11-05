@@ -25,7 +25,8 @@ machine that should accept starts.
 ```
 
 - `roots`: the only folders a session may start in, or below (after resolving symlinks and `..`). `/` is not
-  accepted as a root.
+  accepted as a root. One exception: a squad member's own folder, named by the owner's signed squad, may be
+  outside them if it is a plain folder of this user in the home folder (docs/squads.md, "Starting a member").
 - `kinds`: which agents may be started, and which options a device may set for each. A kind or option missing
   here is refused. `bin` is optional: by default the agent is looked up in `~/.local/bin`, `~/.claude/local`,
   `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and must not be writable by others. `models` is optional:
