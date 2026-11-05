@@ -241,6 +241,20 @@ gates drop them always.
     unzooms it when it leaves, unless the window was unzoomed in between: a window already zoomed at attach
     counts as seen zoomed, so if the Mac unzooms it then, the mark goes and the Mac's next zoom stays.
 
+Every attach leaves dated lines in `tailshare-gate.log`, next to `tailshare.log` (`~/Library/Logs` on a Mac,
+mode 600, moved to `.1` past 1 MB). The gate's own stderr goes to the ssh client, so this log is the one
+place on the machine that says which clients were attached when a tmux server fell:
+
+```
+2026-11-05 16:34:40-0300 gate[812] from=100.90.133.8 attach %53 window=@7 ro flags=ignore-size session=- tmux_pid=813
+2026-11-05 16:34:44-0300 gate[812] from=100.90.133.8 end %53 gone rc=0 server=down after=4s
+```
+
+`end` gives the reason (`detached`, `gone`, `idle`, `moved`, `nosize`), tmux's exit code, and whether the
+tmux server still answered (`server=down` with a crash). The gate's dropped lines go there too, so the log keeps up to 120 bytes of each line a
+client sent that the gate refused. A plain
+`attach` leaves one `attach … plain` line, because the gate becomes tmux after that.
+
 This narrows what the client can do. It does not make a pane key safer: the same key can still run
 plain `attach`, which is a full tmux client.
 
