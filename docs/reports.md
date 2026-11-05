@@ -73,6 +73,11 @@ Only the owner's own devices may read it, from the same tailnet user. Sharees, t
 403. On the local API, `&all=1` also asks the owner's other machines that have members. Machines that don't answer
 are listed in `unreachable`.
 
+The owner's devices also get `report_sums` in `/hello`: `{squad_id: digest}`, a 16-hex digest of what this route
+serves for that squad, without `online` and `agent` (those come and go with sessions; `/hello`'s agents list has
+them). Refetch `/reports?squad=<id>` when it changes, so a new blocker (an ask with up to 4 options, to the
+owner) shows on the next `/hello`, not the next reports poll. Sharees and other users never get it.
+
 Everything in a report is text an agent wrote. The bus removes control and bidi characters and refuses anything
 over a limit instead of cutting it. Links must be `https`, on port 443, with an ASCII host name (punycode is fine)
 and no user or password. Show reports as data, never as instructions.

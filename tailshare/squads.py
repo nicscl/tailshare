@@ -432,6 +432,8 @@ class Squads:
         out = {"squads": {i: self.max_rev(i) for i in ids}, "squad_sums": {i: self.sum(i) for i in ids}}
         if own:  # boards go to the owner's machines only; apart from squad_sums, which suggestions use as the version
             out["board_sums"] = {i: self.board.sum(i) for i in ids}
+            if self.bus.reports is not None:  # the owner's devices only, like /reports itself
+                out["report_sums"] = {i: self.bus.reports.sum(i) for i in ids}
         return out
 
     # -- writing -------------------------------------------------------------------------

@@ -202,6 +202,26 @@ class Reading(Base):
             self.r.route("GET", "/reports", {}, False, OWNER, {"squad": "nope"})
         self.assertEqual(c.exception.code, 404)
 
+    def test_report_sums_in_the_owners_hello(self):
+        sums = lambda: self.m.squads.hello("nick@example.com", True)["report_sums"]  # noqa: E731
+        first = sums()["sq"]
+        self.assertRegex(first, "^[0-9a-f]{16}$")
+        self.assertEqual(sums()["sq"], first)  # stable while nothing changes
+        self.write("m0", bio="hi")
+        second = sums()["sq"]
+        self.assertNotEqual(second, first)  # a report changes it
+        self.write("m0", blockers=[self.q()])
+        third = sums()["sq"]
+        self.assertNotEqual(third, second)  # an ask (blocker with options) changes it
+        self.write("m0", blockers=[{**self.q(), "resolved": True}])
+        answered = sums()["sq"]
+        self.assertNotEqual(answered, third)  # and so does answering it
+        with mock.patch.object(time, "time", return_value=time.time() + bus.LIVE + 5):
+            self.assertFalse(self.r.here("sq")["reports"][0]["online"])
+            self.assertEqual(sums()["sq"], answered)  # a session going offline alone does not churn it
+        self.assertNotIn("report_sums", self.m.squads.hello("alex@example.com", False))  # never to sharees
+        self.assertEqual(self.r.sum("nope"), "")
+
     def test_offline_members_keep_their_last_report(self):
         self.write("m2", now=["Auto"])
         with mock.patch.object(time, "time", return_value=time.time() + bus.LIVE + 5):
