@@ -1168,7 +1168,7 @@ def close_started(sid: object) -> dict:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
             try:
                 con.row_factory = sqlite3.Row
-                rows = con.execute("SELECT id, harness, tmux, state, last_seen FROM agents WHERE lower(id)=?",
+                rows = con.execute("SELECT id, harness, tmux, squad, state, last_seen FROM agents WHERE lower(id)=?",
                                    (sid,)).fetchall()
             finally:
                 con.close()
@@ -1178,8 +1178,8 @@ def close_started(sid: object) -> dict:
         if row is None or not dead.is_live(row):
             raise Refused("not_running", "close", "no session with this id runs here")
         t = bus.clean_tmux(dead._json(row["tmux"]))
-        session = (t.get("target") or "").rsplit(":", 1)[0] if t else ""
-        if not t or not Path(t["socket"]).name.startswith(LABEL) or not session.startswith(dead.STARTED):
+        squad = bus.clean_squad_tag(dead._json(row["squad"]))
+        if not t or not Path(t["socket"]).name.startswith(LABEL) or not dead.ours(t, squad):
             raise Refused("not_started", "close", "tailshare closes only sessions it started")
         binary = keys.tmux_binary(t["bin"])
         if not binary:

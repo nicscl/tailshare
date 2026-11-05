@@ -25,14 +25,39 @@ def session_id(harness: str, aid: str) -> str:
     return aid.lower() if harness in ("claude", "codex") and _UUID.fullmatch(aid or "") else ""
 
 
-def _managed_elsewhere(t: dict) -> bool:
+def started_members(db: Path | None = None) -> set[tuple[str, str]]:
+    """The squad members `tailshare start` has started on this host (start.db member_starts), read-only."""
+    from . import start
+
+    db = db or start.db_path()
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return set()
+    try:
+        return {(r[0], r[1]) for r in con.execute("SELECT squad, member FROM member_starts")}
+    except sqlite3.Error:
+        return set()
+    finally:
+        con.close()
+
+
+def ours(t: dict, squad: dict | None = None, members: set | None = None) -> bool:
+    """Whether `tailshare start` made this pane: in a session it names (tailshare-start, squad-…), or, whatever the
+    recorded target says, the pane of a squad member it started here. A row viewed from a device before the target
+    was kept (docs/start.md#reopen) may name a gate's session instead; the member tag still tells."""
+    session = (t.get("target") or "").rsplit(":", 1)[0]
+    if session.startswith(STARTED):
+        return True
+    return bool(squad) and (squad["id"], squad["member"]) in (members if members is not None else started_members())
+
+
+def _managed_elsewhere(t: dict, squad: dict | None = None, members: set | None = None) -> bool:
     """A pane on a per-agent server (`tmux -L ts-<name>`) that `tailshare start` did not make: ts-agents and the
     like run those and bring their agents back themselves, so the list never offers them."""
     from .start import LABEL
 
-    name = Path(t.get("socket") or "").name
-    session = (t.get("target") or "").rsplit(":", 1)[0]
-    return name.startswith(LABEL) and not session.startswith(STARTED)
+    return Path(t.get("socket") or "").name.startswith(LABEL) and not ours(t, squad, members)
 
 
 def is_live(a, now: float | None = None) -> bool:
@@ -71,16 +96,20 @@ def rows(db: Path | None = None, now: float | None = None) -> list[dict]:
         con.close()
     live = [a for a in agents if is_live(a, now)]
     held = {(t["socket"], t["pane"]): a["last_seen"] for a in live if (t := bus.clean_tmux(_json(a["tmux"])))}
-    out, cache = [], {}
+    out, cache, members = [], {}, None
     for a in agents:
         sid, t = session_id(a["harness"] or "", a["id"]), bus.clean_tmux(_json(a["tmux"]))
-        if not sid or not t or is_live(a, now) or _managed_elsewhere(t):
+        if not sid or not t or is_live(a, now):
+            continue
+        squad = bus.clean_squad_tag(_json(a["squad"] if "squad" in a.keys() else ""))
+        if squad and members is None:
+            members = started_members()
+        if _managed_elsewhere(t, squad, members or set()):
             continue
         # gone, or a newer live agent sits in that pane now (pane ids start again at %0 on a new server)
         if not (_pane_gone(t, cache) or held.get((t["socket"], t["pane"]), 0) > a["last_seen"]):
             continue
         name = _clean(a["session"] or "", 256)
-        squad = bus.clean_squad_tag(_json(a["squad"] if "squad" in a.keys() else ""))
         out.append({"id": sid, "kind": a["harness"], "address": a["address"], "name": name,
                     "folder": Path(a["cwd"] or "").name, "cwd": a["cwd"] or "", "title": _clean(name, TITLE_MAX),
                     "squad": squad or None, "last_seen": round(float(a["last_seen"]), 3)})

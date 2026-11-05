@@ -20,6 +20,15 @@ TMUX = shutil.which("tmux") or ""
 S1, S2, S3 = ("0b0e0f2a-1c2d-4e5f-8a9b-0c1d2e3f4a5" + c for c in "abc")
 
 
+def started(tmp, tag):
+    """start.db saying `tailshare start` started this squad member here."""
+    con = start._db(tmp / "start.db")
+    con.execute("INSERT INTO member_starts(squad, member, instructions_sha256, at) VALUES(?,?,?,?)",
+                (tag["id"], tag["member"], "0" * 64, time.time()))
+    con.commit()
+    con.close()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.m = Machine(self, "air")
@@ -82,6 +91,19 @@ class Listing(Base):
         self.agent(S2, sock=str(self.tmp / "tmux" / "ts-y"), target="squad-tail-share:1.0")
         self.agent(S3, sock=str(self.tmp / "tmux" / "default"), target="workspace:3.0")  # the default server is not ts-*
         self.assertEqual(sorted(self.ids()), sorted([S1, S2, S3]))
+
+    def test_a_viewed_then_crashed_member(self):
+        """ProtosPM on prismo, 2026-11-05: viewed from Hive, its row named the gate's own session; after the tmux
+        crash it was ended but never listed. A member tailshare started here is ours whatever the target says."""
+        tag = {"id": "sq_2olACmvp6m4sydELdvc-Ag", "member": "m_ouu7NI73nSag"}
+        started(self.tmp, tag)
+        sock = str(self.tmp / "tmux" / "ts-protospm")
+        self.agent(S1, name="ProtosPM", sock=sock, target="tailshare-0-63875:1.0", squad=tag)
+        # the same, tagged by ts-agents (which tags members too) but never started by tailshare here: not ours
+        self.agent(S2, name="Manager", sock=str(self.tmp / "tmux" / "ts-manager"), target="tailshare-0-9:1.0",
+                   squad={"id": tag["id"], "member": "m_other"})
+        self.assertEqual(self.ids(), [S1])
+        self.assertEqual(dead.find(S1)[1], False)
 
     def test_newest_first_and_capped(self):
         for i in range(dead.LIMIT + 5):
@@ -240,6 +262,14 @@ class Close(Base):
         self.assertEqual(start.build(self.item(), cfg, "safe", "air")["session"], S1)
         self.assertEqual(start.close_started(S1)["error"], "not_running")  # once
 
+    def test_a_viewed_member_closes(self):
+        self.config()
+        tag = {"id": "sq_a", "member": "m_b"}
+        started(self.tmp, tag)
+        sock, pane = self.server(session="squad-tail-share")
+        self.agent(S1, ago=5, sock=sock, pane=pane, target="tailshare-0-123:0", squad=tag)
+        self.assertTrue(start.close_started(S1)["closed"])
+
     def test_a_squad_member(self):
         self.config()
         sock, pane = self.server(session="squad-tail-share")
@@ -320,3 +350,42 @@ class Close(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeepsTarget(Base):
+    """A device viewing a pane links its window into a gate's own session; the agent row keeps its own session."""
+
+    def reg(self, target):
+        return self.m.bus.register({"id": S1, "harness": "claude", "cwd": self.app, "session": "AppDev",
+                                    "tmux": {"socket": "/tmp/tmux-1/ts-appdev", "pane": "%3", "target": target}})
+
+    def stored(self):
+        return json.loads(self.m.bus.store.one("SELECT tmux FROM agents WHERE id=?", S1)["tmux"])["target"]
+
+    def test_a_gate_session_never_overwrites_it(self):
+        self.reg("squad-tail-share:1.0")
+        self.reg("tailshare-3-63875:1.0")
+        self.assertEqual(self.stored(), "squad-tail-share:1.0")
+        self.reg("squad-tail-share:2.0")  # a real move still counts
+        self.assertEqual(self.stored(), "squad-tail-share:2.0")
+
+    def test_a_first_sighting_from_a_gate_is_kept_as_is(self):
+        self.reg("tailshare-3-63875:1.0")
+        self.assertEqual(self.stored(), "tailshare-3-63875:1.0")
+
+    @unittest.skipUnless(TMUX, "needs tmux")
+    def test_the_hook_names_the_agents_own_session(self):
+        from tailshare import agent, gate_control
+
+        d = Path(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, d, True)
+        sock = str(d / "ts-appdev")
+        subprocess.run([TMUX, "-S", sock, "new-session", "-d", "-s", "squad-tail-share", "sleep 60"], check=True,
+                       env=self.env)
+        self.addCleanup(subprocess.run, [TMUX, "-S", sock, "kill-server"], capture_output=True, env=self.env)
+        pane, window = subprocess.run([TMUX, "-S", sock, "display", "-p", "#{pane_id} #{window_id}"],
+                                      capture_output=True, text=True, check=True, env=self.env).stdout.split()
+        with mock.patch.dict(os.environ, {"TMUX": f"{sock},1,0", "TMUX_PANE": pane}), \
+                mock.patch.object(gate_control.os, "getpid", return_value=63875):
+            self.assertTrue(gate_control.own_session(TMUX, sock, pane, window))
+            self.assertEqual(agent._tmux_pane()["target"], "squad-tail-share:0.0")

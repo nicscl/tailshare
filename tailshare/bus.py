@@ -388,6 +388,14 @@ def clean_tmux(t: object) -> dict:
     return out
 
 
+_GATE_RE = re.compile(r"tailshare-[0-9]{1,6}-[0-9]{1,10}")  # a viewing gate's own session (gate_control.own_session)
+
+
+def is_gate(target: str) -> bool:
+    """Whether a tmux target names a gate's own session, which only links the agent's window while a device looks."""
+    return bool(_GATE_RE.fullmatch((target or "").rsplit(":", 1)[0]))
+
+
 def clean_squad_tag(t: object) -> dict:
     """{id, member}: which squad member an agent was started as (TAILSHARE_SQUAD/TAILSHARE_MEMBER), or {}."""
     if not isinstance(t, dict):
@@ -609,7 +617,11 @@ class Bus:
         tmux = clean_tmux(a.get("tmux"))
         squad = clean_squad_tag(a.get("squad"))
         pid = int(a.get("pid") or 0)
-        was = self.store.one("SELECT pid, skip, mode FROM agents WHERE id=?", aid)
+        was = self.store.one("SELECT pid, skip, mode, tmux FROM agents WHERE id=?", aid)
+        if tmux and was and is_gate(tmux["target"]):  # a device is looking: keep the agent's own session
+            old = clean_tmux(json.loads(was["tmux"]) if was["tmux"] else {})
+            if old and (old["socket"], old["pane"]) == (tmux["socket"], tmux["pane"]) and not is_gate(old["target"]):
+                tmux = {**tmux, "target": old["target"]}
         # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's
         skip = was["skip"] if was and (was["pid"] == pid or harness != "codex") else ""
         mode = was["mode"] if was and harness != "codex" else ""  # Claude's permission_mode, from its hooks
