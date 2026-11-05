@@ -118,10 +118,14 @@ def _tmux_pane() -> dict:
     target = ""
     if exe_:
         try:
-            r = subprocess.run([exe_, "-S", sock, "display", "-p", "-t", pane,
-                                "#{session_name}:#{window_index}.#{pane_index}"],
+            # every session the pane's window is in: a device viewing it links that window into a gate's own
+            # session too (gate_control.own_session), and the agent's own session is the one to keep
+            r = subprocess.run([exe_, "-S", sock, "list-panes", "-a", "-F",
+                                "#{pane_id} #{session_name}:#{window_index}.#{pane_index}"],
                                capture_output=True, text=True, timeout=2)
-            target = r.stdout.strip() if r.returncode == 0 else ""
+            seen = [ln.split(" ", 1)[1] for ln in r.stdout.splitlines()
+                    if r.returncode == 0 and ln.startswith(pane + " ") and " " in ln]
+            target = next((x for x in seen if not bus.is_gate(x)), seen[0] if seen else "")
         except (OSError, subprocess.SubprocessError):
             pass
     return bus.clean_tmux({"socket": sock, "pane": pane, "target": target, "bin": exe_})
