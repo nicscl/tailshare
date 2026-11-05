@@ -70,6 +70,12 @@ class Revive(Base):
         self.assertEqual((sid, mid, b["to"], b["kind"], b["id"]), ("sq_a", "m_b", "owner", "question", "revive"))
         self.tick(31 + 122 + 600)
         self.assertEqual(self.m.bus.reports.flag.call_count, 1)  # once an hour
+        (st,) = start.revive_stopped()  # what the owner's devices read in /hello start.revive_stopped
+        self.assertEqual((st["session"], st["crashes"], st["why"]), (S1, 3, "session"))
+        self.assertEqual(start.revived([S1, S2], now=self.now + 200), {S1: {"at": self.now + 31, "count": 2}})
+        self.ended(S1)
+        self.tick(31 + 122 + 1200)
+        self.assertEqual(start.revive_stopped(), [])  # it ended: nothing to look at any more
 
     def test_the_host_cap_counts_a_server_once(self):
         self.config(revive_per_host=1)

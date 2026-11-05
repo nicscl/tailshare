@@ -235,6 +235,22 @@ class FromADevice(Base):
         self.assertEqual(self.op("allow", {"kind": "claude", "option": "nope"})["error"], "bad_request")
         self.assertEqual(json.loads(self.path.read_text())["skip_permissions"], True)  # as the person wrote it
 
+    def test_revive_on_and_off_from_the_start_key(self):
+        p = mock.patch.object(start, "CONFIRMS_PER_MIN", 100)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertTrue(start.load_config(self.path)["revive"])  # on unless set to false
+        out = self.op("revive", {"on": False})
+        self.assertEqual((out["ok"], out["start"]["revive"], "revive_stopped" in out["start"]), (True, False, False))
+        self.assertIs(json.loads(self.path.read_text())["revive"], False)
+        self.assertTrue(self.op("revive", {"on": True})["start"]["revive"])
+        for bad in ({}, {"on": 1}, {"on": "yes"}, {"on": True, "per_session": 9}):
+            self.assertEqual(self.op("revive", bad)["error"], "bad_request", bad)
+        self.assertEqual(self.op("revive", {"on": False}, plan_only=True)["error"], "no_grant")
+        self.assertEqual(json.loads(self.path.read_text())["skip_permissions"], True)  # the rest as it was
+        self.path.unlink()
+        self.assertEqual(self.op("revive", {"on": True})["fix"], {"action": "enable_start"})
+
     def test_every_refusal_has_a_fix(self):
         r = self.dry(self.item(cwd=str(self.tmp)))[0]
         self.assertEqual(r["fix"], {"action": "add_root", "folder": str(self.tmp)})

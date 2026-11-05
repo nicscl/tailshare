@@ -915,6 +915,12 @@ class Bus:
                     model = f["model"] or self._model_from_transcript(f)
                     if model:
                         a["model"] = model
+                from . import start
+
+                rv = start.revived([f["id"] for f in full])  # reopened by the revive watchdog: when, how often
+                for a, f in zip(agents, full):
+                    if f["id"] in rv:
+                        a["revived"] = rv[f["id"]]
             if own:  # what a start key may start here (tailshare/start.py); never the folders
                 from . import start
 

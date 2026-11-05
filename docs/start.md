@@ -32,6 +32,7 @@ With the start key (Face ID; the plan key is refused with `no_grant`), a device 
 | `{"add_root": {"folder": "/Users/me/Work"}}` | adds a root: an absolute folder held to the same rules as a squad folder outside the roots (docs/squads.md, "Starting a member"): a plain folder of this user in the home folder, not the home folder, `~/Library`, a hidden folder of the home folder or a `.git` folder, with no symlink on the path and nobody else able to write to it or a folder above it. Nothing changes if a root already covers it. |
 | `{"allow": {"kind": "codex"}}` | allows an agent, with every option but `skip_permissions` |
 | `{"allow": {"kind": "claude", "option": "effort"}}` | allows one more option of an allowed agent |
+| `{"revive": {"on": false}}` | turns the revive watchdog off (or on): see "Revive" |
 
 The answer is `{"v":1, "ok":true, "start":{…}}` with the new /hello `start` block, or a refusal with a `fix`.
 Changes count against the key's confirm rate. A device never changes `skip_permissions`, `auto`, `bin`,
@@ -288,8 +289,10 @@ own name, re-checked against start.json now. It uses the options the session was
 `launched`), and never more than the start key that approved that start may do now: it skips permissions only if it
 was started skipping and that key is still installed here as a skip key. A key approved again without skip, or one
 that was removed, means no reopen at all (`stopped: key`, no try spent), and the owner is told as past a cap
-(below). Reopening it without skip would not be the same session. A session started before launches were recorded gets only `resume`, without skipping. A squad member
-reopens as that member. Only Claude sessions reopen, as above.
+(below). Reopening it without skip would not be the same session. If the key is approved again as a skip key
+while the session is still fresh enough to reopen (10 min), the next look reopens it with skip, on its own. A
+session started before launches were recorded gets only `resume`, without skipping. A squad member reopens as
+that member. Only Claude sessions reopen, as above.
 
 A crash is anything that takes the pane away without the session ending: a tmux crash, a killed server, and also
 a `tmux kill-pane` or `kill-server` by hand. To stop one for good, end it (`/exit`, or Close from a device), or turn
@@ -302,9 +305,23 @@ It is bounded so that a crash loop ends up with the owner:
   counts twice; `revive_per_host` an hour on the host, where every session on one tmux server dying at once counts
   as one;
 - past a cap, it stops reopening and tells the owner once an hour: a squad member gets a `to: owner` question
-  blocker with id `revive` in its report, which shows in the board's Needs you; a single session gets a log line.
+  blocker with id `revive` in its report, which shows in the board's Needs you. Every session it stopped, members
+  and single sessions alike, is also in /hello `start.revive_stopped` (below).
   The blocker never pushes out the member's own open blockers: it replaces older resolved ones, and with 8 open
   already it is only logged. A Reopen from a device still works.
+
+For the owner's devices, /hello says what it did:
+
+- `agents[].revived`: `{at, count}`, the last reopen of that session and how many in the last hour. It is absent
+  when the session was never reopened.
+- `start.revive_stopped`: `[{session, name, crashes, at, why}]`, the sessions it stopped reopening in the last
+  24 h, where `why` is `session` or `host` (a cap) or `key` (its start key). `crashes` counts this hour's reopens plus
+  the crash it did not reopen. An entry goes once the session ends, comes back up or is past 10 min. It is absent
+  when there are none.
+
+A device turns it on or off with the start key (Face ID), like the other changes above: `{"v":1,"revive":{"on":
+false}}`. That writes only `revive`. Turning it on never widens anything, since a reopen never does more than its
+start key may now. The caps stay a person's, in start.json.
 
 Every reopen, refusal and stop is a `revive …` line in tailshare.log. A refusal (`limit`, a folder now outside the
 roots) counts as a try, so it backs off too.

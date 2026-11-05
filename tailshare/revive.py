@@ -105,6 +105,12 @@ def _flag(b, con: sqlite3.Connection, key: str, r: dict | None, why: str, now: f
         bus.log(f"revive: cannot flag {key}: {e!r}")
 
 
+def _stopped(con: sqlite3.Connection, r: dict, past: list, why: str, now: float) -> None:
+    """For /hello start.revive_stopped: crashes = this hour's reopens, plus the crash it did not reopen."""
+    con.execute("INSERT OR REPLACE INTO revive_stopped(session, name, crashes, at, why) VALUES(?,?,?,?,?)",
+                (r["id"], r["name"] or "", len(past) + 1, now, why))
+
+
 def tick(b, now: float | None = None) -> list[dict]:
     """One look; what it did, for tests and the log."""
     from . import start
@@ -117,6 +123,12 @@ def tick(b, now: float | None = None) -> list[dict]:
     if not cfg or not cfg["revive"] or not cfg["roots"] or not cfg["kinds"]:
         return []
     listed = [r for r in dead.listing(b.net.host)["sessions"] if r["resumable"] and r["last_seen"] > now - FRESH]
+    con = start._db()
+    try:  # a stop the owner no longer needs to see: that session ended, came back, or is too old to reopen
+        q = ",".join("?" * len(listed))
+        con.execute(f"DELETE FROM revive_stopped WHERE session NOT IN ({q})", [r["id"] for r in listed])
+    finally:
+        con.close()
     if not listed:
         return []
     states = _states([r["id"] for r in listed])
@@ -139,6 +151,7 @@ def tick(b, now: float | None = None) -> list[dict]:
                       if gone == "gone" else f"it was started with skip, and its start key ({key}) no longer allows it",
                       now, f"{r['name']} crashed: not reopened, its start key " +
                       ("is gone" if gone == "gone" else "no longer allows skip"))
+                _stopped(con, r, past, "key", now)
                 out.append({"id": sid, "stopped": "key"})
                 continue
             # dying soon after the last revive (or never coming up: last_seen before it) counts twice
@@ -147,6 +160,7 @@ def tick(b, now: float | None = None) -> list[dict]:
             if used + weight > cfg["revive_per_session"]:
                 _flag(b, con, sid, r, f"{used} reopens of this session in the last hour "
                                       f"(revive_per_session {cfg['revive_per_session']})", now)
+                _stopped(con, r, past, "session", now)
                 out.append({"id": sid, "stopped": "session"})
                 continue
             event = st["socket"] not in servers
@@ -155,6 +169,7 @@ def tick(b, now: float | None = None) -> list[dict]:
                 _flag(b, con, "host", r, f"{host} reopens on this host in the last hour "
                                          f"(revive_per_host {cfg['revive_per_host']})", now,
                       f"Sessions on {b.net.host} keep crashing: reopening paused ({r['name']} waits)")
+                _stopped(con, r, past, "host", now)
                 out.append({"id": sid, "stopped": "host"})
                 continue
             servers.add(st["socket"])
@@ -172,6 +187,7 @@ def tick(b, now: float | None = None) -> list[dict]:
                 out.append({"id": sid, "refused": {"error": "failed"}})
                 continue
             start.record_launch(con, plan, res, key)
+            con.execute("DELETE FROM revive_stopped WHERE session=?", (sid,))
             bus.log(f"revive {sid[:8]} {r['name']}: reopened in {res['tmux']['pane']} "
                     f"(#{len(past) + 1} this hour, weight {weight})")
             out.append({"id": sid, "revived": res})
