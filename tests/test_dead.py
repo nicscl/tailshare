@@ -73,6 +73,10 @@ class Listing(Base):
                           "cwd": self.app, "title": "AppDev", "squad": None, "resumable": True})
         self.assertIsInstance(r["last_seen"], float)
         self.assertNotIn("reason", r)
+        self.assertEqual((r["ended"], "ended_at" in r), (False, False))  # its pane went: a crash
+        self.m.bus.store.x("UPDATE agents SET state=? WHERE id=?", json.dumps({"v": "ended", "since": 5, "at": 7.25}), S1)
+        (r,) = dead.listing("air")["sessions"]
+        self.assertEqual((r["ended"], r["ended_at"]), (True, 7.25))  # SessionEnd or Close
         d = dead.listing("air")
         self.assertEqual((d["host"], d["max_age"], d["limit"]), ("air", 7 * 86400, 50))
 
