@@ -43,12 +43,14 @@ def started_members(db: Path | None = None) -> set[tuple[str, str]]:
 
 
 def ours(t: dict, squad: dict | None = None, members: set | None = None) -> bool:
-    """Whether `tailshare start` made this pane: in a session it names (tailshare-start, squad-…), or, whatever the
-    recorded target says, the pane of a squad member it started here. A row viewed from a device before the target
+    """Whether `tailshare start` made this pane: in a session it names (tailshare-start, squad-…), or, when the
+    recorded target is only a gate's session, the pane of a squad member it started here. A row viewed from a device before the target
     was kept (docs/start.md#reopen) may name a gate's session instead; the member tag still tells."""
     session = (t.get("target") or "").rsplit(":", 1)[0]
     if session.startswith(STARTED):
         return True
+    if not bus.is_gate(session):  # a session of its own that start does not name: ts-agents' (it tags members too)
+        return False
     return bool(squad) and (squad["id"], squad["member"]) in (members if members is not None else started_members())
 
 

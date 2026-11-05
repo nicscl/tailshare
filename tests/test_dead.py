@@ -102,6 +102,8 @@ class Listing(Base):
         # the same, tagged by ts-agents (which tags members too) but never started by tailshare here: not ours
         self.agent(S2, name="Manager", sock=str(self.tmp / "tmux" / "ts-manager"), target="tailshare-0-9:1.0",
                    squad={"id": tag["id"], "member": "m_other"})
+        # a member start ran once, now run by ts-agents in a session of its own: not ours
+        self.agent(S3, name="ProtosPM", sock=sock, target="protospm:0.0", squad=tag)
         self.assertEqual(self.ids(), [S1])
         self.assertEqual(dead.find(S1)[1], False)
 
