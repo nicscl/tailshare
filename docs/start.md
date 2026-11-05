@@ -290,7 +290,7 @@ own name, re-checked against start.json now. It uses the options the session was
 was started skipping and that key is still installed here as a skip key. A key approved again without skip, or one
 that was removed, means no reopen at all (`stopped: key`, no try spent), and the owner is told as past a cap
 (below). Reopening it without skip would not be the same session. If the key is approved again as a skip key
-while the session is still fresh enough to reopen (10 min), the next look reopens it with skip, on its own. A
+while the session is still fresh enough to reopen (15 min), the next look reopens it with skip, on its own. A
 session started before launches were recorded gets only `resume`, without skipping. A squad member reopens as
 that member. Only Claude sessions reopen, as above.
 
@@ -316,7 +316,7 @@ For the owner's devices, /hello says what it did:
   when the session was never reopened.
 - `start.revive_stopped`: `[{session, name, crashes, at, why}]`, the sessions it stopped reopening in the last
   24 h, where `why` is `session` or `host` (a cap) or `key` (its start key). `crashes` counts this hour's reopens plus
-  the crash it did not reopen. An entry goes once the session ends, comes back up or is past 10 min. It is absent
+  the crash it did not reopen. An entry goes once the session ends, comes back up or is past 15 min. It is absent
   when there are none.
 
 A device turns it on or off with the start key (Face ID), like the other changes above: `{"v":1,"revive":{"on":
