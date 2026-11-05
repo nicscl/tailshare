@@ -93,6 +93,11 @@ the gate never confirms a plan or attaches to anything for it. Both lines share 
 the plan key belongs to the pair and the start key can confirm it. Removing the key (`tailshare keys rm`, or
 the device revoking it) removes both lines.
 
+Approved on one of the owner's machines, the pair reaches the others without approving it again on each: they
+hold it as an offer, and install it as `start` (safe) when the device enrolls there with a proof signed by its
+start key ([Approve once, everywhere](ssh-keys.md#approve-once)). Skipping permissions is still granted machine by
+machine.
+
 You can grant less than the device asked for, never more. An attach request cannot be approved as a start
 key, nor a start request as an attach key or a shell. The installed lines are:
 

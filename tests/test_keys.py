@@ -154,6 +154,8 @@ class Flow(unittest.TestCase):
         keys.gate_exe = lambda: "/u/bin/tailshare"
         self._notify = keys.Keys._notify
         keys.Keys._notify = lambda *a: None  # no desktop notifications from tests
+        self._alert = keys.Keys._alert
+        keys.Keys._alert = lambda *a: None
         self._sk = keys.REQUIRE_SK
         keys.REQUIRE_SK = False  # ssh-keygen cannot make security keys without the hardware
         self.tmp = Path(tempfile.mkdtemp())
@@ -177,6 +179,7 @@ class Flow(unittest.TestCase):
 
     def tearDown(self):
         keys.install_problem, keys.gate_exe, keys.Keys._notify = self._problem, self._exe, self._notify
+        keys.Keys._alert = self._alert
         keys.REQUIRE_SK = self._sk
         self.srv.shutdown()
         self.srv.server_close()
@@ -759,6 +762,148 @@ class Flow(unittest.TestCase):
         with self.assertRaises(bus.BusError) as cm:  # only the owner's machines may ask
             self.pro_keys.machine_info("100.64.0.66")
         self.assertEqual(cm.exception.code, 403)
+
+    # -- approve once, everywhere: an offer, redeemed by the device's proof (docs/ssh-keys.md#approve-once) ------
+    def start_pair(self, tag=""):
+        start_pub, plan_pub = self.p256("start" + tag), self.p256("plan" + tag)
+        r = self.air_keys.enroll(PHONE, {"pubkey": start_pub, "plan_pubkey": plan_pub, "purpose": "start",
+                                         "want": ["start", "skip"], "device_name": "iPad"})
+        return r, start_pub, plan_pub
+
+    def proof(self, key, pub, plan, hosts=("pro",), ts=None, nonce=None):
+        ts, nonce = int(time.time()) if ts is None else ts, nonce or secrets.token_hex(16)
+        msg = "\n".join(["tailshare-start-proof/1", " ".join(hosts), str(ts), nonce, pub, plan])
+        cp = subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", keys.PROOF_NAMESPACE, "-f", str(self.tmp / key)],
+                            input=msg.encode(), capture_output=True, check=True, env={"PATH": "/usr/bin:/bin"})
+        body = "".join(cp.stdout.decode().strip().splitlines()[1:-1])
+        return {"time": ts, "nonce": nonce, "hosts": list(hosts), "signature": body}
+
+    def on_pro(self, pub, plan, proof=None, ip=PHONE):
+        self.pro.net.ipmap.setdefault(PHONE, "iphone")
+        self.pro.net.usermap.setdefault(PHONE, OWNER)
+        body = {"pubkey": pub, "plan_pubkey": plan, "purpose": "start", "want": ["start", "skip"], "device_name": "iPad"}
+        return self.pro_keys.enroll(ip, {**body, **({"proof": proof} if proof is not None else {})})
+
+    def test_a_start_key_approved_once_installs_where_the_device_proves_it(self):
+        r, pub, plan = self.start_pair()
+        out = self.approve_here(r, "start-skip", squads=True)
+        self.assertEqual(out["errors"], {}, out)
+        staged = next(i for i in out["installed"] if i["host"] == "pro")
+        self.assertEqual((staged["staged"], staged["mode"], staged["squads"]), (True, "start", True))
+        self.assertFalse((self.tmp / "pro" / "authorized_keys").exists())  # nothing yet: an offer
+        ls = self.pro_keys.ls()
+        self.assertEqual((ls["keys"], [o["key_id"] for o in ls["offered"]]), ([], [out["key_id"]]))
+        self.assertEqual(self.pro.store.one("SELECT pubkey FROM owner_machines WHERE host='air'")["pubkey"],
+                         self.air_keys.machine_pub())  # pinned on first use
+        self.assertEqual(self.on_pro(pub, plan)["status"], "pending")  # no proof: a person's request, as before
+        got = self.on_pro(pub, plan, self.proof("start", pub, plan, hosts=("air", "pro", "prismo")))
+        self.assertEqual((got["status"], got["key_id"], got["squads"], got["approved_on"]),
+                         ("approved", out["key_id"], True, "air"))
+        k = self.pro_keys.ls()["keys"][0]
+        self.assertEqual((k["mode"], k["squads"], k["approved_by"]), ("start", 1, "approved on air, proven by the device"))
+        self.assertIn(f"tailshare:{out['key_id']}", (self.tmp / "pro" / "authorized_keys").read_text())
+        self.assertEqual(self.pro_keys.ls()["offered"], [])
+        self.assertEqual(self.pro_keys.pending()["pending"], [])  # the request it made without the proof is gone
+        # revoked on air: gone on pro too, and it never comes back from an offer
+        self.air_keys.rm({"key_id": out["key_id"]})
+        self.assertEqual(self.pro_keys.ls()["keys"], [])
+
+    def test_the_proof_must_be_the_start_key_for_that_device_now(self):
+        r, pub, plan = self.start_pair()
+        out = self.approve_here(r, "start")
+        cases = {
+            "signed by the plan key": (self.proof("plan", pub, plan), PHONE, "bad_signature"),
+            "not for pro": (self.proof("start", pub, plan, hosts=("air",)), PHONE, "bad_proof"),
+            "old": (self.proof("start", pub, plan, ts=int(time.time()) - 600), PHONE, "expired"),
+            "another of the owner's devices": (self.proof("start", pub, plan), "100.64.0.8", "other_device"),
+            "someone else's device": (self.proof("start", pub, plan), "100.64.0.66", "not_owner"),
+            "malformed": ({"time": 1, "nonce": "x", "hosts": ["pro"], "signature": "y"}, PHONE, "bad_proof"),
+        }
+        self.pro.net.ipmap.update({"100.64.0.8": "ipad", "100.64.0.66": "eve-laptop"})
+        self.pro.net.usermap.update({"100.64.0.8": OWNER, "100.64.0.66": "eve@example.com"})
+        for name, (proof, ip, reason) in cases.items():
+            with self.subTest(name), self.assertRaises(bus.BusError) as cm:
+                self.on_pro(pub, plan, proof, ip=ip)
+            self.assertEqual((cm.exception.code, cm.exception.extra.get("reason")), (403, reason), name)
+        self.assertEqual(self.pro_keys.ls()["keys"], [])
+        good = self.proof("start", pub, plan)
+        self.assertEqual(self.on_pro(pub, plan, good)["status"], "approved")
+        self.assertEqual(self.pro_keys.ls()["keys"][0]["id"], out["key_id"])
+        r2, pub2, plan2 = self.start_pair("2")
+        self.approve_here(r2, "start")
+        with self.assertRaises(bus.BusError) as cm:  # a nonce is good once
+            self.on_pro(pub2, plan2, self.proof("start2", pub2, plan2, nonce=good["nonce"]))
+        self.assertEqual(cm.exception.extra.get("reason"), "replayed")
+        # a proof with no offer here is just a request for a person
+        _r3, pub3, plan3 = self.start_pair("3")
+        self.assertEqual(self.on_pro(pub3, plan3, self.proof("start3", pub3, plan3))["status"], "pending")
+
+    def test_only_start_keys_and_only_from_the_owners_machines_are_offers(self):
+        r = self.enroll()
+        out = self.approve_here(r, "pane")
+        self.assertIn("pro does not trust air", out["errors"]["pro"])  # pane and shell keys still need trust
+        r, _pub, _plan = self.start_pair()
+        p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r["request_id"])
+        payload = keys.approval_doc("air", "air", p, "k" + "7" * 12, "start", ["pro"], machine=True)
+        body = {"payload": payload, "signature": self.air_keys._machine_sign(payload),
+                "machine_pubkey": self.air_keys.machine_pub()}
+        self.pro.net.usermap["100.64.0.66"] = "eve@example.com"
+        self.pro.net.ipmap["100.64.0.66"] = "air"  # even claiming the name
+        with self.assertRaises(bus.BusError) as cm:
+            self.pro_keys.install_from_peer("100.64.0.66", body)
+        self.assertEqual(cm.exception.code, 403)
+        self.pro.net.user = "tagged-devices"
+        with self.assertRaises(bus.BusError):
+            self.pro_keys.install_from_peer("127.0.0.1", body)
+        self.pro.net.user = OWNER
+        with self.assertRaises(bus.BusError):  # no machine key sent and none pinned
+            self.pro_keys.install_from_peer("127.0.0.1", {**body, "machine_pubkey": ""})
+        self.assertTrue(self.pro_keys.install_from_peer("127.0.0.1", body)["staged"])
+
+    def test_a_changed_machine_key_is_refused_until_a_person_forgets_it(self):
+        r, _pub, _plan = self.start_pair()
+        self.approve_here(r, "start")  # pins air's key on pro
+        alerts = []
+        self.pro_keys._alert = lambda *a: alerts.append(a)
+        other = keys.Keys(self.air, self.signers, self.tmp / "air2" / "authorized_keys", self.tmp / "air2.token",
+                          machine_key=self.tmp / "air2" / "machine_key", trusted=self.tmp / "air2" / "trusted")
+        r2, _pub2, _plan2 = self.start_pair("2")
+        p = next(x for x in self.air_keys.pending()["pending"] if x["id"] == r2["request_id"])
+        payload = keys.approval_doc("air", "air", p, "k" + "8" * 12, "start", ["pro"], machine=True)
+        body = {"payload": payload, "signature": other._machine_sign(payload), "machine_pubkey": other.machine_pub()}
+        with self.assertRaises(bus.BusError) as cm:
+            self.pro_keys.install_from_peer("127.0.0.1", body)
+        self.assertEqual(cm.exception.extra.get("reason"), "machine_key_changed")
+        self.assertEqual(len(alerts), 1)
+        with self.assertRaises(bus.BusError):  # nor without sending a key: the pinned one does not match
+            self.pro_keys.install_from_peer("127.0.0.1", {**body, "machine_pubkey": ""})
+        self.assertTrue(self.pro_keys.untrust({"host": "air"})["removed"])
+        payload = keys.approval_doc("air", "air", p, "k" + "9" * 12, "start", ["pro"], machine=True)
+        body = {"payload": payload, "signature": other._machine_sign(payload), "machine_pubkey": other.machine_pub()}
+        self.assertTrue(self.pro_keys.install_from_peer("127.0.0.1", body)["staged"])
+
+    def test_a_security_key_approval_pro_cannot_check_becomes_an_offer(self):
+        empty = self.tmp / "pro_signers"
+        empty.write_text("")
+        os.chmod(empty, 0o600)
+        self.pro_keys.signers = empty  # pro does not know the person's signing key
+        r, _pub, _plan = self.start_pair()
+        p = self.air_keys.pending()["pending"][0]
+        payload = keys.approval_doc("nick", "air", p, "k" + "c" * 12, "start", ["air", "pro"])
+        out = self.air_keys.approve({"confirm": r["pair_fingerprint"][-6:], "id": r["request_id"], "mode": "start",
+                                     "payload": payload, "signature": sessions.sign(payload, self.signing_key,
+                                                                                    sessions.KEYS_NAMESPACE)})
+        self.assertEqual(out["errors"], {}, out)
+        self.assertTrue(next(i for i in out["installed"] if i["host"] == "pro")["staged"])
+
+    def test_an_offline_machine_gets_the_offer_later(self):
+        self.air.net.peers["pro"]["online"] = False
+        r, _pub, _plan = self.start_pair()
+        out = self.approve_here(r, "start")
+        self.assertEqual(out["errors"], {"pro": "offline: will retry"})
+        self.air.net.peers["pro"]["online"] = True
+        self.assertEqual(self.air_keys.retry_installs(), {"pro": "installed"})
+        self.assertEqual([o["key_id"] for o in self.pro_keys.ls()["offered"]], [out["key_id"]])
 
     def test_offline_machines_get_it_later_signed_again(self):
         self.trust(self.pro_keys, self.air_keys)
