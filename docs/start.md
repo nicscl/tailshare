@@ -286,9 +286,9 @@ within 15 minutes, and that did not end: no `SessionEnd`, no Close. That is a cr
 server was killed. It reopens it as a device's Reopen would: a start that resumes it, in its own folder under its
 own name, re-checked against start.json now. It uses the options the session was started with here (start.db
 `launched`), and never more than the start key that approved that start may do now: it skips permissions only if it
-was started skipping and that key is still installed here as a skip key. A key approved again without skip makes the
-reopen refused (`no_skip_grant`); a key that was removed means no reopen at all, and the owner is told as past a
-cap (below). A session started before launches were recorded gets only `resume`, without skipping. A squad member
+was started skipping and that key is still installed here as a skip key. A key approved again without skip, or one
+that was removed, means no reopen at all (`stopped: key`, no try spent), and the owner is told as past a cap
+(below). Reopening it without skip would not be the same session. A session started before launches were recorded gets only `resume`, without skipping. A squad member
 reopens as that member. Only Claude sessions reopen, as above.
 
 A crash is anything that takes the pane away without the session ending: a tmux crash, a killed server, and also
