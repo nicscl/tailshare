@@ -171,10 +171,15 @@ def load_config(path: Path | None = None) -> dict | None:
             extra = [m for m in v.get("models") or [] if isinstance(m, str) and _MODEL.fullmatch(m)] \
                 if isinstance(v.get("models"), list) else []
             kinds[k] = {"options": opts, "bin": b if isinstance(b, str) and b.startswith("/") else "", "models": extra}
-    mr = d.get("max_running")
+    def count(key: str, lo: int, hi: int, default: int) -> int:
+        v = d.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi else default
+
     return {"roots": roots, "kinds": kinds, "skip_permissions": d.get("skip_permissions") is True,
-            "auto": d.get("auto") is True,
-            "max_running": mr if isinstance(mr, int) and not isinstance(mr, bool) and 0 < mr <= 100 else 12}
+            "auto": d.get("auto") is True, "max_running": count("max_running", 1, 100, 12),
+            # the revive watchdog (revive.py): on unless set to false; reopens an hour, per session and per host
+            "revive": d.get("revive") is not False, "revive_per_session": count("revive_per_session", 0, 100, 3),
+            "revive_per_host": count("revive_per_host", 0, 1000, 10)}
 
 
 # --------------------------------------------------------------------------- changing it from a device
@@ -338,7 +343,7 @@ def capabilities(path: Path | None = None, owner: str = "") -> dict | None:
     if not cfg or not cfg["roots"] or not cfg["kinds"]:
         return None
     out = {"kinds": sorted(cfg["kinds"]), "options": {k: v["options"] for k, v in sorted(cfg["kinds"].items())},
-           "skip": cfg["skip_permissions"]}
+           "skip": cfg["skip_permissions"], "revive": cfg["revive"]}
     if "permission_mode" in cfg["kinds"].get("claude", {}).get("options", []):
         # the values a device may pick: auto only where this host allows it, bypassPermissions only with skip
         out["permission_modes"] = {"claude": [m for m in KINDS["claude"]["permission_mode"][1]
@@ -866,6 +871,11 @@ CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, key TEXT NOT NULL, item TE
 CREATE TABLE IF NOT EXISTS confirms(key TEXT NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS member_starts(squad TEXT NOT NULL, member TEXT NOT NULL, instructions_sha256 TEXT NOT NULL,
   at REAL NOT NULL, PRIMARY KEY(squad, member));
+CREATE TABLE IF NOT EXISTS launched(session TEXT PRIMARY KEY, options TEXT NOT NULL, grant_ TEXT NOT NULL,
+  at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS revives(session TEXT NOT NULL, socket TEXT NOT NULL, at REAL NOT NULL,
+  weight INTEGER NOT NULL, host_event INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS revive_flags(key TEXT PRIMARY KEY, at REAL NOT NULL);
 """
 
 
@@ -887,7 +897,19 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
     con.execute("DELETE FROM plans WHERE (used IS NULL AND expires<?) OR (used IS NOT NULL AND used<?)",
                 (now, now - KEEP))
     con.execute("DELETE FROM confirms WHERE at<?", (now - 60,))
+    con.execute("DELETE FROM revives WHERE at<?", (now - 86400,))
+    con.execute("DELETE FROM launched WHERE at<?", (now - 30 * 86400,))
     return con
+
+
+def record_launch(con: sqlite3.Connection, plan: dict, result: dict) -> None:
+    """What a session was started with, so the revive watchdog reopens it the same way (revive.py)."""
+    sid = str(result.get("session") or plan.get("session") or "").lower()
+    if not sid:
+        return  # a new Codex thread: its id is not known here
+    con.execute("INSERT OR REPLACE INTO launched(session, options, grant_, at) VALUES(?,?,?,?)",
+                (sid, json.dumps(plan["options"], sort_keys=True), "skip" if plan["skip"] else "safe",
+                 time.time()))
 
 
 def squad_session(name: str) -> str:
@@ -1013,6 +1035,8 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
         con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(e.out), pid))
         raise
     con.execute("UPDATE plans SET result=? WHERE id=?", (json.dumps(result), pid))
+    if not result.get("error"):
+        record_launch(con, plan, result)
     if plan.get("squad"):
         con.execute("INSERT OR REPLACE INTO member_starts(squad, member, instructions_sha256, at) VALUES(?,?,?,?)",
                     (plan["squad"]["id"], plan["squad"]["member"], plan["instructions_sha256"], time.time()))

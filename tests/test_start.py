@@ -132,7 +132,7 @@ class Config(Base):
 
     def test_capabilities_and_folders(self):
         self.config(kinds={"claude": {"options": ["model", "nonsense"]}, "grok": {"options": []}})
-        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True,
+        self.assertEqual(start.capabilities(), {"kinds": ["claude"], "options": {"claude": ["model"]}, "skip": True, "revive": True,
                                                 "models": {"claude": list(start.CLAUDE_ALIASES)}})
         (self.root / ".hidden").mkdir()
         (self.root / "app" / "src").mkdir()
