@@ -1035,14 +1035,14 @@ class Bus:
             raise BusError("this machine has no single tailnet owner", 403)
         return {"folders": start.folders()}
 
-    def dead_sessions(self, ip: str) -> dict:
+    def dead_sessions(self, ip: str, qs: dict | None = None) -> dict:
         """GET /sessions/dead: sessions that ran here lately and whose pane is gone, for the owner's devices."""
         from . import dead
 
         self.require_same_user(ip)
         if not self.net.user or self.net.user == "tagged-devices":
             raise BusError("this machine has no single tailnet owner", 403)
-        return dead.listing(self.net.host)
+        return dead.listing(self.net.host, qs=qs)
 
     def require_same_user(self, ip: str) -> None:
         """Only machines owned by this machine's tailnet user may update it or read its sessions."""
@@ -1324,7 +1324,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello(ip))
                 if (method, path) == ("GET", "/sessions/dead"):
-                    return self._reply(200, b.dead_sessions(ip))
+                    return self._reply(200, b.dead_sessions(ip, qs))
                 if (method, path) == ("GET", "/sessions/start/folders"):
                     return self._reply(200, b.start_folders(ip))
                 if (method, path) == ("GET", "/peers"):

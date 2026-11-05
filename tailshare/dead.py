@@ -14,8 +14,10 @@ from pathlib import Path
 from . import bus
 
 MAX_AGE = 7 * 86400  # agents seen this recently
-LIMIT = 50
-TITLE_MAX = 120
+LIMIT = 50  # a page, by default
+LIMIT_MAX = 200
+NAME_MAX = 256
+TITLE_MAX = NAME_MAX  # the title is the name; devices cut it for display
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 STARTED = ("tailshare-start", "squad-")  # the tmux sessions `tailshare start` puts agents in (start.py)
 
@@ -54,8 +56,10 @@ def _pane_gone(t: dict, cache: dict) -> bool:
     return cache[k]
 
 
-def rows(db: Path | None = None, now: float | None = None) -> list[dict]:
-    """The dead sessions, newest first, at most LIMIT, with nothing about whether this host may reopen them."""
+def rows(db: Path | None = None, now: float | None = None, before: float | None = None,
+         limit: int | None = LIMIT) -> list[dict]:
+    """The dead sessions, newest first, last seen before `before` (a page's last `last_seen`), at most `limit` (None:
+    all), with nothing about whether this host may reopen them."""
     db = db or bus.STATE_DIR / "bus.db"
     now = time.time() if now is None else now
     try:
@@ -76,15 +80,17 @@ def rows(db: Path | None = None, now: float | None = None) -> list[dict]:
         sid, t = session_id(a["harness"] or "", a["id"]), bus.clean_tmux(_json(a["tmux"]))
         if not sid or not t or is_live(a, now) or _managed_elsewhere(t):
             continue
+        if before is not None and round(float(a["last_seen"]), 3) >= before:
+            continue
         # gone, or a newer live agent sits in that pane now (pane ids start again at %0 on a new server)
         if not (_pane_gone(t, cache) or held.get((t["socket"], t["pane"]), 0) > a["last_seen"]):
             continue
-        name = _clean(a["session"] or "", 256)
+        name = _clean(a["session"] or "", NAME_MAX)
         squad = bus.clean_squad_tag(_json(a["squad"] if "squad" in a.keys() else ""))
         out.append({"id": sid, "kind": a["harness"], "address": a["address"], "name": name,
                     "folder": Path(a["cwd"] or "").name, "cwd": a["cwd"] or "", "title": _clean(name, TITLE_MAX),
                     "squad": squad or None, "last_seen": round(float(a["last_seen"]), 3)})
-        if len(out) >= LIMIT:
+        if limit is not None and len(out) >= limit:
             break
     return out
 
@@ -105,19 +111,33 @@ def resumable(r: dict, cfg: dict | None) -> str:
     return ""
 
 
-def listing(host: str, db: Path | None = None) -> dict:
-    """GET /bus/v1/sessions/dead."""
+def page(qs: dict) -> tuple[float | None, int]:
+    """`?before=<last_seen>&limit=<n>` of GET /sessions/dead."""
+    try:
+        before = float(qs["before"]) if "before" in qs else None
+        limit = int(qs.get("limit", LIMIT))
+    except ValueError:
+        raise bus.BusError("before is a last_seen, limit a number", 400) from None
+    if (before is not None and not before > 0) or not 1 <= limit <= LIMIT_MAX:
+        raise bus.BusError(f"before is a last_seen, limit 1 to {LIMIT_MAX}", 400)
+    return before, limit
+
+
+def listing(host: str, db: Path | None = None, qs: dict | None = None) -> dict:
+    """GET /bus/v1/sessions/dead[?before=&limit=]: a page, newest first; `more` when older ones are left."""
     from . import start
 
+    before, limit = page(qs or {})
     try:
         cfg = start.load_config()
     except start.Refused:
         cfg = None
     out = []
-    for r in rows(db):
+    got = rows(db, before=before, limit=limit + 1)
+    for r in got[:limit]:
         why = resumable(r, cfg)
         out.append({**r, "resumable": not why, **({"reason": why} if why else {})})
-    return {"host": host, "max_age": MAX_AGE, "limit": LIMIT, "sessions": out}
+    return {"host": host, "max_age": MAX_AGE, "limit": limit, "more": len(got) > limit, "sessions": out}
 
 
 def find(sid: str, db: Path | None = None) -> tuple[dict | None, bool]:
@@ -133,7 +153,7 @@ def find(sid: str, db: Path | None = None) -> tuple[dict | None, bool]:
             con.close()
     except sqlite3.Error:
         live = False
-    return next((r for r in rows(db) if r["id"] == sid), None), live
+    return next((r for r in rows(db, limit=None) if r["id"] == sid), None), live  # any page can be reopened
 
 
 def _json(s: object) -> object:
