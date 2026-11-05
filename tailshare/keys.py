@@ -90,6 +90,34 @@ def log(msg: str) -> None:
     bus.log(f"keys: {msg}")
 
 
+GATE_LOG_MAX = 1 << 20  # bytes, then the log moves to .1 and starts again
+
+
+def gate_log(msg: str) -> None:
+    """One dated line in tailshare-gate.log, next to tailshare.log: the gate runs under sshd, so its own stderr
+    goes to the ssh client and nothing on this machine would say which clients were attached when tmux fell."""
+    from datetime import datetime
+
+    from .daemon import LOG
+
+    path = LOG.with_name("tailshare-gate.log")
+    conn = (os.environ.get("SSH_CONNECTION") or "-").split()[0]
+    line = f"{datetime.now().astimezone():%Y-%m-%d %H:%M:%S%z} gate[{os.getpid()}] from={conn} {msg}\n"
+    try:
+        if path.stat().st_size > GATE_LOG_MAX:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # never stop an attach over the log
+
+
 # --------------------------------------------------------------------------- keys and fingerprints
 
 
@@ -651,7 +679,12 @@ def cmd_gate(args) -> None:
             sys.exit("tailshare ssh-gate: -C attach takes no other commands")
         from . import gate_control
 
-        sys.exit(gate_control.run(req, binary, log=log))
+        def both(msg: str) -> None:
+            log(msg)
+            gate_log(msg)
+
+        sys.exit(gate_control.run(req, binary, log=both, trace=gate_log))
+    gate_log(f"attach {req['pane']} plain {'ro' if req.get('readonly') else 'rw'} socket={Path(req['socket']).name}")
     os.execv(binary, gate_argv(req, binary))
 
 

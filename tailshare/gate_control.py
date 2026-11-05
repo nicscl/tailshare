@@ -273,7 +273,9 @@ def _exit(signum, _frame):
 
 
 def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None,
-        log: Callable[[str], None] = lambda m: None) -> int:
+        log: Callable[[str], None] = lambda m: None, trace: Callable[[str], None] = lambda m: None) -> int:
+    """`trace` gets one line when the client attaches and one when it ends (why, tmux's exit code, whether the
+    tmux server still answers), for the gate log (keys.gate_log): a tmux crash can be matched to the clients."""
     if threading.current_thread() is threading.main_thread():  # logout, shutdown, sshd going away
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, _exit)
@@ -293,6 +295,10 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         return 0
     child = subprocess.Popen(control_argv(req, binary, session), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, env=child_env())
+    began = time.monotonic()
+    trace(f"attach {pane} window={window or '-'} {'ro' if ro else 'rw'} flags={','.join(req['flags']) or '-'}"
+          f" session={session or '-'} tmux_pid={child.pid}")
+    why = {"v": "detached"}
     write = threading.Lock()
     done = threading.Event()
     gone = threading.Event()
@@ -309,10 +315,11 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
     def alive() -> bool:
         return _display(binary, sock, pane, "#{pane_id} #{pane_dead}") == f"{pane} 0"
 
-    def end(why: str = "gone") -> None:
+    def end(reason: str = "gone") -> None:
         if not gone.is_set():
+            why["v"] = reason
             gone.set()
-            send(f"%tailshare-{why} {pane}".encode())
+            send(f"%tailshare-{reason} {pane}".encode())
             done.set()
             child.terminate()
 
@@ -397,4 +404,6 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
             _tmux(binary, sock, "kill-session", "-t", f"={session}")
         if session:
             unzoom(binary, sock, pane, window, session)
+        server = "up" if _tmux(binary, sock, "display", "-p", "#{pid}") else "down"
+        trace(f"end {pane} {why['v']} rc={child.poll()} server={server} after={time.monotonic() - began:.0f}s")
     return 0 if gone.is_set() else child.returncode

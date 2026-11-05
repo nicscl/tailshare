@@ -109,6 +109,7 @@ class Proxy(unittest.TestCase):
         self.t("new-window", "-d", "while :; do echo SECRET; sleep 0.1; done")
         self.b = self.t("display", "-p", "-t", ":1", "#{pane_id}")
         self.dropped: list[str] = []
+        self.traced: list[str] = []
 
     def tearDown(self):
         subprocess.run([self.tmux, "-S", self.sock, "kill-server"], capture_output=True, env=self.env)
@@ -127,7 +128,8 @@ class Proxy(unittest.TestCase):
 
         def go():
             with os.fdopen(rin, "rb") as i, os.fdopen(wout, "wb") as o:
-                self.result["rc"] = gate_control.run(req, self.tmux, i, o, self.dropped.append)
+                self.result["rc"] = gate_control.run(req, self.tmux, i, o, self.dropped.append,
+                                                         self.traced.append)
 
         self.thread = threading.Thread(target=go, daemon=True)
         self.thread.start()
@@ -536,6 +538,37 @@ class Proxy(unittest.TestCase):
         self.thread.join(5)
         self.assertEqual(self.result.get("rc"), 0)
         self.assertTrue(self.out.rstrip(b"\n").endswith(f"%tailshare-gone {self.a}".encode()))
+
+    def test_traces_attach_and_end(self):
+        self.start()
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual(len(self.traced), 2)
+        self.assertRegex(self.traced[0], rf"^attach {self.a} window=@[0-9]+ rw flags=ignore-size session=- tmux_pid=[0-9]+$")
+        self.assertRegex(self.traced[1], rf"^end {self.a} detached rc=0 server=up after=[0-9]+s$")
+
+    def test_traces_a_server_that_died(self):
+        self.start()
+        self.t("kill-server")
+        self.thread.join(5)
+        self.assertRegex(self.traced[-1], rf"^end {self.a} gone rc=[-0-9]+ server=down ")
+
+
+class GateLog(unittest.TestCase):
+    def test_dated_lines_and_rotation(self):
+        from tailshare import daemon
+
+        d = Path(tempfile.mkdtemp())
+        with mock.patch.object(daemon, "LOG", d / "tailshare.log"), mock.patch.object(keys, "GATE_LOG_MAX", 200), \
+                mock.patch.dict(os.environ, {"SSH_CONNECTION": "100.1.2.3 5555 100.4.5.6 22"}):
+            keys.gate_log("attach %1 plain rw socket=ts-x")
+            line = (d / "tailshare-gate.log").read_text()
+            self.assertRegex(line, r"^20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9:]{8}[-+][0-9]{4} gate\[[0-9]+\] "
+                                   r"from=100\.1\.2\.3 attach %1 plain rw socket=ts-x\n$")
+            self.assertEqual((d / "tailshare-gate.log").stat().st_mode & 0o777, 0o600)
+            for _ in range(5):
+                keys.gate_log("x" * 80)
+            self.assertTrue((d / "tailshare-gate.log.1").exists())
+            self.assertLess((d / "tailshare-gate.log").stat().st_size, 400)
 
 
 if __name__ == "__main__":
