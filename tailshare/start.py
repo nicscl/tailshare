@@ -129,8 +129,23 @@ def autos(kind: str, opts: dict) -> bool:
 _BY_HAND = {"action": "terminal"}  # only a person at the machine can fix it
 
 
+def _check_dir(folder: Path) -> None:
+    """start.json's folder (~/.tailshare): this user's own real folder that nobody else can write to, so nobody
+    else can swap the file inside it."""
+    try:
+        st = os.lstat(folder)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise Refused("off", reason=f"cannot read {folder} ({e.strerror})", fix=_BY_HAND) from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise Refused("off", reason=f"{folder} must be a folder of this user (not a link), not writable by group or "
+                      "others", fix=_BY_HAND)
+
+
 def _read_raw(path: Path) -> dict | None:
     """start.json as written, checked to be this user's own plain file; None when there is none."""
+    _check_dir(path.parent)
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -212,9 +227,14 @@ def change_config(op: str, arg: object, path: Path | None = None) -> None:
     if not isinstance(arg, dict):
         raise Refused("bad_request", op)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _check_dir(path.parent)
     import fcntl
 
-    with open(path.parent / "start.json.lock", "a") as lock:
+    try:
+        fd = os.open(path.parent / "start.json.lock", os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as e:
+        raise Refused("off", reason=f"cannot open start.json.lock ({e.strerror})", fix=_BY_HAND) from None
+    with os.fdopen(fd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         d = _read_raw(path)
         if op == "enable":
@@ -1057,7 +1077,8 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             finally:
                 con.close()
             change_config(op, doc[op], cfg_path)
-            return {"v": 1, "ok": True, "start": capabilities(cfg_path, owner)}
+            caps = capabilities(cfg_path, owner)
+            return {"v": 1, "ok": True, "start": caps, **({"start_off": off_reason(cfg_path)} if caps is None else {})}
         cfg = load_config(cfg_path)
         if not cfg:
             raise Refused("off", reason="starting sessions is off on this host", fix={"action": "enable_start"})
