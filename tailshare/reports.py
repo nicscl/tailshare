@@ -9,6 +9,7 @@ checked again when the report is read, against the squad tree as it is then."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -338,6 +339,17 @@ class Reports:
             raise bus.BusError("no such squad", 404)
         out = [self.view(sq, m["id"]) for m in sq["members"] if m["host"] == self.bus.net.host]
         return {"squad": sid, "host": self.bus.net.host, "at": time.time(), "reports": [r for r in out if r]}
+
+    def sum(self, sid: str) -> str:
+        """/hello's report_sums: a digest of what `here` serves for the squad, so the owner's devices refetch
+        /reports as soon as a report, a blocker or the tree changes, not on their next poll. Which session is
+        online is left out: that is /hello's own agents list, and it would change the sum on every restart."""
+        try:
+            reports = self.here(sid)["reports"]
+        except bus.BusError:
+            return ""
+        parts = [{k: v for k, v in r.items() if k not in ("online", "agent")} for r in reports]
+        return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
     def everywhere(self, sid: str) -> dict:
         """`tailshare report ls`: this machine's reports and those of the squad's other hosts, if they answer."""
