@@ -262,7 +262,7 @@ sessions this machine ran in the last 7 days whose tmux pane is gone (or taken b
 - Only sessions with an id to resume by (Claude's session uuid, Codex's thread id), never an agent that is online,
   and never one on a `ts-*` server that `tailshare start` did not make (ts-agents brings those back itself).
   `tailshare start` made it when its pane is in a `tailshare-start` or `squad-*` session, or when it is a squad
-  member that start has started on this host (start.db `member_starts`), whatever its recorded session says.
+  member that start has started on this host (start.db `member_starts`) whose recorded session is only a gate's.
   A device viewing a pane links its window into a gate's own session (`tailshare-<pane>-<pid>`); the agent row
   keeps its own session, never the gate's.
 - `resumable: false` comes with a `reason`: `kind` (only Claude sessions reopen), `off` (starting is off here, or
