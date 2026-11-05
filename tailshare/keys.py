@@ -66,6 +66,9 @@ VERIFY_PER_MINUTE = 30  # signature checks per address: each one runs ssh-keygen
 SIGNED_HEADERS = ("X-Tailshare-Key", "X-Tailshare-Time", "X-Tailshare-Nonce", "X-Tailshare-Signature")
 MACHINE_KEY_TYPE = "ssh-ed25519"  # a machine key is a plain file: whatever reads it signs as the machine
 INSTALL_RETRY_FOR = 7 * 86400  # how long an approval keeps trying a machine that was offline
+MAX_OFFERS = 50  # offers waiting on this machine
+OFFER_TTL = 7 * 86400  # how long a start key approved on another of the owner's machines waits for the device here
+PROOF_NAMESPACE = "tailshare-start-proof"  # the start key proving itself to a machine that holds an offer for it
 _HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")  # also a valid allowed_signers principal
 
 SCHEMA = """
@@ -83,6 +86,11 @@ CREATE TABLE IF NOT EXISTS key_revocations(
 CREATE TABLE IF NOT EXISTS key_installs(
   key_id TEXT NOT NULL, host TEXT NOT NULL, created REAL NOT NULL, done REAL, final INTEGER NOT NULL DEFAULT 0,
   error TEXT, PRIMARY KEY(key_id, host));
+CREATE TABLE IF NOT EXISTS key_offers(
+  key_id TEXT PRIMARY KEY, signer TEXT NOT NULL, pubkey TEXT NOT NULL, plan_pubkey TEXT NOT NULL,
+  fingerprint TEXT NOT NULL, device TEXT NOT NULL, node TEXT NOT NULL, user TEXT NOT NULL,
+  squads INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS owner_machines(host TEXT PRIMARY KEY, pubkey TEXT NOT NULL, first REAL NOT NULL);
 """
 
 
@@ -808,15 +816,18 @@ class Keys:
         return {"host": self.host, "trusts": host, "fingerprint": fingerprint(pub)}
 
     def untrust(self, body: dict) -> dict:
+        """Remove the edge host -> this machine, and forget the machine key pinned for host's start key offers
+        (so a machine that made a new key, say after a reinstall, is pinned afresh on its next offer)."""
         host = str(body.get("host") or "")
         with self._key_lock:
             rows = read_trusted(self.trusted)
             keep = [t for t in rows if t["host"] != host]
             if len(keep) != len(rows):
                 write_trusted(self.trusted, keep)
-        if len(keep) != len(rows):
-            log(f"no longer trusts {host}'s machine key")
-        return {"host": self.host, "removed": len(keep) != len(rows)}
+        pinned = self.store.x("DELETE FROM owner_machines WHERE host=?", host)
+        if len(keep) != len(rows) or pinned:
+            log(f"no longer trusts {host}'s machine key{' and forgot its pinned key' if pinned else ''}")
+        return {"host": self.host, "removed": len(keep) != len(rows) or bool(pinned)}
 
     # -- what peers may know ----------------------------------------------------
     def ssh_info(self) -> dict:
@@ -869,6 +880,10 @@ class Keys:
                 raise bus.BusError("plan_pubkey must be a different key from pubkey")
             if not all(k.startswith(START_KEY_TYPE + " ") for k in (pubkey, plan)):
                 raise bus.BusError(f"start and plan keys must be {START_KEY_TYPE}")
+        if purpose == "start" and body.get("proof") is not None:
+            done = self._redeem(ip, node, user or "", pubkey, plan, device, purpose, want, body.get("proof"))
+            if done is not None:
+                return done
         now = time.time()
         with self.store.lock:
             self._expire()
@@ -971,7 +986,9 @@ class Keys:
         rows = self.store.q("SELECT * FROM ssh_keys ORDER BY installed")
         unfinished = self.store.q("SELECT key_id, host, created, error FROM key_revocations WHERE done IS NULL")
         installing = self.store.q("SELECT key_id, host, created, final, error FROM key_installs WHERE done IS NULL")
-        return {"host": self.host, "login": bus.LOGIN, "keys": [dict(r) for r in rows],
+        offers = self.store.q("SELECT key_id, signer, device, node, fingerprint, squads, created, expires FROM key_offers"
+                              " WHERE expires>=? ORDER BY created", time.time())
+        return {"host": self.host, "login": bus.LOGIN, "keys": [dict(r) for r in rows], "offered": [dict(r) for r in offers],
                 "revoking": [dict(r) for r in unfinished], "installing": [dict(r) for r in installing]}
 
     # -- approving and installing ---------------------------------------------------
@@ -1008,11 +1025,13 @@ class Keys:
         log(f"installed {key_id} ({r['device']}, {r['fingerprint']}) mode={mode}{', squads' if squads else ''}, {by}")
         return {"host": self.host, "login": bus.LOGIN, "mode": mode, "key_id": key_id, "squads": bool(squads)}
 
-    def check_approval(self, payload: str, signature: str, sender: str | None = None) -> dict:
+    def check_approval(self, payload: str, signature: str, sender: str | None = None, machine_pubkey: str = "") -> dict:
         """The approval, if it may install here. `sender`: the machine that sent it (None: a person on this one).
         A person's approval is signed with a security key in allowed_signers. A machine's (`"by": "machine"`)
         is signed with its machine key, accepted only from that machine itself, and only when trusted_machines
-        here names it: one direct edge, never relayed by another machine."""
+        here names it: one direct edge, never relayed by another machine. Without that edge, a machine's approval
+        of a start key is still taken as an offer (`_offer`): verified with the sender's pinned machine key, it
+        installs nothing until the device proves it holds the start key (docs/ssh-keys.md#approve-once)."""
         from .sessions import KEYS_NAMESPACE, verify
 
         if len(payload) > 16 * 1024 or len(signature) > 8 * 1024:
@@ -1025,10 +1044,13 @@ class Keys:
             signer = str(head.get("signer") or "")
             if sender is None or signer != sender or head.get("origin") != signer:
                 raise bus.BusError("approval refused: a machine's approval is only accepted from that machine", 403)
-            if not any(t["host"] == signer for t in read_trusted(self.trusted)):
+            offer = not any(t["host"] == signer for t in read_trusted(self.trusted))
+            if offer and head.get("mode") not in ("start", "start-skip"):
                 raise bus.BusError(f"approval refused: {self.host} does not trust {signer} (a person on {self.host} "
                                    f"can run `tailshare keys trust-machine {signer}`)", 403)
-            d = verify(payload, signature, self.trusted, KEYS_NAMESPACE)
+            d = self._verify_offer(signer, payload, signature, machine_pubkey) if offer \
+                else verify(payload, signature, self.trusted, KEYS_NAMESPACE)
+            d["_offer"] = offer
         else:
             if REQUIRE_SK and not signature_key_type(signature).startswith("sk-"):
                 raise bus.BusError("approval refused: key approvals for other machines must be signed with a security key "
@@ -1040,6 +1062,7 @@ class Keys:
                     raise
                 raise bus.BusError(f"{e}. If this key was trusted before key approvals existed, run `tailshare sessions "
                                    "trust` for it again: its line needs namespaces=\"...,tailshare-keys\"", 403) from None
+            d["_offer"] = False
         now = time.time()
         problems = []
         if d.get("v") != 1 or d.get("action") != "ssh-key":
@@ -1139,6 +1162,11 @@ class Keys:
         errors = {}
         for h in others:
             got, error = self._deliver(key_id, h, payload, signature)
+            if not got and by != "approved here" and mode in ("start", "start-skip") and self.store.one(
+                    "SELECT 1 FROM key_installs WHERE key_id=? AND host=? AND final=1", key_id, h):
+                # h does not know the person's security key: offer it with this machine's key instead
+                again = approval_doc(self.host, self.host, r, key_id, mode, [h], squads=squads, machine=True)
+                got, error = self._deliver(key_id, h, again, self._machine_sign(again))
             if got:
                 installed.append(got)
             else:
@@ -1159,7 +1187,8 @@ class Keys:
         else:
             try:
                 got = bus.request(f"http://{p['ip']}:{p['port']}/bus/v1/keys/install",
-                                  {"v": bus.PROTOCOL, "payload": payload, "signature": signature}, timeout=20)
+                                  {"v": bus.PROTOCOL, "payload": payload, "signature": signature,
+                                   "machine_pubkey": self.machine_pub()}, timeout=20)
                 if got.get("host") != h:
                     raise bus.BusError(f"answered as {got.get('host')!r}", 502)
                 self.store.x("INSERT OR REPLACE INTO key_installs(key_id, host, created, done, final, error)"
@@ -1209,10 +1238,176 @@ class Keys:
             raise bus.BusError(self._owner_problem(), 403)
         self.bus.require_same_user(ip)
         d = self.check_approval(str(body.get("payload") or ""), str(body.get("signature") or ""),
-                                sender=self.bus.net.host_for_ip(ip) or "")
+                                sender=self.bus.net.host_for_ip(ip) or "", machine_pubkey=str(body.get("machine_pubkey") or ""))
+        if d["_offer"]:
+            return self._stage(d)
         r = {k: d.get(k, "") for k in ("pubkey", "fingerprint", "device", "node", "user", "plan_pubkey")}
         by = f"trusted machine {d['signer']}" if d.get("by") == "machine" else f"signed by {d['signer']} (from {d.get('origin')})"
         return self.install_here(d["key_id"], r, d["mode"], by, d.get("squads") is True)
+
+    # -- approve once, everywhere (docs/ssh-keys.md#approve-once) -------------------------
+    def _verify_offer(self, signer: str, payload: str, signature: str, machine_pubkey: str) -> dict:
+        """A start key approval signed by `signer`'s machine key, which this machine does not trust: checked with
+        the key pinned for signer the first time it sent one (taken from that machine itself, over the tailnet).
+        A different key later is refused until a person here forgets the old one."""
+        from .sessions import KEYS_NAMESPACE, verify
+
+        row = self.store.one("SELECT pubkey, first FROM owner_machines WHERE host=?", signer)
+        try:
+            sent = parse_pubkey(machine_pubkey) if machine_pubkey else ""
+        except bus.BusError:
+            sent = ""
+        pub = row["pubkey"] if row else sent
+        if not pub.startswith(MACHINE_KEY_TYPE + " "):
+            raise bus.BusError("approval refused: an offer must come with the sender's machine key", 403)
+        if row and sent and sent != row["pubkey"]:
+            log(f"{signer}'s machine key changed: pinned {fingerprint(row['pubkey'])}, now {fingerprint(sent)}")
+            self._alert("Machine key changed", f"{signer} sent a start key signed with a new machine key. Nothing "
+                        f"was installed. If {signer} was reinstalled, run tailshare keys untrust-machine {signer}.")
+            raise bus.BusError(f"approval refused: {signer}'s machine key is not the one {self.host} pinned "
+                               f"{time.strftime('%Y-%m-%d', time.localtime(row['first']))}. If {signer} was "
+                               f"reinstalled, a person on {self.host} can run `tailshare keys untrust-machine {signer}` "
+                               "to forget the old key", 403, {"reason": "machine_key_changed", "host": signer})
+        with tempfile.TemporaryDirectory() as tmp:
+            signers = Path(tmp) / "signers"
+            signers.write_text(machine_line(signer, pub))
+            d = verify(payload, signature, signers, KEYS_NAMESPACE)
+        if not row:
+            with self.store.lock:
+                self.store.x("INSERT OR IGNORE INTO owner_machines(host, pubkey, first) VALUES(?,?,?)", signer, pub,
+                             time.time())
+                if self.store.one("SELECT pubkey FROM owner_machines WHERE host=?", signer)["pubkey"] != pub:
+                    raise bus.BusError(f"approval refused: {signer} sent two machine keys at once", 403,
+                                       {"reason": "machine_key_changed", "host": signer})
+            log(f"pinned {signer}'s machine key {fingerprint(pub)} for start key offers")
+        return d
+
+    def _stage(self, d: dict) -> dict:
+        """Keep an owner machine's start key approval as an offer: nothing goes into authorized_keys until the
+        device enrolls here and proves it holds the start key. Capped at start (never skip), squads as granted."""
+        problem = install_problem()
+        if problem:
+            raise bus.BusError(problem, 409)
+        key_id, plan = d["key_id"], d.get("plan_pubkey") or ""
+        with self.store.lock:
+            if self.store.one("SELECT 1 FROM revoked_keys WHERE id=?", key_id):
+                raise bus.BusError(f"key {key_id} was revoked; enroll again", 409)
+            for k in (d["pubkey"], plan):
+                if self.store.one("SELECT 1 FROM ssh_keys WHERE id!=? AND (pubkey=? OR plan_pubkey=?)", key_id, k, k):
+                    raise bus.BusError("this key is already installed here under another id", 409)
+            now = time.time()
+            self.store.x("DELETE FROM key_offers WHERE expires<? OR (key_id!=? AND (pubkey=? OR plan_pubkey=?))",
+                         now, key_id, d["pubkey"], plan)
+            if len(self.store.q("SELECT 1 FROM key_offers WHERE key_id!=?", key_id)) >= MAX_OFFERS:
+                raise bus.BusError(f"too many start keys are waiting for their devices on {self.host}", 429)
+            self.store.x("INSERT OR REPLACE INTO key_offers(key_id, signer, pubkey, plan_pubkey, fingerprint, device,"
+                         " node, user, squads, created, expires) VALUES(?,?,?,?,?,?,?,?,?,?,?)", key_id, d["signer"],
+                         d["pubkey"], plan, d["fingerprint"], d["device"], d["node"], d["user"],
+                         int(d.get("squads") is True), now, now + OFFER_TTL)
+        log(f"offered {key_id} ({d['device']} on {d['node']}, {d['fingerprint']}) by {d['signer']}: waits for the device")
+        return {"host": self.host, "login": bus.LOGIN, "mode": "start", "key_id": key_id,
+                "squads": d.get("squads") is True, "staged": True}
+
+    def _redeem(self, ip: str, node: str, user: str, pubkey: str, plan: str, device: str, purpose: str,
+                want: list[str], proof: object) -> dict | None:
+        """Enroll with a proof: the start key signed this machine's name, a recent time and a fresh nonce. With an
+        offer for this very pair, from the device the owner approved it for, it installs now. No offer: None, and
+        the enroll goes on as a request for a person here."""
+        now = time.time()
+        offer = self.store.one("SELECT * FROM key_offers WHERE pubkey=? AND plan_pubkey=? AND expires>=?",
+                               pubkey, plan, now)
+        if offer is None:
+            return None
+
+        def no(reason: str, why: str) -> bus.BusError:
+            return bus.BusError(f"proof refused: {why}", 403, {"reason": reason})
+
+        if self._owner_problem() or user != self.bus.net.user or user != offer["user"]:
+            raise no("not_owner", "only the owner's own devices redeem a start key approved on another machine")
+        if node != offer["node"]:
+            raise no("other_device", f"{offer['signer']} approved this key for {offer['node']}, not {node}")
+        if not isinstance(proof, dict) or set(proof) != {"time", "nonce", "hosts", "signature"}:
+            raise no("bad_proof", "proof is {time, nonce, hosts, signature}")
+        ts, nonce, hosts, sig = proof["time"], proof["nonce"], proof["hosts"], proof["signature"]
+        if not (isinstance(ts, int) and not isinstance(ts, bool) and isinstance(nonce, str)
+                and re.fullmatch(r"[0-9a-f]{32}", nonce) and isinstance(hosts, list) and 0 < len(hosts) <= 64
+                and all(isinstance(h, str) and _HOST_RE.fullmatch(h) for h in hosts)
+                and isinstance(sig, str) and re.fullmatch(r"[A-Za-z0-9+/]{20,4096}={0,2}", sig)):
+            raise no("bad_proof", "malformed proof")
+        if self.host not in hosts:
+            raise no("bad_proof", f"the proof does not name {self.host}")
+        if abs(now - ts) > SIGNED_WINDOW:
+            raise bus.BusError(f"proof refused: its time is more than {SIGNED_WINDOW} s from this machine's clock", 403,
+                               {"reason": "expired", "now": int(now)})
+        self._rate_verify(ip, now)
+        message = "\n".join(["tailshare-start-proof/1", " ".join(hosts), str(ts), nonce, pubkey, plan])
+        if not self._ssh_verify(offer["key_id"], PROOF_NAMESPACE, pubkey, message, sig):
+            raise no("bad_signature", "not signed by this start key, for these machines, at that time")
+        with self.store.lock:
+            self.store.x("DELETE FROM key_nonces WHERE expires<?", now)
+            if self.store.one("SELECT 1 FROM key_nonces WHERE nonce=?", "pf:" + nonce):
+                raise no("replayed", "this nonce was already used: sign a new proof")
+            self.store.x("INSERT INTO key_nonces(nonce, expires) VALUES(?,?)", "pf:" + nonce, ts + 2 * SIGNED_WINDOW)
+            offer = self.store.one("SELECT * FROM key_offers WHERE key_id=?", offer["key_id"])  # revoked meanwhile?
+            if offer is None:
+                raise no("revoked", "the approval was withdrawn")
+        key_id = offer["key_id"]
+        r = {"pubkey": pubkey, "plan_pubkey": plan, "fingerprint": offer["fingerprint"], "device": device,
+             "node": node, "user": user}
+        got = self.install_here(key_id, r, "start", f"approved on {offer['signer']}, proven by the device",
+                                bool(offer["squads"]))  # refuses a revoked id
+        rid = secrets.token_hex(16)
+        with self.store.lock:
+            self.store.x("DELETE FROM key_offers WHERE key_id=?", key_id)
+            self.store.x("UPDATE key_requests SET status='cancelled' WHERE ip=? AND pubkey=? AND status='pending'", ip, pubkey)
+            self.store.x("INSERT INTO key_requests(id, ip, node, user, device, pubkey, fingerprint, created, expires, status,"
+                         " purpose, want, plan_pubkey, key_id, installed) VALUES(?,?,?,?,?,?,?,?,?,'approved',?,?,?,?,?)",
+                         rid, ip, node, user, device, pubkey, offer["fingerprint"], now, now, purpose, json.dumps(want),
+                         plan, key_id, json.dumps([got]))
+        self._alert("Start key installed", f"{device} on {node} can start sessions here (safe mode): approved on "
+                    f"{offer['signer']}. Remove it with tailshare keys rm {key_id}.")
+        return {**self._view(self.store.one("SELECT * FROM key_requests WHERE id=?", rid)),
+                "approved_on": offer["signer"]}
+
+    def _rate_verify(self, ip: str, now: float) -> None:
+        with self.store.lock:
+            recent = [t for t in self._verified.get(ip, []) if t > now - 60]
+            if len(recent) >= VERIFY_PER_MINUTE:
+                raise bus.BusError("signature", 429, {"reason": "rate_limited", "detail": "too many signed requests from "
+                                   "this device in the last minute; try again shortly"})
+            self._verified[ip] = [*recent, now]
+            for a in [a for a, ts in self._verified.items() if not ts or ts[-1] <= now - 60]:
+                del self._verified[a]
+
+    @staticmethod
+    def _ssh_verify(principal: str, namespace: str, pubkey: str, message: str, sig: str) -> bool:
+        """An SSH signature (base64, no armor) of `message` by `pubkey` in `namespace`, checked by ssh-keygen."""
+        from .sessions import ssh_keygen
+
+        armored = "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(sig[i : i + 70] for i in range(0, len(sig), 70)) \
+            + "\n-----END SSH SIGNATURE-----\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            signers, sigfile = Path(tmp) / "signers", Path(tmp) / "sig"
+            signers.write_text(f'{principal} namespaces="{namespace}" {pubkey}\n')
+            sigfile.write_text(armored)
+            cp = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", principal, "-n", namespace,
+                                 "-s", str(sigfile)], input=message.encode(), capture_output=True, timeout=30)
+        return cp.returncode == 0
+
+    def _alert(self, title: str, text: str) -> None:
+        """A desktop notification on a Mac (a person at it sees what tailshare did on its own)."""
+        if sys.platform != "darwin" or os.geteuid() == 0:
+            return
+        script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
+
+        def show() -> None:
+            try:
+                subprocess.run(["osascript", "-e", script, title, text], timeout=10, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        threading.Thread(target=show, daemon=True).start()
 
     def deny(self, body: dict) -> dict:
         n = self.store.x("UPDATE key_requests SET status='denied' WHERE id=? AND status='pending'", str(body.get("id")))
@@ -1226,7 +1421,6 @@ class Keys:
         installed here with the squads grant, for this machine, this method, path and body, recently and once. The
         pane key (a file in iSH, say) and the start key (Face ID on every save) never sign one. Returns the key's
         row; refuses with 403."""
-        from .sessions import ssh_keygen
 
         def no(reason: str, why: str, **more) -> bus.BusError:
             return bus.BusError("signature", 403, {"reason": reason, "detail": why, **more})
@@ -1249,25 +1443,10 @@ class Keys:
         if not row["squads"] or not row["plan_pubkey"]:
             raise no("no_grant", f"key {key_id} was not granted squad edits on {self.host}: grant it there with "
                      f"`tailshare keys grant-squads {key_id}`")
-        with self.store.lock:
-            recent = [t for t in self._verified.get(ip, []) if t > now - 60]
-            if len(recent) >= VERIFY_PER_MINUTE:
-                raise bus.BusError("signature", 429, {"reason": "rate_limited", "detail": "too many signed writes from "
-                                   "this device in the last minute; try again shortly"})
-            self._verified[ip] = [*recent, now]
-            for a in [a for a, ts in self._verified.items() if not ts or ts[-1] <= now - 60]:
-                del self._verified[a]
+        self._rate_verify(ip, now)
         message = "\n".join(["tailshare-squad-write/1", self.host, method, path, ts, nonce,
                               hashlib.sha256(raw).hexdigest()])
-        armored = "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(sig[i : i + 70] for i in range(0, len(sig), 70)) \
-            + "\n-----END SSH SIGNATURE-----\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            signers, sigfile = Path(tmp) / "signers", Path(tmp) / "sig"
-            signers.write_text(f'{key_id} namespaces="{SQUADS_NAMESPACE}" {row["plan_pubkey"]}\n')
-            sigfile.write_text(armored)
-            cp = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", key_id, "-n", SQUADS_NAMESPACE,
-                                 "-s", str(sigfile)], input=message.encode(), capture_output=True, timeout=30)
-        if cp.returncode != 0:
+        if not self._ssh_verify(key_id, SQUADS_NAMESPACE, row["plan_pubkey"], message, sig):
             raise no("bad_signature", "the signature does not match this request on this machine with that key")
         with self.store.lock:
             self.store.x("DELETE FROM key_nonces WHERE expires<?", now)
@@ -1281,12 +1460,13 @@ class Keys:
         with self.store.lock:
             self.store.x("INSERT OR IGNORE INTO revoked_keys(id, at) VALUES(?,?)", key_id, time.time())
             n = self.store.x("DELETE FROM ssh_keys WHERE id=?", key_id)
+            offered = self.store.x("DELETE FROM key_offers WHERE key_id=?", key_id)
             self.store.x("UPDATE key_requests SET status='revoked' WHERE key_id=?", key_id)
             if n:
                 self._rewrite()
-        if n:
-            log(f"removed {key_id}")
-        return bool(n)
+        if n or offered:
+            log(f"removed {key_id}{'' if n else ' (offered, not installed yet)'}")
+        return bool(n or offered)
 
     def grant_squads(self, body: dict) -> dict:
         """`tailshare keys grant-squads`: give an installed start key's plan key squad edits here (or take them back
@@ -1660,6 +1840,9 @@ def cmd_ls(args):
     for k in d["keys"]:
         when = time.strftime("%Y-%m-%d", time.localtime(k["installed"]))
         print(f"{k['id']}  {k['mode'] + ('+squads' if k.get('squads') else ''):<17}  {k['device']!r} on {k['node']} ({k['user']})  {k['fingerprint']}  {when}, {k['approved_by']}")
+    for o in d.get("offered", []):
+        print(f"{o['key_id']}  offered{'+squads' if o['squads'] else '':<10}  {o['device']!r} on {o['node']}  "
+              f"{o['fingerprint']}  approved on {o['signer']}: installs when the device proves it holds the key")
     for r in d.get("installing", []):
         print(f"⚠ {r['key_id']} is not installed on {r['host']}" + ("" if r["final"] else ", retrying") +
               (f" ({r['error']})" if r["error"] else ""))

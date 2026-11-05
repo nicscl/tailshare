@@ -56,7 +56,8 @@ tailshare keys trust-machine macbook-air   # let the Air's approvals install key
   installing. Without one, the approval also goes to the owner's other machines, signed with this machine's
   key, and only the machines where a person ran `tailshare keys trust-machine <this machine>` install it
   ([Machine trust](#machine-trust)). A machine that has not said so never adds a key on another machine's
-  say-so. `--here` skips the others either way.
+  say-so, with one exception: a start key, which it holds as an offer until the device itself proves it holds
+  that key ([Approve once, everywhere](#approve-once)). `--here` skips the others either way.
   Keys trusted with `tailshare sessions trust` sign both launches and key approvals. Lines written before key
   approvals existed name only `tailshare-launch`: run `trust` for that key again. A launch signature is
   never accepted as a key approval, and a key approval is never accepted as a launch.
@@ -105,6 +106,62 @@ tailshare keys untrust-machine X    # on Y: stop
   yet, and removing a key stops its retries.
 - **Removing stays wide.** `keys rm` and a device's own revoke reach every machine of the owner, trusted or
   not, as before.
+
+## Approve once, everywhere
+<a id="approve-once"></a>
+
+A start key (the Face ID pair the app makes to start sessions) approved on one of the owner's machines reaches
+all the others with no `trust-machine` and no `approve` on each one (Nicholas, 2026-11-05: the server should
+handle it). **What it means: anyone who controls one of your machines, or reads its machine key, can let a
+device of yours start safe-mode sessions on all of them.** They cannot give one shell or pane access, skipping
+permissions, or anything for a device that is not yours.
+
+How it goes, for X where a person approved the pair and Y, another machine of the same owner:
+
+1. X sends Y the approval signed with X's machine key, as for a trusted machine, with X's machine public key.
+2. Y does not trust X, so it does not install it. It keeps it as an **offer** for 7 days, when all of these hold:
+   - it came from X's own tailnet address, X belongs to Y's tailnet user, and neither is tagged;
+   - it is signed by X's machine key: the one Y pinned the first time X sent an offer. A different key later
+     is refused, and a Mac shows a notification. If X was reinstalled, `tailshare keys untrust-machine X` on
+     Y forgets the old key;
+   - it is for a start key and its plan key, for Y, within 15 minutes, with an unused nonce, for a key id
+     never revoked on Y.
+   The offer installs nothing. `tailshare keys ls` lists it under `offered`; X's answer for Y says `staged`.
+3. The device enrolls on Y with the same pair and a **proof**: its start key (Face ID) signs Y's name, the time
+   and a fresh nonce. Y installs the pair when the proof checks out, the device is the same tailnet node X
+   approved it for, and that node belongs to the owner. The key goes in as `start` (safe), even if X approved
+   `start-skip`, with the squads grant if X gave it. `keys ls` shows `approved on X, proven by the device`,
+   and a Mac shows a notification.
+
+Without a proof, or with no offer on Y, the enroll is an ordinary request for a person on Y. Pane and shell
+keys and skipping permissions still need a person on Y, a security key or `trust-machine`. An approval X
+first signed with a person's security key, which Y refuses because it does not know that key, is offered to Y
+with X's machine key instead. Removing the key on any machine (`keys rm`, or the device's revoke) removes the
+offer or the key everywhere, and its id never comes back.
+
+The proof, in the enroll body next to `pubkey` and `plan_pubkey`:
+
+```json
+"proof": {"time": 1762300000, "nonce": "<32 hex>", "hosts": ["pro", "prismo"], "signature": "<base64>"}
+```
+
+`signature` is `ssh-keygen -Y sign -n tailshare-start-proof` with the start key (base64 between the armor
+lines, like a signed squad write) over these lines joined by `\n`:
+
+```
+tailshare-start-proof/1
+<hosts joined by spaces>
+<time>
+<nonce>
+<start pubkey>
+<plan pubkey>
+```
+
+`hosts` may name several machines, so one Face ID covers every machine the app enrolls on at once; each
+machine checks it is named. The time must be within 60 s of the machine's clock (`expired` says its time), and
+a nonce works once per machine. Refusals are 403 with `reason`: `not_owner`, `other_device`, `bad_proof`,
+`expired`, `bad_signature`, `replayed` or `revoked`. A successful enroll answers `status: "approved"` with
+`approved_on`.
 
 ## Revoking
 
