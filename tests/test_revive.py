@@ -111,12 +111,17 @@ class Revive(Base):
         con = start._db()
         self.assertEqual(con.execute("SELECT key FROM launched WHERE session=?", (S1,)).fetchone()[0], "k1ae2c3b481a8")
 
-    def test_a_narrowed_key_reopens_without_skip(self):
+    def test_a_narrowed_key_stops_up_front_and_spends_no_tries(self):
         self.skip_launch("k1ae2c3b481a8")
         self.key("k1ae2c3b481a8", "start")  # approved again as a safe start key
-        (r,) = self.tick()
-        self.assertEqual(r["refused"]["error"], "no_skip_grant")
+        with mock.patch("tailshare.bus.log") as log:
+            self.assertEqual(self.tick(), [{"id": S1, "stopped": "key"}])
+        self.assertIn("no longer allows it", log.call_args_list[0].args[0])
         self.launch.assert_not_called()
+        self.assertIsNone(start._db().execute("SELECT 1 FROM revives").fetchone())  # no try spent
+        self.m.bus.store.x("UPDATE ssh_keys SET mode='start-skip'")  # allowed skip again: reopens with it
+        (r,) = self.tick(700)
+        self.assertIn("revived", r)
 
     def test_a_removed_key_is_never_reopened_and_the_owner_hears(self):
         self.skip_launch("k1ae2c3b481a8")
@@ -135,7 +140,7 @@ class Revive(Base):
         con = start._db()
         self.assertIsNone(con.execute("SELECT 1 FROM launched").fetchone())
         con.close()
-        item, grant, key = revive._item(self.m.bus, start._db(), {"id": S1, "kind": "claude", "cwd": self.app,
+        item, grant, key, _ = revive._item(self.m.bus, start._db(), {"id": S1, "kind": "claude", "cwd": self.app,
                                                                   "name": "AppDev"})
         self.assertEqual((item["options"], grant, key), ({"resume": S1}, "safe", ""))
         self.assertIn("revived", self.tick()[0])

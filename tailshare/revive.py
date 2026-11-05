@@ -64,21 +64,25 @@ def _key_grant(b, key: str) -> str | None:
     return {"start-skip": "skip", "start": "safe"}.get(k["mode"]) if k else None
 
 
-def _item(b, con: sqlite3.Connection, r: dict) -> tuple[dict, str | None, str]:
+def _item(b, con: sqlite3.Connection, r: dict) -> tuple[dict, str | None, str, str]:
     """The start that resumes dead row `r`, with the options it was started with here (start.db `launched`); the
-    grant to build it with, never more than the start key that approved it may do now (None: that key is gone);
-    and that key. One started before launches were recorded: only resume, and the safe grant."""
+    grant to build it with, never more than the start key that approved it may do now; that key; and, when the
+    grant is None (not reopened), why: the key is gone, or it was started with skip and its key no longer allows
+    skip (reopening it without skip would not be the same session, and would only be refused). One started before
+    launches were recorded: only resume, and the safe grant."""
     row = con.execute("SELECT options, grant_, key FROM launched WHERE session=?", (r["id"],)).fetchone()
     opts = json.loads(row["options"]) if row else {}
     opts = {k: v for k, v in opts.items() if k != "resume"} if isinstance(opts, dict) else {}
     item = {"kind": r["kind"], "cwd": r["cwd"], "name": r["name"], "options": {**opts, "resume": r["id"]},
             "device_name": "revive"}
     if not row or not row["key"]:
-        return item, "safe", ""
+        return item, "safe", "", ""
     now = _key_grant(b, row["key"])
     if now is None:
-        return item, None, row["key"]
-    return item, ("skip" if row["grant_"] == "skip" and now == "skip" else "safe"), row["key"]
+        return item, None, row["key"], "gone"
+    if row["grant_"] == "skip" and now != "skip":
+        return item, None, row["key"], "narrowed"
+    return item, row["grant_"] if row["grant_"] in ("skip", "safe") else "safe", row["key"], ""
 
 
 def _flag(b, con: sqlite3.Connection, key: str, r: dict | None, why: str, now: float, title: str = "") -> None:
@@ -129,10 +133,12 @@ def tick(b, now: float | None = None) -> list[dict]:
             past = con.execute("SELECT at, weight FROM revives WHERE session=? AND at>? ORDER BY at", (sid, cut)).fetchall()
             if past and past[-1]["at"] + BACKOFF[min(len(past), len(BACKOFF)) - 1] > now:
                 continue
-            item, grant, key = _item(b, con, r)
+            item, grant, key, gone = _item(b, con, r)
             if grant is None:
-                _flag(b, con, sid, r, f"the start key that opened it ({key}) was removed from this host", now,
-                      f"{r['name']} crashed: not reopened, its start key is gone")
+                _flag(b, con, sid, r, f"the start key that opened it ({key}) was removed from this host"
+                      if gone == "gone" else f"it was started with skip, and its start key ({key}) no longer allows it",
+                      now, f"{r['name']} crashed: not reopened, its start key " +
+                      ("is gone" if gone == "gone" else "no longer allows skip"))
                 out.append({"id": sid, "stopped": "key"})
                 continue
             # dying soon after the last revive (or never coming up: last_seen before it) counts twice
