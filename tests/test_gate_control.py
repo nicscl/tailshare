@@ -569,6 +569,8 @@ class GateLog(unittest.TestCase):
                 keys.gate_log("x" * 80)
             self.assertTrue((d / "tailshare-gate.log.1").exists())
             self.assertLess((d / "tailshare-gate.log").stat().st_size, 400)
+            total = sum(p.read_text().count("\n") for p in d.glob("tailshare-gate.log*"))
+            self.assertGreaterEqual(total, 3)  # nothing written was lost to a rotation but what .1 replaced
 
 
 if __name__ == "__main__":

@@ -251,7 +251,8 @@ place on the machine that says which clients were attached when a tmux server fe
 ```
 
 `end` gives the reason (`detached`, `gone`, `idle`, `moved`, `nosize`), tmux's exit code, and whether the
-tmux server still answered (`server=down` with a crash). The gate's dropped lines go there too. A plain
+tmux server still answered (`server=down` with a crash). The gate's dropped lines go there too, so the log keeps up to 120 bytes of each line a
+client sent that the gate refused. A plain
 `attach` leaves one `attach … plain` line, because the gate becomes tmux after that.
 
 This narrows what the client can do. It does not make a pane key safer: the same key can still run

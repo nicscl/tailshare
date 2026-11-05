@@ -103,14 +103,19 @@ def gate_log(msg: str) -> None:
     path = LOG.with_name("tailshare-gate.log")
     conn = (os.environ.get("SSH_CONNECTION") or "-").split()[0]
     line = f"{datetime.now().astimezone():%Y-%m-%d %H:%M:%S%z} gate[{os.getpid()}] from={conn} {msg}\n"
+    import fcntl
+
+    def opened() -> int:
+        return os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
     try:
-        if path.stat().st_size > GATE_LOG_MAX:
-            os.replace(path, path.with_name(path.name + ".1"))
-    except OSError:
-        pass
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = opened()
         try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # two gates rotating at once must not move a fresh log over .1
+            if os.fstat(fd).st_size > GATE_LOG_MAX and os.path.samestat(os.fstat(fd), os.stat(path)):
+                os.replace(path, path.with_name(path.name + ".1"))
+                os.close(fd)
+                fd = opened()
             os.write(fd, line.encode("utf-8", "replace"))
         finally:
             os.close(fd)
