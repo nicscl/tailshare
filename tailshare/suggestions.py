@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import string
 import time
@@ -28,12 +29,16 @@ ADD_FIELDS = ("name", "role", "icon", "host", "kind", "folder", "instructions", 
 SET_FIELDS = ("name", "role", "icon", "instructions", "reports_to")
 SHOWN = ADD_FIELDS  # a member's fields as a diff shows them
 _B62 = string.digits + string.ascii_letters
+NONCE = re.compile(r"[A-Za-z0-9._:-]{1,64}")  # an intent key: one pending suggestion per agent and nonce
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS squad_suggestions(id TEXT PRIMARY KEY, owner TEXT NOT NULL, squad TEXT NOT NULL,
   base TEXT NOT NULL, created REAL NOT NULL, status TEXT NOT NULL, why TEXT NOT NULL, by_ TEXT NOT NULL,
-  agent TEXT NOT NULL, ops TEXT NOT NULL, diff TEXT NOT NULL, key TEXT NOT NULL, resolved_at REAL);
+  agent TEXT NOT NULL, ops TEXT NOT NULL, diff TEXT NOT NULL, key TEXT NOT NULL, resolved_at REAL,
+  nonce TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT '', supersedes TEXT, superseded_by TEXT, corrects TEXT);
 """
+LATER = (("nonce", "TEXT NOT NULL DEFAULT ''"), ("author", "TEXT NOT NULL DEFAULT ''"), ("supersedes", "TEXT"),
+         ("superseded_by", "TEXT"), ("corrects", "TEXT"))
 
 Bad = squads.Bad
 
@@ -57,6 +62,10 @@ class Suggestions:
         self.squads, self.bus, self.store = sq, sq.bus, sq.store
         with self.store.lock:
             self.store.db.executescript(SCHEMA)
+            have = {r[1] for r in self.store.db.execute("PRAGMA table_info(squad_suggestions)")}
+            for col, decl in LATER:
+                if col not in have:
+                    self.store.db.execute(f"ALTER TABLE squad_suggestions ADD COLUMN {col} {decl}")
 
     # -- checking ops --------------------------------------------------------------------
     def _owner_host(self, host: str) -> bool:
@@ -194,6 +203,11 @@ class Suggestions:
         """POST /squads/<id>/suggestions from a live local agent."""
         aid = str(body.get("agent") or "")
         why = reports.text(body.get("why"), "why", WHY_MAX, lines=True, required=True)
+        nonce = body.get("nonce")
+        if nonce is None:
+            nonce = secrets.token_hex(8)
+        elif not isinstance(nonce, str) or not NONCE.fullmatch(nonce):
+            raise Bad("nonce", "1 to 64 of A-Z a-z 0-9 . _ : -")
         now = time.time()
         with self.store.lock:
             self._expire(now)
@@ -223,13 +237,20 @@ class Suggestions:
                                   self.squads.owner, sid, key)
             if same:
                 return {"suggestion": self.view(self._row(same["id"]))}
+            # the same intent from the same agent (its address survives a resume): the latest wins
+            earlier = self.store.q("SELECT id, status FROM squad_suggestions WHERE owner=? AND squad=? AND nonce=? AND "
+                                   "author=? ORDER BY created DESC", self.squads.owner, sid, nonce, a["address"])
+            old = [r["id"] for r in earlier if r["status"] == "pending"]
+            corrects = next((r["id"] for r in earlier if r["status"] == "applied"), None) if not old else None
             squad_pending = self.store.one(
-                "SELECT COUNT(*) AS n FROM squad_suggestions WHERE owner=? AND squad=? AND status='pending' AND base=?",
-                self.squads.owner, sid, version)["n"]
+                "SELECT COUNT(*) AS n FROM squad_suggestions WHERE owner=? AND squad=? AND status='pending' AND base=?"
+                f" AND id NOT IN ({','.join('?' * len(old))})", self.squads.owner, sid, version, *old)["n"]
             versions = {sid: version}
             agent_pending = 0
-            for r in self.store.q("SELECT squad, base FROM squad_suggestions WHERE owner=? AND agent=? AND status='pending'",
+            for r in self.store.q("SELECT id, squad, base FROM squad_suggestions WHERE owner=? AND agent=? AND status='pending'",
                                   self.squads.owner, aid):
+                if r["id"] in old:
+                    continue
                 if r["squad"] not in versions:
                     versions[r["squad"]] = self.squads.sum(r["squad"])
                 agent_pending += r["base"] == versions[r["squad"]]
@@ -246,8 +267,13 @@ class Suggestions:
                 author = next((m for m in sq["members"] if m["id"] == member), None)
                 if author:
                     by["name"] = reports.text(author["name"], "by.name", 200)
-            self.store.x("INSERT INTO squad_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)", sgid, self.squads.owner,
-                         sid, version, now, "pending", why, json.dumps(by), aid, json.dumps(ops), json.dumps(diff), key)
+            self.store.x("INSERT INTO squad_suggestions(id, owner, squad, base, created, status, why, by_, agent, ops, diff,"
+                         " key, nonce, author, supersedes, corrects) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", sgid,
+                         self.squads.owner, sid, version, now, "pending", why, json.dumps(by), aid, json.dumps(ops),
+                         json.dumps(diff), key, nonce, a["address"], old[0] if old else None, corrects)
+            for o in old:
+                self.store.x("UPDATE squad_suggestions SET status='superseded', resolved_at=?, superseded_by=? WHERE id=?",
+                             now, sgid, o)
             return {"suggestion": self.view(self._row(sgid))}
 
     def apply(self, sid: str, sgid: str, body: dict) -> dict:
@@ -320,7 +346,8 @@ class Suggestions:
             status = "stale"
         return {"id": r["id"], "squad": r["squad"], "host": self.bus.net.host, "base": r["base"], "created": r["created"],
                 "status": status, "why": r["why"], "by": json.loads(r["by_"]), "ops": json.loads(r["ops"]),
-                "diff": json.loads(r["diff"]),
+                "diff": json.loads(r["diff"]), "nonce": r["nonce"], "supersedes": r["supersedes"],
+                "superseded_by": r["superseded_by"], "corrects": r["corrects"],
                 "resolved": None if r["resolved_at"] is None else {"at": r["resolved_at"], "how": r["status"]}}
 
     def here(self, sid: str) -> dict:

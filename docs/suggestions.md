@@ -26,8 +26,19 @@ yet can ask to join.
 `POST /bus/v1/squads/<id>/suggestions` (local API) with:
 
 ```
-{agent: <agent id>, base: <squad version>, why: text ≤ 600, ops: [op, …] (1–8)}
+{agent: <agent id>, base: <squad version>, why: text ≤ 600, ops: [op, …] (1–8), nonce?: <intent key>}
 ```
+
+**Correcting a proposal: reuse its nonce.** `nonce` (1–64 of `A-Z a-z 0-9 . _ : -`) names what the suggestion is
+for. Without one the server picks a fresh one; every suggestion returns its `nonce`. A new suggestion with the
+same nonce, from the same agent (its address, so it survives a resume), in the same squad:
+- **replaces** that agent's pending one (stale included): the old one becomes `superseded`, with `superseded_by`
+  set to the new id, and can no longer be applied or dismissed (409 `not_pending`). The new one has
+  `supersedes`. One pending suggestion per intent: the latest wins;
+- with none pending but one already **applied**, links to it as `corrects`, for the owner to see it is a
+  correction. That changes nothing about either one.
+
+CLI: `tailshare squad suggest … --nonce <key>`; MCP: the `squad` tool's `nonce`.
 
 `base` is the top-level `version` from `GET /squads/<id>` (beside `squad`, not inside it).
 It is the squad's checksum, the one machines already compare (`squad_sums` in /hello), so it is the same on every machine of the
@@ -62,7 +73,8 @@ Answer: `200 {suggestion}`.
 
 **Limits.**
 - Per squad: 20 pending. Stale suggestions do not consume pending quotas.
-- Per agent: 3 pending across squads, and 10 new suggestions an hour (including ones now stale).
+- Per agent: 3 pending across squads, and 10 new suggestions an hour (including ones now stale). One that
+  replaces a pending one does not add to the 3.
 - A suggestion expires 7 days after it is made.
 - A second suggestion with the same `base` and `ops` as a pending one returns that pending one.
 
@@ -73,14 +85,15 @@ Answer: `200 {suggestion}`.
  by: {agent, host, member | null, name?: <member name at base>},
  ops: [op, …],
  diff: [change, …],
- resolved: null | {at, how: "applied" | "dismissed" | "expired"}}
+ nonce, supersedes: <sid> | null, superseded_by: <sid> | null, corrects: <sid> | null,
+ resolved: null | {at, how: "applied" | "dismissed" | "expired" | "superseded"}}
 ```
 
 `by.member` is the suggester's member **id** (or null), not its name. The optional `by.name` snapshots the member name at
 `base`, so removed or renamed authors keep that label. Older suggestions without it fall back to `by.agent`;
 the app must not substitute a later member name.
 
-`status` is `pending`, `stale`, `applied`, `dismissed` or `expired`. It is `stale` whenever `base` is not the current
+`status` is `pending`, `stale`, `applied`, `dismissed`, `expired` or `superseded`. It is `stale` whenever `base` is not the current
 version. That is worked out when the suggestion is read, so a suggestion goes stale as soon as anything changes the
 squad, anywhere. A stale suggestion can't be applied; the agent can send a new one against the new version.
 
@@ -122,7 +135,7 @@ Apply:
   the same. The app sends the `base` it showed, so it applies exactly the diff the person saw;
 - applies every op as one write, all or nothing, with fresh revs, then marks the suggestion `applied`. The squad
   then replicates as usual, and every other pending suggestion for it goes stale;
-- refuses with 409 `not_pending` if the suggestion was already applied, dismissed or expired.
+- refuses with 409 `not_pending` if the suggestion was already applied, dismissed, expired or superseded.
 
 Dismiss marks it `dismissed`, including a stale suggestion. A resolved or expired one returns 409
 `not_pending` with `{suggestion}`. HTTP errors use the `error` field (`stale` or `not_pending`); `reason`
