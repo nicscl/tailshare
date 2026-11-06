@@ -290,7 +290,8 @@ The bus looks every 30 s for a session it would list as dead (above) that is res
 within 15 minutes, and that did not end: no `SessionEnd`, no Close. That is a crash: tmux died, or its pane or
 server was killed. It reopens it as a device's Reopen would: a start that resumes it, in its own folder under its
 own name, re-checked against start.json now. It uses the options the session was started with here (start.db
-`launched`), and never more than the start key that approved that start may do now: it skips permissions only if it
+`launched`; a new Codex thread's id is known only when it registers, so its start is recorded then, if it registers
+from the pane that start made, in the same folder, within 10 min, once per start), and never more than the start key that approved that start may do now: it skips permissions only if it
 was started skipping and that key is still installed here as a skip key. A key approved again without skip, or one
 that was removed, means no reopen at all (`stopped: key`, no try spent), and the owner is told as past a cap
 (below). Reopening it without skip would not be the same session. If the key is approved again as a skip key
