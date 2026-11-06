@@ -6,8 +6,10 @@ a resume against the same list). Nothing here starts anything."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -69,6 +71,73 @@ def is_live(a, now: float | None = None) -> bool:
         return False
     st = _json(a["state"] if "state" in a.keys() else "")
     return not (isinstance(st, dict) and st.get("v") == "ended")
+
+
+SHELLS = ("zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "-zsh", "-bash", "login")
+AGENTS = ("claude", "codex", "node")  # what an agent's registered pid runs (Claude Code is node underneath)
+
+
+def ended(a) -> bool:
+    st = _json(a["state"] if "state" in a.keys() else "")
+    return isinstance(st, dict) and st.get("v") == "ended"
+
+
+def _comm(pid: int) -> str:
+    """The program `pid` runs: its first argument's (or, for node, its script's) file name."""
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, timeout=3, check=False,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    argv = r.stdout.split() if r.returncode == 0 else []
+    names = [os.path.basename(x) for x in argv[:2]]
+    return next((n for n in names if n in AGENTS and n != "node"), names[0] if names else "")
+
+
+def pid_runs(pid: object) -> bool:
+    """Whether `pid` is still an agent's process (not a pid the system gave to something else since)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False  # another user's process: not this user's agent
+    except OSError:
+        return False
+    return _comm(pid) in AGENTS
+
+
+def pane_runs(t: dict) -> bool:
+    """Whether the registered pane is still there and runs something other than a bare shell."""
+    from . import keys
+
+    binary = keys.tmux_binary(t.get("bin") or "")
+    if not (binary and keys.own_socket(t["socket"])):
+        return False
+    try:
+        r = subprocess.run([binary, "-S", t["socket"], "display", "-p", "-t", t["pane"],
+                            "#{pane_id}\t#{pane_dead}\t#{pane_current_command}"],
+                           capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pane, _, rest = r.stdout.strip().partition("\t")
+    dead_, _, cmd = rest.partition("\t")
+    return r.returncode == 0 and pane == t["pane"] and dead_ != "1" and os.path.basename(cmd) not in SHELLS
+
+
+def holds(a, now: float | None = None) -> bool:
+    """Whether agents row `a` still is a running agent: it polled within bus.LIVE, or it went quiet (a long tool
+    call polls nothing) while its process or its pane still runs. Never one that ended."""
+    if ended(a):
+        return False
+    if is_live(a, now):
+        return True
+    if pid_runs(a["pid"] if "pid" in a.keys() else 0):
+        return True
+    t = bus.clean_tmux(_json(a["tmux"] if "tmux" in a.keys() else ""))
+    return bool(t) and pane_runs(t)
 
 
 def _pane_gone(t: dict, cache: dict) -> bool:

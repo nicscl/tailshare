@@ -507,7 +507,8 @@ class Net:
             if ips:
                 peers[name(p)] = {"ip": ips[0], "port": BUS_PORT, "online": bool(p.get("Online")),
                                   "user": logins.get(str(p.get("UserID")), ""),
-                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys")), "id": str(p.get("ID") or "")}
+                                  "ssh_host_keys": clean_host_keys(p.get("sshHostKeys")), "id": str(p.get("ID") or ""),
+                                  "last_seen": str(p.get("LastSeen") or "")[:40]}
                 nodes.append({"host": name(p), **peers[name(p)]})
         self.peers, self.nodes = peers, nodes
 
@@ -603,6 +604,7 @@ class Bus:
         self.keys = None  # set by start_bus: keys.Keys (SSH keys devices ask for)
         self.squads = None  # set by start_bus: squads.Squads (docs/squads.md)
         self.reports = None  # set by start_bus: reports.Reports (docs/reports.md)
+        self.keep_due = False  # a member's run changed: keep running (keep.py) looks again on the next turn
         self.battery = power.Battery()
 
     # -- agents ---------------------------------------------------------------
@@ -630,7 +632,11 @@ class Bus:
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
         now = time.time()
         with self.store.lock:  # the tag's "no other live holder" and the write that takes it, as one step
-            squad = self.squads.check_tag(squad, aid, harness, cwd) if squad and self.squads else {}
+            if self.squads is None:
+                squad = {}
+            else:  # started as a member, or by hand as one: in its folder, under its name (squads.match_tag)
+                squad = (self.squads.check_tag(squad, aid, harness, cwd) if squad
+                         else self.squads.match_tag(aid, harness, cwd, session))
             row = self.store.one("SELECT address FROM agents WHERE id=?", aid)
             if row and row["address"].split(":")[0] == base:
                 address = row["address"]  # keep a collision suffix stable
@@ -921,6 +927,10 @@ class Bus:
                 for a, f in zip(agents, full):
                     if f["id"] in rv:
                         a["revived"] = rv[f["id"]]
+            if own and self.squads is not None:  # keep running: each member here, and those on machines that are off
+                from . import keep
+
+                out["keep"] = keep.hello() + keep.offline(self)
             if own:  # what a start key may start here (tailshare/start.py); never the folders
                 from . import start
 
@@ -1188,13 +1198,17 @@ class Bus:
 
     # -- running --------------------------------------------------------------
     def _loop(self) -> None:
-        from . import revive
+        from . import keep, revive
 
         was_online: set[str] = set()
-        last_hello = last_revive = 0.0
+        last_hello = last_revive = last_keep = 0.0
+        last_turn = time.time()
         while True:
             self.kick.wait(5)
             self.kick.clear()
+            woke = time.time() - last_turn > 60  # the machine slept: every member is looked at again right away
+            last_turn = time.time()
+            back: set[str] = set()
             try:
                 now = time.time()
                 if now - self.net.updated > 15:
@@ -1221,6 +1235,13 @@ class Bus:
                     revive.tick(self)
                 except Exception as e:  # noqa: BLE001
                     log(f"revive: {e!r}")
+            if self.keep_due or woke or back or time.time() - last_keep >= keep.CHECK:
+                self.keep_due = False
+                last_keep = time.time()
+                try:
+                    keep.tick(self)
+                except Exception as e:  # noqa: BLE001
+                    log(f"keep: {e!r}")
 
     def listen(self, addr: str, local: bool) -> ThreadingHTTPServer:
         srv = ThreadingHTTPServer((addr, self.port), _Handler)
@@ -1361,8 +1382,18 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._reply(200, b.accept(ip, body))
                 if (method, path) == ("POST", "/update"):
                     return self._reply(200, b.update_trigger(ip))
+                if (method, path) == ("POST", "/member/run"):  # a lead on another of the owner's machines
+                    from . import keep
+
+                    return self._reply(200, keep.route_peer(b, ip, body))
             elif (method, path) == ("POST", "/register"):
                 return self._reply(200, b.register(body))
+            elif (method, path) == ("POST", "/member/run"):
+                from . import keep
+
+                if b.squads is None:
+                    raise BusError("squads are not available on this machine", 409)
+                return self._reply(200, keep.route_local(b, body, self.headers.get("X-Tailshare-Keys", "")))
             elif (method, path) == ("POST", "/state"):
                 return self._reply(200, b.report_state(body))
             elif (method, path) == ("POST", "/send"):

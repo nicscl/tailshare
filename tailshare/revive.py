@@ -137,10 +137,16 @@ def tick(b, now: float | None = None) -> list[dict]:
     try:
         cut = now - HOUR
         servers = set()  # tmux servers counted toward the host's cap in this look
+        from . import keep
+
+        kept = keep.managed(b)  # squad members here: keep running (keep.py) brings them back, not this watchdog
         for r in listed:
             st = states.get(r["id"])
             if not st or st["ended"]:
                 continue  # ended on purpose
+            tag = r.get("squad") or {}
+            if tag and (tag.get("id"), tag.get("member")) in kept:
+                continue
             sid = r["id"]
             past = con.execute("SELECT at, weight FROM revives WHERE session=? AND at>? ORDER BY at", (sid, cut)).fetchall()
             if past and past[-1]["at"] + BACKOFF[min(len(past), len(BACKOFF)) - 1] > now:
