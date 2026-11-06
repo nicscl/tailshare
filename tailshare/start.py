@@ -1177,6 +1177,19 @@ def handle(doc: object, grant: str, key: str, host: str, cfg_path: Path | None =
             raise Refused("no_grant", reason="this key may not start sessions")
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             raise Refused("root", reason="tailshare never starts sessions as root")
+        if isinstance(doc, dict) and "trust_codex_hooks" in doc:  # tailshare's own Codex hooks: codex_trust.py
+            if doc.get("v") != 1 or len(doc) != 2 or doc["trust_codex_hooks"] != {}:
+                raise Refused("bad_request", reason="send {\"v\":1, \"trust_codex_hooks\":{}} alone")
+            if plan_only:
+                raise Refused("no_grant", reason="the plan key only makes plans: trust hooks with the start key")
+            con = _db(db)
+            try:
+                _rate(con, key)
+            finally:
+                con.close()
+            from . import codex_trust
+
+            return {"v": 1, "ok": True, "codex_hooks": codex_trust.trust()}
         if isinstance(doc, dict) and set(doc) & set(CONFIG_OPS):
             if doc.get("v") != 1 or len(doc) != 2:
                 raise Refused("bad_request", reason="a config change goes alone: {\"v\":1, \"<change>\":{…}}")

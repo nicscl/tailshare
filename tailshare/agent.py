@@ -642,7 +642,8 @@ def cmd_uninstall_claude(args):
 # --------------------------------------------------------------------------- Codex hooks
 
 # Codex's hooks (~/.codex/hooks.json) take Claude's shape and input; session_id is the thread id. Codex runs a hook
-# only once the person trusts it (/hooks in Codex): tailshare never marks its own hooks trusted.
+# only once the person trusts it: /hooks in Codex, `tailshare agent trust-codex`, or the owner's device with the
+# start key (codex_trust.py). Only tailshare's own hooks, through Codex's app-server.
 CODEX_STATE_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop",
                       "SessionEnd")
 
@@ -675,7 +676,7 @@ def cmd_install_codex(args):
         print(f"✓ hooks added to {path} (backup: hooks.json.bak-tailshare)")
     else:
         print("✓ hooks already installed")
-    print("  Codex runs new hooks only after you trust them: open /hooks in Codex once and trust tailshare's.")
+    print("  Codex runs new hooks only after you trust them: `tailshare agent trust-codex`, or /hooks in Codex.")
     codex = shutil.which("codex")
     if not codex:
         print("✗ codex CLI not found; add the MCP server yourself: codex mcp add tailshare -- tailshare mcp")
@@ -686,6 +687,12 @@ def cmd_install_codex(args):
         cp = subprocess.run([codex, "mcp", "add", "tailshare", "--", *shlex.split(t), "mcp"], capture_output=True, text=True)
         print("✓ MCP server registered" if cp.returncode == 0 else f"✗ codex mcp add: {cp.stderr.strip()}")
     print("New Codex sessions join the bus once the hooks are trusted.")
+
+
+def cmd_trust_codex(args):
+    from . import codex_trust
+
+    codex_trust.cmd_trust(args)
 
 
 def cmd_uninstall_codex(args):
@@ -774,5 +781,7 @@ def add_parser(sub) -> None:
     p.set_defaults(fn=cmd_uninstall_claude)
     p = s.add_parser("install-codex", help="join every Codex session to the bus (hooks + MCP)")
     p.set_defaults(fn=cmd_install_codex)
+    p = s.add_parser("trust-codex", help="trust tailshare's Codex hooks here (in your own terminal)")
+    p.set_defaults(fn=cmd_trust_codex)
     p = s.add_parser("uninstall-codex", help="undo install-codex")
     p.set_defaults(fn=cmd_uninstall_codex)

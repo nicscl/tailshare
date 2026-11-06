@@ -973,6 +973,11 @@ class Bus:
                     off = start.off_reason()
                     if off:
                         out["start_off"] = off
+                from . import codex_trust
+
+                hooks = codex_trust.cached()  # whether this Codex runs tailshare's hooks; None: no Codex here
+                if hooks:
+                    out["codex_hooks"] = hooks
         return out
 
     def _pane_alive(self, t: dict) -> bool:
