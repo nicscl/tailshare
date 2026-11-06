@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tailshare import bus, sessions
+from tailshare import bus, sessions, sessions_cli, start
 from tests.test_bus import StaticNet, free_port, make_bus
 
 SID = "11111111-2222-3333-4444-555555555555"
@@ -262,13 +262,51 @@ class Launch(Fixture):
         self.assertIn("expired", self.refused(*self.request(issued=time.time() - 900, expires=time.time() - 1)))
         self.assertIn("not allowed", self.refused(*self.request(mode="bypassPermissions")))
         self.assertIn("folder", self.refused(*self.request(cwd="/etc")))
-        self.assertIn("only Claude", self.refused(*self.request(session=CODEX_ID, harness="codex")))
+        self.assertIn("folder", self.refused(*self.request(session=CODEX_ID, harness="codex")))  # its cwd is not ours
+        self.assertIn("cannot be launched", self.refused(*self.request(harness="codex")))  # signed as another harness
         # signed by a key this machine does not trust
         other = self.keys / "other"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(other)], check=True)
         p, _ = self.request()
         self.refused(p, sessions.sign(p, other))
         self.assertEqual(self.ran, [])
+
+    def test_a_codex_thread_launches_in_tmux(self):
+        codex = self.index.get(CODEX_ID)
+        got = []
+        saved = sessions.codex_launch
+        sessions.codex_launch = lambda s, mode, prompt, signer: (got.append((s["id"], mode, prompt, signer)),
+                                                                 {"socket": "/tmp/ts-x", "pane": "%3", "bin": "t"})[1]
+        try:
+            d = json.loads(sessions.launch_request("nick", "pro", codex, "plan", "look"))
+            payload = sessions.canonical(d)
+            r = self.svc.launch_local(payload, sessions.sign(payload, self.key))
+        finally:
+            sessions.codex_launch = saved
+        self.assertEqual(got, [(CODEX_ID, "plan", "look", "nick")])
+        self.assertEqual((r["harness"], r["tmux"]), ("codex", {"socket": "/tmp/ts-x", "pane": "%3"}))
+        self.assertEqual(self.ran, [])  # never `claude --bg`
+        self.assertIn("tmux -S /tmp/ts-x attach -t %3", sessions_cli.attach_hint(r))
+        self.assertIn("claude attach", sessions_cli.attach_hint({"host": "pro", "id": SID, "harness": "claude"}))
+
+    def test_codex_launch_plan(self):
+        """What a Codex launch runs: `codex resume`, the mode's approval and sandbox, the id and prompt after `--`."""
+        plans = []
+        saved = start.launch, start.binary
+        start.launch = lambda plan, max_running: (plans.append(plan), {"tmux": {"socket": "s", "pane": "%1", "bin": "t"}})[1]
+        start.binary = lambda kind, cfg: "/opt/homebrew/bin/codex"
+        try:
+            for mode in sessions.MODES:
+                sessions.codex_launch({"id": CODEX_ID, "cwd": "/p", "name": "Bob\x1b]"}, mode, "-go", "nick")
+        finally:
+            start.launch, start.binary = saved
+        for p in plans:
+            argv = start.argv_for("codex", p["argv"][0], p["cwd"], p["name"], p["options"], "", p["prompt"], p["session"])
+            self.assertEqual(argv[:3], ["/opt/homebrew/bin/codex", "resume", "--cd=/p"])
+            self.assertEqual(argv[-3:], ["--", CODEX_ID, "-go"])
+            self.assertFalse([a for a in argv if "bypass" in a or "danger" in a])
+            self.assertEqual((p["name"], p["tmux"]["window"]), ("Bob]", "bob"))
+        self.assertIn("--sandbox=read-only", start.argv_for("codex", "c", "/p", "n", plans[1]["options"], "", "", ""))
 
     def test_running_session_is_not_launched(self):
         self.live = True

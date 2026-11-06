@@ -446,6 +446,40 @@ def ask_prompt(question: str, asker: str) -> str:
     )
 
 
+# A launch mode for Codex, which has no permission modes: an approval policy and a sandbox. Never
+# danger-full-access or the bypass, as no mode is bypassPermissions for Claude.
+CODEX_MODES = {
+    "manual": {"approval": "untrusted", "sandbox": "workspace-write"},  # asks before anything not known safe
+    "plan": {"approval": "on-request", "sandbox": "read-only"},  # reads and plans; writes nothing
+    "dontAsk": {"approval": "never", "sandbox": "read-only"},  # never asks: what it may not do fails
+    "acceptEdits": {"approval": "on-request", "sandbox": "workspace-write"},  # edits the folder, asks to leave it
+    "auto": {"approval": "on-request", "sandbox": "workspace-write"},  # Codex's own --full-auto
+}
+
+
+def codex_launch(s: dict, mode: str, prompt: str, signer: str) -> dict:
+    """Resume Codex thread `s` in a tmux window (Codex has no `--bg`), on the per-agent server `tailshare
+    start` uses, so a device can attach to it and the bus sees its pane. Returns {socket, pane, bin}."""
+    from . import start
+
+    try:
+        cfg = start.load_config() or {}
+        exe = start.binary("codex", {"kinds": {"codex": {}}})  # the fixed search path, files only we can change
+        name = "".join(c for c in (s.get("name") or "") if c.isprintable())[:64] or s["id"][:8]
+        env = {"TAILSHARE_AGENT_NAME": name, "TAILSHARE_STARTED_BY": f"a launch signed by {signer}"[:120],
+               "PATH": os.pathsep.join(dict.fromkeys([os.path.dirname(exe), os.path.expanduser("~/.local/bin"),
+                                                      "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))}
+        plan = {"kind": "codex", "name": name, "cwd": s["cwd"], "argv": [exe], "env": env, "session": s["id"],
+                "options": {**CODEX_MODES[mode], "resume": s["id"]}, "instructions": "", "prompt": prompt,
+                "tmux": {"session": start.SESSION, "window": start.slug(name)}}
+        return start.launch(plan, int(cfg.get("max_running") or 12))["tmux"]
+    except start.Refused as e:
+        why = e.out.get("reason") or e.out["error"]
+        if e.out["error"] == "not_installed":
+            raise bus.BusError("codex is not installed on this machine", 409) from None
+        raise bus.BusError(f"codex launch refused: {why}", 409 if e.out["error"] in ("running", "limit") else 502) from None
+
+
 def launch_command(s: dict, mode: str, prompt: str) -> list[str]:
     tool = find_tool("claude")
     if not tool:
@@ -727,8 +761,8 @@ class Sessions:
         s = self.index.get(str(d.get("session") or ""))
         if s is None:
             problems.append("no such session on this machine")
-        elif s["harness"] != "claude" or d.get("harness") != "claude":
-            problems.append("only Claude Code sessions can be launched so far")
+        elif s["harness"] not in ("claude", "codex") or d.get("harness") != s["harness"]:
+            problems.append(f"{s['harness']} sessions cannot be launched")
         elif s["cwd"] != d.get("cwd"):
             problems.append("the session's folder does not match the signed one")
         elif self.running(s["id"]):
@@ -738,7 +772,11 @@ class Sessions:
         if not re.fullmatch(r"[0-9a-f]{32}", str(d.get("nonce"))) or not self.index.use_nonce(d["nonce"], expires):
             raise bus.BusError("launch refused: this request was already used", 403)
         assert s is not None and prompt is not None
-        log(f"launch {s['id'][:8]} mode={d['mode']} signed by {d['signer']}")
+        log(f"launch {s['harness']} {s['id'][:8]} mode={d['mode']} signed by {d['signer']}")
+        base = {"host": self.bus.net.host, "harness": s["harness"], "id": s["id"], "name": s["name"], "mode": d["mode"]}
+        if s["harness"] == "codex":
+            t = codex_launch(s, d["mode"], prompt, str(d.get("signer") or ""))
+            return {**base, "output": "", "tmux": {"socket": t["socket"], "pane": t["pane"]}}
         argv = launch_command(s, d["mode"], prompt)
         try:
             cp = subprocess.run(argv, capture_output=True, text=True, cwd=s["cwd"], env=_env(argv[0]), timeout=60,
@@ -747,8 +785,7 @@ class Sessions:
             raise bus.BusError("claude --bg did not return within 60s", 504) from None
         if cp.returncode != 0:
             raise bus.BusError(f"claude --bg failed: {(cp.stderr or cp.stdout).strip()[-300:]}", 502)
-        return {"host": self.bus.net.host, "id": s["id"], "name": s["name"], "mode": d["mode"],
-                "output": cp.stdout.strip()[-500:]}
+        return {**base, "output": cp.stdout.strip()[-500:]}
 
 
 def start(b: bus.Bus) -> Sessions:

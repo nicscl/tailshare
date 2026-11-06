@@ -140,21 +140,31 @@ def _key(given: str) -> Path:
                      "or point TAILSHARE_SIGN_KEY / --key at your signing key")
 
 
+def attach_hint(r: dict) -> str:
+    """How to open what a launch started: Claude's background agents, or Codex's tmux pane."""
+    t = r.get("tmux") or {}
+    if r.get("harness") == "codex" and t.get("socket") and t.get("pane"):
+        return f"ssh -t {r['host']} tmux -S {shlex.quote(t['socket'])} attach -t {shlex.quote(t['pane'])}"
+    return f"ssh -t {r['host']} claude attach {r['id'][:8]}   (or `claude agents` there)"
+
+
 @_run
 def cmd_launch(args):
     """Ask a machine to resume a session in the background with real permissions, signed by you."""
     if args.mode not in sessions.MODES:
         raise ValueError(f"--mode must be one of {', '.join(sessions.MODES)}")
     s = resolve(args.ref)
-    if s["harness"] != "claude":
-        raise ValueError("only Claude Code sessions can be launched so far")
+    if s["harness"] not in ("claude", "codex"):
+        raise ValueError(f"{s['harness']} sessions cannot be launched")
     key = _key(args.key)
     payload = sessions.launch_request(_principal(args.signer), s["host"], s, args.mode, args.prompt or "")
     d = json.loads(payload)
     print("You are approving:", file=sys.stderr)
     print(f"  resume   {s['harness']} session {s['id']} ({s.get('name') or 'unnamed'})", file=sys.stderr)
     print(f"  on       {d['host']}, in {d['cwd']}", file=sys.stderr)
-    print(f"  mode     {d['mode']}", file=sys.stderr)
+    cm = sessions.CODEX_MODES[d["mode"]]
+    print(f"  mode     {d['mode']}" + (f" (codex: approval {cm['approval']}, sandbox {cm['sandbox']}; in tmux)"
+                                     if s["harness"] == "codex" else ""), file=sys.stderr)
     print(f"  prompt   {d['prompt'][:500]!r}" if d["prompt"] else "  prompt   (none: it waits for you to attach)", file=sys.stderr)
     print(f"  signer   {d['signer']} with {key}, valid {sessions.LAUNCH_TTL // 60} min, once", file=sys.stderr)
     if not args.yes:
@@ -167,7 +177,7 @@ def cmd_launch(args):
     print(f"✓ launched on {r['host']} ({r['mode']})")
     if r.get("output"):
         print(r["output"])
-    print(f"attach: ssh -t {r['host']} claude attach {r['id'][:8]}   (or `claude agents` there)")
+    print(f"attach: {attach_hint(r)}")
 
 
 @_run

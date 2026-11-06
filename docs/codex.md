@@ -64,5 +64,6 @@ A plan's `session` is `""` for a new Codex member (Codex picks the thread id whe
 when resuming. The member's agent appears once the session's first hook registers it. Codex has no name flag:
 the name comes from `TAILSHARE_AGENT_NAME`.
 
-`tailshare sessions` finds Codex threads by id like Claude sessions; `sessions launch` stays Claude-only, and a
-Codex thread is reopened through tailshare-start with `options.resume`.
+`tailshare sessions` finds Codex threads by id like Claude sessions. `sessions launch` resumes one too
+(`codex resume <id>` in a tmux window, as tailshare-start does; see [sessions.md](sessions.md)), and a device
+reopens one through tailshare-start with `options.resume`.

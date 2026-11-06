@@ -99,7 +99,8 @@ FIDO security key (`ed25519-sk`), which only signs after a physical touch. The r
    must belong to the user tailshare runs as and not be writable by others. No file → launching is off.
 2. `host` is this machine; `expires` is in the future; the validity window is at most 15 minutes.
 3. The nonce was never used before (stored until it expires): one signature, one launch.
-4. The session exists here, is a Claude Code session, and its folder matches the signed `cwd`.
+4. The session exists here, is a Claude Code or Codex session of the signed `harness`, and its folder matches
+   the signed `cwd`.
 5. The mode is one of `manual`, `plan`, `dontAsk`, `acceptEdits`, `auto`. **`bypassPermissions` is never
    accepted**, signed or not. (Starting a *new* session from a device with a start key is a separate path with
    its own skip rule: see [start.md](start.md).)
@@ -109,6 +110,20 @@ FIDO security key (`ed25519-sk`), which only signs after a physical touch. The r
 
 Only then does it run `claude --bg`. Claude Code's own gate still applies on top: it refuses folders the
 user never trusted.
+
+Codex has no `--bg` and no permission modes. A Codex thread is resumed with `codex resume <id>` in a window
+on its own tmux server (as tailshare-start runs agents: the same search path for `codex` and the same
+`max_running` cap), and the mode picks its approval policy and sandbox. Never `danger-full-access` and never
+the bypass:
+
+| mode | `--ask-for-approval` | `--sandbox` |
+|---|---|---|
+| `manual` | `untrusted` | `workspace-write` |
+| `plan` | `on-request` | `read-only` |
+| `dontAsk` | `never` | `read-only` |
+| `acceptEdits`, `auto` | `on-request` | `workspace-write` |
+
+`launch` prints `ssh -t <host> tmux -S <socket> attach -t <pane>` to open it.
 
 ```sh
 ssh-keygen -t ed25519-sk -f ~/.ssh/id_ed25519_sk        # once, with a FIDO key plugged in
