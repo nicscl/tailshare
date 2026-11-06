@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tailshare import bus, sessions, sessions_cli, start
 from tests.test_bus import StaticNet, free_port, make_bus
@@ -277,10 +278,18 @@ class Launch(Fixture):
         saved = sessions.codex_launch
         sessions.codex_launch = lambda s, mode, prompt, signer: (got.append((s["id"], mode, prompt, signer)),
                                                                  {"socket": "/tmp/ts-x", "pane": "%3", "bin": "t"})[1]
-        try:
+        def launch():
             d = json.loads(sessions.launch_request("nick", "pro", codex, "plan", "look"))
             payload = sessions.canonical(d)
-            r = self.svc.launch_local(payload, sessions.sign(payload, self.key))
+            return self.svc.launch_local(payload, sessions.sign(payload, self.key))
+
+        try:
+            with mock.patch.object(sessions, "_procs", return_value=[]):
+                r = launch()
+            with mock.patch.object(sessions, "_procs", return_value=[(21, ["codex", "resume", CODEX_ID])]), \
+                    self.assertRaises(bus.BusError) as e:  # that thread is open in a Codex the bus does not see
+                launch()
+            self.assertIn("would start a copy", str(e.exception))
         finally:
             sessions.codex_launch = saved
         self.assertEqual(got, [(CODEX_ID, "plan", "look", "nick")])
@@ -288,6 +297,21 @@ class Launch(Fixture):
         self.assertEqual(self.ran, [])  # never `claude --bg`
         self.assertIn("tmux -S /tmp/ts-x attach -t %3", sessions_cli.attach_hint(r))
         self.assertIn("claude attach", sessions_cli.attach_hint({"host": "pro", "id": SID, "harness": "claude"}))
+
+    def test_a_live_codex_is_not_given_a_second_copy(self):
+        sid = "019a0000-0000-7000-8000-000000000001"
+        procs = [(11, ["/opt/homebrew/bin/node", "/opt/homebrew/bin/codex", "resume", sid]),
+                 (12, ["/Applications/ChatGPT.app/x/codex", "-c", "forced_login_method=chatgpt", "exec-server"]),
+                 (13, ["/usr/bin/vim", sid])]
+        cwds = {11: "/elsewhere", 12: "/work/app", 14: "/work/app"}
+        with mock.patch.object(sessions, "_procs", return_value=procs), \
+                mock.patch.object(sessions, "_cwd", side_effect=lambda pid: cwds.get(pid, "")):
+            self.assertIn("pid 11", sessions.codex_live(sid, "/work/app"))  # resumed with the id
+            procs.pop(0)
+            self.assertEqual(sessions.codex_live(sid, "/work/app"), "")  # the app's exec-server and vim do not count
+            procs.append((14, ["/x/vendor/bin/codex", "--yolo"]))  # a fresh interactive Codex in the same folder
+            self.assertIn("may be this thread", sessions.codex_live(sid, "/work/app"))
+            self.assertEqual(sessions.codex_live(sid, "/work/other"), "")
 
     def test_codex_launch_plan(self):
         """What a Codex launch runs: `codex resume`, the mode's approval and sandbox, the id and prompt after `--`."""

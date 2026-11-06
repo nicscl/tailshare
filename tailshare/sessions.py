@@ -480,6 +480,55 @@ def codex_launch(s: dict, mode: str, prompt: str, signer: str) -> dict:
         raise bus.BusError(f"codex launch refused: {why}", 409 if e.out["error"] in ("running", "limit") else 502) from None
 
 
+# Codex subcommands that hold no interactive thread (the ChatGPT app's `codex ... exec-server`, `codex exec`, …)
+CODEX_NOT_THREADS = {"exec", "app-server", "exec-server", "mcp", "mcp-server", "proto", "login", "logout",
+                     "completion", "sandbox", "debug", "apply", "cloud", "features", "--version"}
+
+
+def _procs() -> list[tuple[int, list[str]]]:
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid.isdigit():
+            rows.append((int(pid), cmd.split()))
+    return rows
+
+
+def _cwd(pid: int) -> str:
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True,
+                             timeout=5, stdin=subprocess.DEVNULL, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return next((ln[1:] for ln in out.splitlines() if ln.startswith("n")), "")
+
+
+def codex_live(sid: str, cwd: str) -> str:
+    """Why Codex thread `sid` may already be open on this machine, or "". The bus does not see a Codex whose hooks
+    are not trusted, so this looks at the processes: an interactive Codex with the thread in its arguments, or one
+    working in the thread's folder (a thread started fresh has no id in its arguments, so it may be this one).
+    Resuming either would give the thread a second copy."""
+    folder = os.path.realpath(cwd) if cwd else ""
+    for pid, argv in _procs():
+        if pid == os.getpid():
+            continue
+        at = next((i for i, a in enumerate(argv[:2]) if os.path.basename(a) in ("codex", "codex.js")), None)
+        if at is None:
+            continue
+        if CODEX_NOT_THREADS.intersection(argv[at + 1:]):
+            continue
+        if sid in argv:
+            return f"a Codex process has this thread open (pid {pid})"
+        if folder and os.path.realpath(_cwd(pid) or "/nonexistent") == folder:
+            return f"a Codex is running in this thread's folder (pid {pid}) and may be this thread"
+    return ""
+
+
 def launch_command(s: dict, mode: str, prompt: str) -> list[str]:
     tool = find_tool("claude")
     if not tool:
@@ -767,6 +816,8 @@ class Sessions:
             problems.append("the session's folder does not match the signed one")
         elif self.running(s["id"]):
             problems.append("that session is running right now (message it instead; launching would start a copy)")
+        elif s["harness"] == "codex" and (why := codex_live(s["id"], s["cwd"])):
+            problems.append(f"{why}: message it or close it instead; launching would start a copy")
         if problems:
             raise bus.BusError("launch refused: " + "; ".join(problems), 403)
         if not re.fullmatch(r"[0-9a-f]{32}", str(d.get("nonce"))) or not self.index.use_nonce(d["nonce"], expires):
