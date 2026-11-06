@@ -41,6 +41,23 @@ class Mapping(unittest.TestCase):
         for d, want in cases:
             self.assertEqual(bus.hook_state(d), want, d)
 
+    def test_codex_waits_on_a_plan_or_a_question(self):
+        plan = "Here it is.\n\n<proposed_plan>\n1. Do it\n</proposed_plan>\n"
+        codex_stop = {**hook("Stop"), "turn_id": "u1", "stop_hook_active": False}
+        cases = [
+            ({"type": "agent-turn-complete", "thread-id": "T", "last-assistant-message": plan}, ("T", "waiting_input", "plan")),
+            ({**codex_stop, "last_assistant_message": plan}, ("S", "waiting_input", "plan")),
+            ({**codex_stop, "last_assistant_message": "done"}, ("S", "idle", "")),
+            ({**codex_stop, "last_assistant_message": None}, ("S", "idle", "")),
+            ({**hook("Stop"), "last_assistant_message": plan}, ("S", "idle", "")),  # Claude plans with ExitPlanMode
+            (hook("PreToolUse", tool_name="request_user_input"), ("S", "waiting_input", "question")),
+            (hook("PermissionRequest", tool_name="Bash"), ("S", "waiting_input", "permission")),
+        ]
+        for d, want in cases:
+            self.assertEqual(bus.hook_state(d), want, d)
+        for msg in ("we could write a <proposed_plan> block", "<proposed_plan>\nunfinished", ["<proposed_plan>"], 3):
+            self.assertFalse(bus.proposed_plan(msg), msg)
+
     def test_malformed_fields_say_nothing(self):
         self.assertEqual(bus.hook_state(hook("PreToolUse", tool_name=["AskUserQuestion"])), ("S", "working", ""))
         for d in (hook("Notification", notification_type={"a": 1}), {**hook("Stop"), "session_id": ["S"]},

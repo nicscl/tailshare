@@ -17,7 +17,11 @@ The hooks do what Claude's do:
 - `SessionStart`: register, tell the session its address, its squad and messages that waited.
 - `UserPromptSubmit`: show new messages with the prompt.
 - State hooks (`curl` to the local mailbox, always exit 0) on `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-  `PostToolUse`, `PermissionRequest`, `Stop`, `SessionEnd`: `working`, `waiting_input`/`permission`, `idle`, `ended`.
+  `PostToolUse`, `PermissionRequest`, `Stop`, `SessionEnd`: `working`, `waiting_input`, `idle`, `ended`.
+  `waiting_input` says why, as for Claude: `permission` (`PermissionRequest`), `question` (its
+  `request_user_input` tool, in Plan mode) or `plan` (a turn that ends on a `<proposed_plan>` block, which
+  Codex follows with "Implement this plan?", from `Stop` or the notify). Codex has no Notification hook, so
+  there is no `elicitation`.
 
 Nothing wakes an idle Codex session from the background, so a Codex agent waits for mail in the foreground with
 `tailshare agent watch --once`, or reads it with the next prompt.

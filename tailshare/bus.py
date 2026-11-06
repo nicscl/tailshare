@@ -121,15 +121,24 @@ def clean_login(v: object) -> str:
 
 STATES = ("working", "waiting_input", "idle", "ended")
 REASONS = ("permission", "question", "plan", "elicitation")  # why a waiting_input waits; never free text
-_ASKS = {"AskUserQuestion": "question", "ExitPlanMode": "plan"}  # tools that wait on the person
+# tools that wait on the person: Claude's, and Codex's question tool (Plan mode)
+_ASKS = {"AskUserQuestion": "question", "ExitPlanMode": "plan", "request_user_input": "question"}
 _NOTIFIED = {"permission_prompt": ("waiting_input", "permission"), "elicitation_dialog": ("waiting_input", "elicitation"),
              "idle_prompt": ("idle", "")}
+
+
+def proposed_plan(msg: object) -> bool:
+    """Does a Codex turn end on a plan? Plan mode closes with a `<proposed_plan>` block, and Codex then asks
+    the person "Implement this plan?": the turn is over, but it waits on them, as after Claude's ExitPlanMode."""
+    return isinstance(msg, str) and "</proposed_plan>" in msg and re.search(r"(?m)^[ \t]*<proposed_plan>[ \t]*$", msg) is not None
 
 
 def hook_state(d: dict) -> tuple[str, str, str]:
     """(agent id, state, reason) from a Claude Code hook's input or a Codex notify payload, or empty
     strings if the event says nothing about the state."""
-    if d.get("type") == "agent-turn-complete":  # Codex notify: the only event it has
+    if d.get("type") == "agent-turn-complete":  # Codex notify, at the end of each turn
+        if proposed_plan(d.get("last-assistant-message")):
+            return str(d.get("thread-id") or ""), "waiting_input", "plan"
         return str(d.get("thread-id") or ""), "idle", ""
     aid, event = d.get("session_id"), d.get("hook_event_name")
     tool, note = (v if isinstance(v, str) else "" for v in (d.get("tool_name"), d.get("notification_type")))
@@ -144,6 +153,8 @@ def hook_state(d: dict) -> tuple[str, str, str]:
         state, reason = _NOTIFIED.get(note, ("", ""))
     elif event == "PermissionRequest":  # Codex: it asks the person before running a tool
         state, reason = "waiting_input", "permission"
+    elif event == "Stop" and "turn_id" in d and proposed_plan(d.get("last_assistant_message")):  # Codex's Stop
+        state, reason = "waiting_input", "plan"
     elif event == "Stop":
         state = "idle"
     elif event == "SessionStart" and d.get("source") != "compact":  # after a compaction it carries on working
