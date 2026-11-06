@@ -839,8 +839,9 @@ class Bus:
                 routes.append({"host": h, "status": self._attempt(m["id"], h)})
         return {"id": m["id"], "sender": me["address"], "routes": routes}
 
-    def receive(self, m: dict) -> bool:
-        """File a message into this mailbox. Returns False for a duplicate."""
+    def receive(self, m: dict, origin: str | None = None) -> bool:
+        """File a message into this mailbox. Returns False for a duplicate. `origin` is the tailnet login that owns
+        the machine that handed it over (None: sent on this machine)."""
         now = time.time()
         with self.store.lock:
             n = self.store.x(
@@ -851,7 +852,7 @@ class Bus:
             )
             if n == 0:
                 return False
-            agents = self.store.q("SELECT id, address, user FROM agents WHERE last_seen>?", now - KNOWN)
+            agents = self.store.q("SELECT id, address, user, harness FROM agents WHERE last_seen>?", now - KNOWN)
             hits = [a["id"] for a in agents
                     if a["address"] != m["sender"] and target_matches(a["address"], a["user"], m["target"])]
             if hits:
@@ -860,6 +861,15 @@ class Bus:
             elif not is_pattern(m["target"]):
                 self.store.x("INSERT INTO inbox(msg, agent) VALUES(?, NULL)", m["id"])  # waits for the address
             self.store.changed.notify_all()
+            codex = [a["id"] for a in agents if a["id"] in hits and a["harness"] == "codex"]
+        if codex:
+            from . import nudge
+
+            # the owner's own mail: the delivering machine is verifiably the owner's, and its sender says the owner
+            own = bool(self.net.user) and (self.net.user if origin is None else origin) == self.net.user \
+                and m.get("sender_user", "") == handle(self.net.user)
+            if nudge.wanted(own):
+                nudge.later(self, codex)
         return True
 
     def inbox(self, aid: str, wait: float = 0.0, peek: bool = False) -> list[dict]:
@@ -1130,7 +1140,7 @@ class Bus:
         claimed = m["sender"].split("/")[0]
         if who != claimed:
             raise BusError(f"{ip} is {who or 'not on the tailnet'}, not {claimed}", 403)
-        fresh = self.receive(m)
+        fresh = self.receive(m, self.net.user_for_ip(ip) or "")
         return {"ok": True, "duplicate": not fresh}
 
     def _attempt(self, msg_id: str, host: str) -> str:
