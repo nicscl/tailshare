@@ -274,8 +274,8 @@ sessions this machine ran in the last 7 days whose tmux pane is gone (or taken b
   member that start has started on this host (start.db `member_starts`) whose recorded session is only a gate's.
   A device viewing a pane links its window into a gate's own session (`tailshare-<pane>-<pid>`); the agent row
   keeps its own session, never the gate's.
-- `resumable: false` comes with a `reason`: `kind` (only Claude sessions reopen), `off` (starting is off here, or
-  claude's options do not include `resume`), `cwd` (its folder is gone or outside the roots), `name`.
+- `resumable: false` comes with a `reason`: `kind` (a harness start does not know: Claude and Codex sessions
+  reopen), `off` (starting is off here, or that kind's options do not include `resume`), `cwd` (its folder is gone or outside the roots), `name`.
 - `/hello` has `"sessions_dead": 1` where the route exists, and for the owner's devices each Claude or Codex agent
   carries `session_id`, so a device can tell a live session from a dead one and a started tab from its agent, and
   `cwd`, the absolute folder it works in (a squad member's `folder`). Other users' devices get neither.
