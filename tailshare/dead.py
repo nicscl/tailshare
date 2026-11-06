@@ -129,15 +129,26 @@ def pane_runs(t: dict) -> bool:
 
 def holds(a, now: float | None = None) -> bool:
     """Whether agents row `a` still is a running agent: it polled within bus.LIVE, or it went quiet (a long tool
-    call polls nothing) while its process or its pane still runs. Never one that ended."""
+    call polls nothing) while its process or its pane still runs. One with neither a pid nor a pane to look at (a
+    session outside tmux that only ever registered pid 0) counts as running for UNSEEN after it was last heard
+    from, unless it ended: a second copy is worse than a late restart. Never one that ended."""
     if ended(a):
         return False
     if is_live(a, now):
         return True
-    if pid_runs(a["pid"] if "pid" in a.keys() else 0):
+    pid = a["pid"] if "pid" in a.keys() else 0
+    if pid_runs(pid):
         return True
     t = bus.clean_tmux(_json(a["tmux"] if "tmux" in a.keys() else ""))
-    return bool(t) and pane_runs(t)
+    if t:
+        return pane_runs(t)
+    if pid:  # its process is gone
+        return False
+    now = time.time() if now is None else now
+    return now - float(a["last_seen"] or 0) < UNSEEN
+
+
+UNSEEN = 1800  # seconds a quiet agent with no pid and no pane still counts as running (holds)
 
 
 def _pane_gone(t: dict, cache: dict) -> bool:

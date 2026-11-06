@@ -627,6 +627,8 @@ class Bus:
         # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's
         skip = was["skip"] if was and (was["pid"] == pid or harness != "codex") else ""
         mode = was["mode"] if was and harness != "codex" else ""  # Claude's permission_mode, from its hooks
+        if not pid and was and harness == "claude":  # an MCP call registers with 0: keep the pid its hooks gave,
+            pid = was["pid"] or 0  # so a quiet session outside tmux is still seen running (dead.holds)
         if harness == "codex" and pid and not (was and was["pid"] == pid):  # once per process, outside the lock
             skip = {True: "1", False: "0", None: ""}[pid_skip(pid)]
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
@@ -1202,12 +1204,11 @@ class Bus:
 
         was_online: set[str] = set()
         last_hello = last_revive = last_keep = 0.0
-        last_turn = time.time()
         while True:
+            waited = time.time()
             self.kick.wait(5)
             self.kick.clear()
-            woke = time.time() - last_turn > 60  # the machine slept: every member is looked at again right away
-            last_turn = time.time()
+            woke = time.time() - waited > 60  # the machine slept in the wait: every member is looked at again now
             back: set[str] = set()
             try:
                 now = time.time()

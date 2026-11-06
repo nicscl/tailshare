@@ -350,7 +350,8 @@ A stop closes the member's pane only if tailshare started it; one started by han
 How it starts one: it resumes the member's last session (its own tag, or an untagged session of its kind, folder
 and name), as a device's Reopen would; if that does not come up, the next try starts fresh in the same folder and
 name. Never a second copy: a member counts as running while its agent is live, or quiet but its process (pid, or
-its tmux pane) still runs, or a session started by hand matches it, or a window tailshare started for it is still
+its tmux pane) still runs, or quiet with neither a pid nor a pane to look at (outside tmux, pid 0) for less than
+30 min, or a session started by hand matches it, or a window tailshare started for it is still
 waiting (up to 2 min, then `stuck`, still left alone: it may wait on a prompt). A member whose pane belongs to
 ts-agents (`tmux -L ts-<name>`) is left to ts-agents while that pane is there.
 

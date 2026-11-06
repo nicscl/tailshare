@@ -196,6 +196,27 @@ class Keep(Base):
             self.assertEqual(self.tick()["AppDev"]["state"], "running")
         self.launch.assert_not_called()
 
+    def test_a_quiet_member_outside_tmux_is_running_a_while(self):
+        """Reviewer, #66: a member started by hand in Terminal registers pid 0 (MCP) and no pane; quiet past LIVE
+        it must not get a fresh second copy."""
+        self.migrated()
+        self.agent(S1, ago=300, squad=TAG)
+        self.m.bus.store.x("UPDATE agents SET tmux='', pid=0 WHERE id=?", S1)
+        self.assertEqual(self.tick()["AppDev"]["state"], "running")
+        self.launch.assert_not_called()
+        self.assertIsNone(self.m.bus.register({"id": S2, "harness": "claude", "cwd": self.app,
+                                               "session": "AppDev"})["squad"])  # nor does a hand-started one take it
+        self.m.bus.store.x("UPDATE agents SET last_seen=? WHERE id=?", self.now - dead.UNSEEN - 1, S1)
+        self.assertEqual(self.tick(1)["AppDev"]["state"], "running")  # long gone: the hand-started one is it now
+        self.m.bus.store.x("DELETE FROM agents WHERE id=?", S2)
+        self.tick(2)
+        self.launch.assert_called_once()
+
+    def test_an_mcp_registration_keeps_the_hooks_pid(self):
+        self.m.bus.register({"id": S1, "harness": "claude", "cwd": self.app, "session": "AppDev", "pid": 4242})
+        self.m.bus.register({"id": S1, "harness": "claude", "cwd": self.app, "session": "AppDev", "pid": 0})
+        self.assertEqual(self.m.bus.store.one("SELECT pid FROM agents WHERE id=?", S1)["pid"], 4242)
+
     def test_a_session_started_by_hand_that_matches_is_running(self):
         self.migrated()
         self.agent(S1, ago=5, name="appdev")  # untagged, its folder and name (as a slug)
