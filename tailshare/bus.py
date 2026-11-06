@@ -174,7 +174,8 @@ CLAUDE_MODES = ("default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPerm
 
 
 def hook_mode(d: dict) -> str:
-    """A Claude Code hook's permission_mode when it is one tailshare knows, else ""."""
+    """A hook's permission_mode when it is one tailshare knows, else "". Codex's hooks send one too (`default`,
+    `acceptEdits`, `plan`, `dontAsk` or `bypassPermissions`), from its approval policy, sandbox and Plan mode."""
     mode = d.get("permission_mode")
     return mode if isinstance(mode, str) and mode in CLAUDE_MODES else ""
 
@@ -624,7 +625,7 @@ class Bus:
                 tmux = {**tmux, "target": old["target"]}
         # Claude's comes from its hooks and survives any pid (an MCP call registers with 0); Codex's is its process's
         skip = was["skip"] if was and (was["pid"] == pid or harness != "codex") else ""
-        mode = was["mode"] if was and harness != "codex" else ""  # Claude's permission_mode, from its hooks
+        mode = was["mode"] if was and (was["pid"] == pid or harness != "codex") else ""  # permission_mode, from hooks
         if harness == "codex" and pid and not (was and was["pid"] == pid):  # once per process, outside the lock
             skip = {True: "1", False: "0", None: ""}[pid_skip(pid)]
         base = make_address(self.net.host, harness, Path(cwd).name or "root", session)
@@ -691,7 +692,7 @@ class Bus:
             "state": json.loads(r["state"]) if r["state"] else None,
             "squad": json.loads(r["squad"]) if r["squad"] else None,
             "skip": {"1": True, "0": False}.get(r["skip"]),  # a display hint (hook_skip): None when unknown
-            "permission_mode": r["mode"] or None,  # Claude's, from its hooks (hook_mode): a hint like skip
+            "permission_mode": r["mode"] or None,  # from its hooks (hook_mode), Claude's or Codex's: a hint like skip
             "model": r["model"] or None,  # from its hooks and transcript (_note_model): a hint like skip
         }
 
