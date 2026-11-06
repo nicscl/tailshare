@@ -21,10 +21,13 @@ import time
 from pathlib import Path
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-TTL = 60  # seconds a status is reused: /hello must not start Codex on every call
+TTL = 60  # seconds before the inputs are looked at again: /hello must not start Codex on every call
+MAX_AGE = 600  # and Codex itself is asked again only when they changed, or this long after it last was
 TIMEOUT = 20
 NOT_INSTALLED = {"state": "not_installed",
                  "fix": {"action": "terminal", "reason": "run `tailshare agent install-codex` on this machine"}}
+REINSTALL_FIX = {"action": "terminal", "reason": "tailshare's Codex hooks here do not run an installed tailshare: "
+                 "install the tool (uv tool install) and run `tailshare agent install-codex` again"}
 TUI_FIX = {"action": "codex_hooks_tui", "reason": "open /hooks in Codex on this machine and trust tailshare's hooks"}
 
 _lock = threading.Lock()
@@ -37,9 +40,15 @@ class Unsupported(Exception):
 
 
 def _codex() -> str | None:
-    from .sessions import find_tool
+    """Codex as starting would run it: start.json's `bin` or the fixed search path, only a file this user or root
+    can change (start.binary)."""
+    from . import start
 
-    return find_tool("codex")
+    cfg = start.load_config() or {}
+    try:
+        return start.binary("codex", {"kinds": {"codex": (cfg.get("kinds") or {}).get("codex") or {}}})
+    except start.Refused:
+        return None
 
 
 def _version(codex: str) -> str:
@@ -66,6 +75,7 @@ class AppServer:
                                   stderr=subprocess.DEVNULL, text=True, env=_env(codex), cwd=str(Path.home()),
                                   start_new_session=True)  # its own group: the launcher and the binary it runs
         self.n = 0
+        self.reap = threading.Lock()  # a kill and the reaping wait never overlap
         self.deadline = time.monotonic() + TIMEOUT
         self.timer = threading.Timer(TIMEOUT, self._expire)
         self.timer.daemon = True
@@ -107,11 +117,16 @@ class AppServer:
 
     def _kill(self) -> None:
         """End the process group we started (its id is our child's exact pid): `codex` may be a launcher whose
-        binary holds the pipe too."""
-        try:
-            os.killpg(self.p.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        binary holds the pipe too. Never once it has been reaped: its pid may belong to someone else by then."""
+        with self.reap:
+            self._kill_locked()
+
+    def _kill_locked(self) -> None:
+        if self.p.returncode is None and self.p.poll() is None:
+            try:
+                os.killpg(self.p.pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def _expire(self) -> None:
         """A hung Codex: end it, so the read sees EOF."""
@@ -125,17 +140,23 @@ class AppServer:
                     f.close()
             except OSError:
                 pass
-        try:
-            self.p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._kill()
-            self.p.wait()
+        with self.reap:  # reaped only under the lock, so a kill from the timer never lands on a reused pid
+            try:
+                self.p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._kill_locked()
+                self.p.wait()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
+
+
+def _line(e: object) -> str:
+    """One line of at most 200 characters, for a `reason`."""
+    return " ".join(str(e).split())[:200]
 
 
 def _tailshare_version() -> str:
@@ -148,15 +169,25 @@ def _tailshare_version() -> str:
 
 
 def own_commands() -> set[str]:
-    """Every command tailshare installs as a Codex hook, for each way it may have been run (installed tool, the
-    server's own path, `python -m tailshare`): only these are ever trusted."""
+    """Every command tailshare installs as a Codex hook, run by an installed tailshare: only these are ever
+    trusted. Only an absolute path to a `tailshare` executable this user or root owns (keys.trusted_file); never
+    `python -m tailshare`, which imports from the folder Codex runs the hook in, so trusting it would trust any
+    `./tailshare` package in whatever folder a session is opened in."""
     from . import agent
+    from .keys import trusted_file
 
-    exes = {agent.exe(), str(Path("~/.local/bin/tailshare").expanduser()), f"{sys.executable} -m tailshare"}
+    exes = {agent.exe(), str(Path("~/.local/bin/tailshare").expanduser())}
     out = {agent.state_command()}
     for t in exes:
-        out |= {f"{t} agent hook {n} --harness codex" for n in agent.HOOKS.values()}
+        if os.path.isabs(t) and os.path.basename(t) == "tailshare" and " " not in t and trusted_file(t):
+            out |= {f"{t} agent hook {n} --harness codex" for n in agent.HOOKS.values()}
     return out
+
+
+def _tailshare_like(h: dict) -> bool:
+    """A hook in this user's hooks.json that runs tailshare in a form never trusted (e.g. `python -m tailshare`)."""
+    c = h.get("command")
+    return isinstance(c, str) and " agent hook " in c and "tailshare" in c
 
 
 def _ours(hooks: list) -> list[dict]:
@@ -170,17 +201,28 @@ def _ours(hooks: list) -> list[dict]:
 def _list(srv: AppServer) -> list[dict]:
     res = srv.call("hooks/list", {"cwds": [str(Path.home())]})
     data = res.get("data")
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+    if not isinstance(data, list) or not data or not all(isinstance(e, dict) for e in data):
         raise RuntimeError("codex hooks/list: no data")
-    hooks = data[0].get("hooks") or []
-    if any(isinstance(h, dict) and "trustStatus" not in h for h in hooks):
+    seen: dict[str, dict] = {}
+    for e in data:
+        for h in e.get("hooks") or []:
+            if isinstance(h, dict):
+                seen.setdefault(str(h.get("key")), h)
+    hooks = list(seen.values())
+    if any("trustStatus" not in h for h in hooks):
         raise Unsupported("trustStatus")
-    return _ours(hooks)
+    return hooks
 
 
-def _summary(ours: list[dict], version: str) -> dict:
+def _summary(hooks: list[dict], version: str) -> dict:
+    ours = _ours(hooks)
     untrusted = [h for h in ours if h.get("trustStatus") not in ("trusted", "managed")]
     out = {"codex": version, "hooks": len(ours), "untrusted": len(untrusted)}
+    path = os.path.realpath(CODEX_HOME / "hooks.json")
+    other = [h for h in hooks if h not in ours and h.get("source") == "user" and _tailshare_like(h)
+             and os.path.realpath(str(h.get("sourcePath", ""))) == path]
+    if other:  # a form never trusted from a device: reinstall with the installed tool
+        return {**out, "state": "untrusted", "untrusted": len(untrusted) + len(other), "fix": REINSTALL_FIX}
     if not ours:
         return {**out, **NOT_INSTALLED}
     if not untrusted:
@@ -205,15 +247,38 @@ def status(fresh: bool = False) -> dict | None:
     except Unsupported:
         return {"state": "unsupported", "codex": version, "fix": TUI_FIX}
     except (OSError, RuntimeError) as e:
-        return {"state": "error", "codex": version, "reason": str(e)[:200], "fix": TUI_FIX}
+        return {"state": "error", "codex": version, "reason": _line(e), "fix": TUI_FIX}
+
+
+def _inputs() -> tuple:
+    """What the status depends on: Codex's path, and the hooks file, config and binary as they are now."""
+    def stamp(p):
+        try:
+            st = os.stat(p)
+            return (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            return None
+    codex = _codex()
+    return (codex, stamp(codex) if codex else None, stamp(CODEX_HOME / "hooks.json"), stamp(CODEX_HOME / "config.toml"))
+
+
+_seen: tuple[float, tuple | None] = (0.0, None)  # when the inputs were last looked at, and what they were
 
 
 def cached() -> dict | None:
-    """The last status, refreshed in the background once it is older than TTL: what /hello sends."""
-    global _busy
+    """The last status, refreshed in the background when Codex's hooks, config or binary changed (looked at once
+    a TTL) or MAX_AGE after the last ask: what /hello sends."""
+    global _busy, _seen
     with _lock:
         at, value = _cache
-        stale = time.time() - at > TTL
+        now = time.time()
+        stale = now - at > MAX_AGE
+        if not stale and now - _seen[0] > TTL:
+            inputs = _inputs()
+            stale = _seen[1] is not None and inputs != _seen[1]
+            _seen = (now, inputs)
+        if at == 0.0:
+            stale = True
         if stale and not _busy:
             _busy = True
             threading.Thread(target=_refresh, daemon=True).start()
@@ -221,9 +286,11 @@ def cached() -> dict | None:
 
 
 def _refresh() -> None:
-    global _cache, _busy
+    global _cache, _busy, _seen
     try:
+        inputs = _inputs()
         value = status()
+        _seen = (time.time(), inputs)
     except Exception:  # noqa: BLE001
         value = None
     with _lock:
@@ -233,7 +300,7 @@ def _refresh() -> None:
 def trust() -> dict:
     """Trust tailshare's own Codex hooks here, through Codex's app-server, and return the new status. Only hooks
     whose command is exactly one tailshare installs, at the hash Codex shows for them now."""
-    global _cache
+    global _cache, _seen
     from .start import Refused
 
     codex = _codex()
@@ -242,7 +309,11 @@ def trust() -> dict:
     version = _version(codex)
     try:
         with AppServer(codex) as srv:
-            ours = _list(srv)
+            hooks = _list(srv)
+            ours = _ours(hooks)
+            if _summary(hooks, version).get("fix") == REINSTALL_FIX:
+                raise Refused("not_ours", reason="tailshare's Codex hooks here do not run an installed tailshare",
+                              fix=REINSTALL_FIX)
             if not ours:
                 raise Refused("not_found", reason="tailshare's Codex hooks are not installed here",
                               fix=NOT_INSTALLED["fix"])
@@ -256,9 +327,9 @@ def trust() -> dict:
         raise Refused("unsupported", reason=f"this Codex ({version or 'unknown version'}) cannot be told to trust "
                       "hooks from outside", fix=TUI_FIX) from None
     except (OSError, RuntimeError) as e:
-        raise Refused("failed", reason=str(e)[:200], fix=TUI_FIX) from None
-    with _lock:
-        _cache = (time.time(), out)
+        raise Refused("failed", reason=_line(e), fix=TUI_FIX) from None
+    with _lock:  # /hello shows it at once, and the config Codex just wrote is not a change to ask about again
+        _cache, _seen = (time.time(), out), (time.time(), _inputs())
     return out
 
 
