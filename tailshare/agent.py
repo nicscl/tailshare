@@ -705,9 +705,38 @@ def cmd_uninstall_codex(args):
 # --------------------------------------------------------------------------- argparse
 
 
+RUN_WORDS = {"stop": "stopped", "keep": "keep", "restart": "restart"}
+
+
+def cmd_run(args):
+    """Stop a squad member for good, keep it running again, or restart it (docs/start.md#keep-running)."""
+    me = register(detect())
+    body = {"agent": me["id"], "member": args.member, "run": RUN_WORDS[args.agent_cmd],
+            **({"squad": args.squad} if args.squad else {})}
+    if me.get("squad"):  # a member changes the members under it; its leads' rights, never the owner's token
+        r = call("/member/run", body, timeout=40)
+    else:
+        from . import keys
+
+        r = keys._call("/member/run", body, timeout=40)
+    what = {"stopped": "stopped: tailshare will not start it again until it is started or kept running",
+            "keep": "kept running: tailshare starts it again whenever it is down"}[r["run"]]
+    print(f"✓ {r['name']} {what} (by {r['by']})")
+    if "closed" in r:
+        print("  its session was closed" + (", and it starts again shortly" if r["run"] == "keep" else "")
+              if r["closed"] else f"  its session still runs: {r.get('reason', 'not closed')}")
+
+
 def add_parser(sub) -> None:
     ag = sub.add_parser("agent", help="message other AI agents on the tailnet")
     s = ag.add_subparsers(dest="agent_cmd", required=True)
+    for word, what in (("stop", "stop a squad member: tailshare ends it and does not start it again"),
+                       ("keep", "keep a squad member running (the default): started again whenever it is down"),
+                       ("restart", "end a squad member's session and start it again")):
+        p = s.add_parser(word, help=what)
+        p.add_argument("member", help="the member's name (or id)")
+        p.add_argument("--squad", default="", help="the squad, when more than one has a member by that name")
+        p.set_defaults(fn=cmd_run)
     p = s.add_parser("whoami", help="this session's address")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_whoami)

@@ -361,6 +361,31 @@ class Squads:
                                json.dumps(tag, sort_keys=True), aid, time.time() - bus.LIVE)
         return {} if other else tag
 
+    def match_tag(self, aid: str, harness: str, cwd: str, session: str) -> dict:
+        """The member an untagged agent is, started by hand: the one member of the owner's squads on this machine of
+        its kind, in its folder, under its name (as a slug). Never when another agent still runs as that member, even
+        one quiet for a while (a long tool call polls nothing): its process or its pane is still there."""
+        from . import dead
+
+        want = bus.slug(session or "")
+        if not want or not cwd:
+            return {}
+        real = os.path.realpath(cwd)
+        hits = []
+        for sid in self.ids():
+            d = self.squad(sid) or {}
+            for m in d.get("members", []):
+                if not m.get("deleted") and m["host"] == self.bus.net.host and m["kind"] == harness \
+                        and bus.slug(m.get("name") or "") == want and os.path.realpath(m["folder"]) == real:
+                    hits.append({"id": sid, "member": m["id"]})
+        if len(hits) != 1:
+            return {}
+        held = self.store.q("SELECT * FROM agents WHERE squad=? AND id!=? AND last_seen>?",
+                            json.dumps(hits[0], sort_keys=True), aid, time.time() - dead.MAX_AGE)
+        if any(dead.holds(a) for a in held):
+            return {}
+        return self.check_tag(hits[0], aid, harness, cwd)
+
     def ids(self, deleted: bool = False) -> list[str]:
         try:
             owner = self.owner
@@ -717,6 +742,13 @@ class Squads:
         if local and (self.bus.keys is None or len(self.bus.keys.token) < 64
                       or not secrets.compare_digest(token.encode(), self.bus.keys.token.encode())):
             raise bus.BusError("local squad edits need ~/.tailshare/keys.token: use `tailshare squad edit`", 403)
+        if method == "POST" and len(parts) == 5 and parts[2] == "members" and parts[4] == "run":
+            from . import (
+                keep,  # Stop / keep running / restart, from the app (signed) or the owner's token
+            )
+
+            return keep.change(self.bus, _id(parts[1], "id"), _id(parts[3], "member"), str(body.get("run") or ""),
+                               "owner" if local else "a device")
         if method == "PUT" and len(parts) == 2:
             return self.create(parts[1], body)
         if method == "PATCH" and len(parts) == 2:

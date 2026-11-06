@@ -330,6 +330,47 @@ start key may now. The caps stay a person's, in start.json.
 Every reopen, refusal and stop is a `revive …` line in tailshare.log. A refusal (`limit`, a folder now outside the
 roots) counts as a try, so it backs off too.
 
+## Keep running (squad members)
+
+Every squad member runs until tailshare stops it. Each host looks after its own members: at serve start, on wake,
+when a peer comes back and every 30 s it checks each member whose `host` is this machine, and starts the ones that
+are down. A `/exit`, a clean quit and a crash all count as down. Only a stop ends one:
+
+- `tailshare agent stop <member>` / `keep` / `restart` (on the member's host, or by a lead from anywhere), or
+- Hive's Stop, Keep running and Restart: `POST /squads/<sid>/members/<mid>/run` `{"run":"stopped"|"keep"|"restart"}`,
+  signed like every squad write, sent to the member's host;
+- a device's Close of a member tailshare started.
+
+Who may: the owner (the local API token, or a signed request from a device), and the member's leads in the squad
+(its `reports_to` chain), never the member itself. A lead on another machine sends it there (peer
+`POST /bus/v1/member/run`), and that machine checks the lead really runs where the request came from.
+A stop closes the member's pane only if tailshare started it; one started by hand keeps running, said as
+`still_running`, and is not started again once it ends.
+
+How it starts one: it resumes the member's last session (its own tag, or an untagged session of its kind, folder
+and name), as a device's Reopen would; if that does not come up, the next try starts fresh in the same folder and
+name. Never a second copy: a member counts as running while its agent is live, or quiet but its process (pid, or
+its tmux pane) still runs, or quiet with neither a pid nor a pane to look at (outside tmux, pid 0) for less than
+30 min, or a session started by hand matches it, or a window tailshare started for it is still
+waiting (up to 2 min, then `stuck`, still left alone: it may wait on a prompt). A member whose pane belongs to
+ts-agents (`tmux -L ts-<name>`) is left to ts-agents while that pane is there.
+
+The start key rule of Revive (above) holds: a restart never does more than the key that approved the member's
+last start may do now. A removed key, or a skip start whose key is now only safe, means no restart (`blocked`,
+`why: key`) and a Needs you item. A member started by hand restarts safe.
+
+Failures back off 0, 30 s, 1, 2, 4, 8 min, then every 10 min, forever. After 5 in a row the owner gets one
+`to: owner` question blocker, id `keep`, with the last output of its pane; it clears once the member stays up
+10 min, which also resets the count. `start.json` must be there and allow the member, else `blocked`, `why: off`.
+
+On upgrade, members that were not running then are set `stopped` (by `upgrade`), so nothing old starts at once;
+Keep running starts them.
+
+/hello `keep` (owner's devices) is one entry per member: `{squad, member, name, state, …}` with `state` one of
+`running`, `starting`, `restarting` (`attempt`, `next_at`, `needs_you`), `blocked` (`why`), `stopped` (`by`, `at`,
+`still_running`) or `host_offline` (`host`, `since`) for members of a machine that is off. The desired state is
+in this host's start.db (`member_run`, `member_keep`). Members it keeps are not Revive's.
+
 ## Closing a session
 
 The start key (with Face ID; never the plan key) may also end sessions `tailshare start` started here, on the same

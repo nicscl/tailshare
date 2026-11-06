@@ -685,9 +685,11 @@ def squad_member(tag: object, host: str) -> tuple[dict, dict]:
                         (h["owner"], h["id"], tag["member"])).fetchone()
         if m is None:
             raise Refused("bad_request", "squad.member", "no such member in the squad")
-        live = con.execute("SELECT 1 FROM agents WHERE squad=? AND last_seen>?",
-                           (json.dumps({"id": tag["id"], "member": tag["member"]}, sort_keys=True),
-                            time.time() - bus.LIVE)).fetchone()
+        from . import dead
+
+        live = any(dead.is_live(a) for a in con.execute(  # one that ended (/exit, Close) is no longer running
+            "SELECT last_seen, state FROM agents WHERE squad=? AND last_seen>?",
+            (json.dumps({"id": tag["id"], "member": tag["member"]}, sort_keys=True), time.time() - bus.LIVE)))
     except sqlite3.Error:
         raise Refused("bad_request", "squad", "no squads on this host") from None
     finally:
@@ -711,6 +713,9 @@ def _from_squad(item: dict, host: str) -> tuple[dict, dict]:
     out = {"kind": m["kind"], "cwd": m["folder"], "name": m["name"], "instructions": m.get("instructions") or "",
            "options": st.get("options") or {}, "prompt": item.get("prompt") or st.get("prompt") or "",
            "device_name": item.get("device_name"), "_session": item.get("_session")}
+    if item.get("_resume"):  # keep running (keep.py) resumes the member's own last session; never from a device
+        out["options"] = {**out["options"], "resume": item["_resume"]}
+        out["_resume"] = item["_resume"]
     return out, {"id": head["id"], "name": head["name"], "member": m["id"]}
 
 
@@ -769,6 +774,10 @@ def build(item: object, cfg: dict, grant: str, host: str) -> dict:
         raise Refused("not_allowed", "options.permission_mode", "this host does not allow auto mode")
     if opts.get("resume") and not squad:  # a squad member's resume comes from the squad, signed by its owner
         squad = _reopen(opts["resume"], cwd, name, host, kind)
+    elif item.get("_resume") and squad:  # keep.py: only a session this host lists as dead, the member's own
+        was = _reopen(opts["resume"], cwd, name, host, kind)
+        if was and (was["id"], was["member"]) != (squad["id"], squad["member"]):
+            raise Refused("bad_request", "options.resume", "another member's session")
     # A member keeps its report current for the squad page; after the reopen, so a resumed member gets it too. The
     # owner's instructions stay within their cap.
     if squad:
@@ -917,6 +926,13 @@ CREATE TABLE IF NOT EXISTS launched(session TEXT PRIMARY KEY, options TEXT NOT N
 CREATE TABLE IF NOT EXISTS revives(session TEXT NOT NULL, socket TEXT NOT NULL, at REAL NOT NULL,
   weight INTEGER NOT NULL, host_event INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS revive_flags(key TEXT PRIMARY KEY, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS member_run(squad TEXT NOT NULL, member TEXT NOT NULL, run TEXT NOT NULL, by TEXT NOT NULL,
+  at REAL NOT NULL, PRIMARY KEY(squad, member));
+CREATE TABLE IF NOT EXISTS member_keep(squad TEXT NOT NULL, member TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0,
+  next_at REAL NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', last_try REAL NOT NULL DEFAULT 0,
+  fresh INTEGER NOT NULL DEFAULT 0, up_since REAL, flagged INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT '{}',
+  grant_ TEXT NOT NULL DEFAULT '', key TEXT NOT NULL DEFAULT '', PRIMARY KEY(squad, member));
+CREATE TABLE IF NOT EXISTS keep_meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS revive_stopped(session TEXT PRIMARY KEY, name TEXT NOT NULL, crashes INTEGER NOT NULL,
   at REAL NOT NULL, why TEXT NOT NULL);
 """
@@ -1085,6 +1101,11 @@ def _confirm_one(con: sqlite3.Connection, pid: str, cfg: dict, grant: str, key: 
     if plan.get("squad"):
         con.execute("INSERT OR REPLACE INTO member_starts(squad, member, instructions_sha256, at) VALUES(?,?,?,?)",
                     (plan["squad"]["id"], plan["squad"]["member"], plan["instructions_sha256"], time.time()))
+        if not result.get("error"):  # a device starting a member: keep it running (keep.py)
+            from . import keep
+
+            keep.kept_by_start(con, plan["squad"]["id"], plan["squad"]["member"],
+                               plan["env"].get("TAILSHARE_STARTED_BY", ""), "skip" if plan["skip"] else "safe", key)
     return result
 
 
@@ -1220,7 +1241,7 @@ def launch_approved(pid: object) -> dict:
 CLOSE_WAIT = 5  # seconds a closed pane has to go away
 
 
-def close_started(sid: object) -> dict:
+def close_started(sid: object, stop: bool = True) -> dict:
     """In the bus: end the live session `sid` if `tailshare start` started it here, on this user's own per-agent
     server, and mark it ended, so it is listed as dead (dead.rows) and may be reopened at once. Never a pane
     tailshare did not start: not the user's own sessions, not ts-agents' (which brings its agents back)."""
@@ -1255,6 +1276,10 @@ def close_started(sid: object) -> dict:
             raise Refused("no_tmux", reason="no tmux binary that only this user or root can change")
         if not (keys.own_socket(t["socket"]) and keys.pane_alive(binary, t["socket"], t["pane"])):
             raise Refused("not_running", "close", "its pane is gone already")
+        if stop and squad:  # a device's Close of a member is its Stop: keep running does not start it again
+            from . import keep
+
+            keep.stopped_by_close(squad["id"], squad["member"])
         r = subprocess.run([binary, "-S", t["socket"], "kill-pane", "-t", t["pane"]], capture_output=True, text=True,
                            timeout=10, stdin=subprocess.DEVNULL)
         end = time.time() + CLOSE_WAIT

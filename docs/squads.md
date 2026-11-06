@@ -95,6 +95,11 @@ runs without its tag, as the gate also says `running` until then. A member that 
 refused (`running`). The plan says `changed` when the member's instructions differ from the last time it was
 started here.
 
+A session started by hand, without the variables, becomes the member when exactly one member across the owner's
+squads runs on this machine with its kind, its folder and its name (as a slug, `appdev` for AppDev), and no
+session holding that member still runs (live, or quiet with its process or pane there). Members are kept running:
+[start.md](start.md#keep-running-squad-members).
+
 ## How it syncs
 
 Each machine keeps its owner's squads in `~/.tailshare/bus.db`. The header and each member are separate

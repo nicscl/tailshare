@@ -265,6 +265,20 @@ class Reports:
                          self.squads.owner, sid, mid, json.dumps(doc), row["agent"] if row else "", time.time())
         return True
 
+    def unflag(self, sid: str, mid: str, bid: str) -> bool:
+        """Resolve the open blocker `bid` this host put in a member's report (flag), once what it said is over."""
+        with self.store.lock:
+            row = self._row(sid, mid)
+            doc = json.loads(row["doc"]) if row else {}
+            hit = False
+            for x in doc.get("blockers") or []:
+                if isinstance(x, dict) and x.get("id") == bid and not x.get("resolved_at"):
+                    x["resolved_at"], hit = time.time(), True
+            if hit:
+                self.store.x("INSERT OR REPLACE INTO reports(owner, squad, member, doc, agent, at) VALUES(?,?,?,?,?,?)",
+                             self.squads.owner, sid, mid, json.dumps(doc), row["agent"], time.time())
+        return hit
+
     @staticmethod
     def _stamp_done(v: object, old: list, now: float) -> list:
         """done[] with the time each task first showed up as done: kept for a task already there, now for a new one."""
