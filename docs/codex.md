@@ -19,8 +19,12 @@ The hooks do what Claude's do:
 - State hooks (`curl` to the local mailbox, always exit 0) on `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
   `PostToolUse`, `PermissionRequest`, `Stop`, `SessionEnd`: `working`, `waiting_input`/`permission`, `idle`, `ended`.
 
-Nothing wakes an idle Codex session from the background, so a Codex agent waits for mail in the foreground with
-`tailshare agent watch --once`, or reads it with the next prompt.
+Codex has no background task to wake it, so the mailbox wakes it: when a message is filed for a Codex agent on
+this machine that has been idle at its prompt for 3 s, in a live pane of this user's tmux server that runs Codex,
+not in copy mode, on a server no client is attached to (someone attached may have a draft at the prompt), it types
+one fixed line there (`New tailshare bus mail: read it …`) and Enter. The prompt hook then shows the messages. The
+line never holds message text, and an agent is nudged at most once a minute (tailshare/nudge.py). Otherwise a Codex
+agent waits for mail in the foreground with `tailshare agent watch --once`, or reads it with the next prompt.
 
 ## Identity
 

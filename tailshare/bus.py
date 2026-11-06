@@ -824,7 +824,7 @@ class Bus:
             )
             if n == 0:
                 return False
-            agents = self.store.q("SELECT id, address, user FROM agents WHERE last_seen>?", now - KNOWN)
+            agents = self.store.q("SELECT id, address, user, harness FROM agents WHERE last_seen>?", now - KNOWN)
             hits = [a["id"] for a in agents
                     if a["address"] != m["sender"] and target_matches(a["address"], a["user"], m["target"])]
             if hits:
@@ -833,6 +833,11 @@ class Bus:
             elif not is_pattern(m["target"]):
                 self.store.x("INSERT INTO inbox(msg, agent) VALUES(?, NULL)", m["id"])  # waits for the address
             self.store.changed.notify_all()
+            codex = [a["id"] for a in agents if a["id"] in hits and a["harness"] == "codex"]
+        if codex:
+            from . import nudge
+
+            nudge.later(self, codex)
         return True
 
     def inbox(self, aid: str, wait: float = 0.0, peek: bool = False) -> list[dict]:
