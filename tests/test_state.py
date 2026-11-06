@@ -233,6 +233,22 @@ class Skip(unittest.TestCase):
         self.assertEqual(got, {"pro/claude/a": "auto", "pro/claude/b": "absent", "pro/claude/c": "absent",
                                "pro/claude/d": "absent"})
 
+    def test_codex_permission_mode_from_its_hooks(self):
+        """Codex hooks carry permission_mode too; it lasts while the same Codex process registers again."""
+        mode = lambda: {a["address"]: a.get("permission_mode") for a in self.b.hello("100.1.1.1")["agents"]}["pro/codex/cx"]
+        with mock.patch.object(bus, "pid_skip", return_value=False):
+            self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": 4242})
+            self.assertIsNone(mode())
+            self.b.report_state({**hook("PreToolUse", tool_name="Bash", permission_mode="plan"), "session_id": "T",
+                                 "turn_id": "u1"})
+            self.assertEqual(mode(), "plan")
+            self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": 4242})
+            self.assertEqual(mode(), "plan")  # the same process
+            self.b.report_state({**hook("Stop", permission_mode="bypassPermissions"), "session_id": "T"})
+            self.assertEqual((mode(), self.skips()["pro/codex/cx"]), ("bypassPermissions", True))
+            self.b.register({"id": "T", "harness": "codex", "cwd": "/x/cx", "pid": 4343})
+            self.assertIsNone(mode())  # a new process: unknown until its first hook
+
     def test_follows_the_hooks_and_is_unknown_until_one(self):
         self.assertEqual(self.skips(), {"pro/claude/api": None, "pro/claude/web": None})  # omitted, never guessed
         self.b.report_state(hook("SessionStart", source="startup", permission_mode="bypassPermissions"))

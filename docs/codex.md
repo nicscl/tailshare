@@ -57,6 +57,7 @@ flight per agent (tailshare/nudge.py). Otherwise a Codex agent waits for mail in
 | `/hello` `agents[]` | `harness` | `claude`, `codex`, `cli` |
 | `/hello` `agents[]` | `session_id` | the Claude session id, or the Codex thread id |
 | `/hello` `agents[]` | `tmux`, `state` | same shape for both |
+| `/hello` `agents[]` | `permission_mode` | from Codex's hooks: `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` (owner only, a hint like `skip`; unknown until the process's first hook) |
 | squad members | `kind` | `claude`, `codex` |
 | member reports (`GET …/report`) | `harness` | the member's `kind` |
 | dead sessions (`/start/dead`) | `kind` | `claude`, `codex` |
