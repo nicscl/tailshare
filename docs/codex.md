@@ -9,8 +9,8 @@ apps and the setup for a machine.
 tailshare agent install-codex      # hooks in ~/.codex/hooks.json + `codex mcp add tailshare -- tailshare mcp`
 ```
 
-Codex runs a new hook only after the person trusts it: open `/hooks` in Codex once and trust tailshare's.
-tailshare never marks its own hooks trusted. `uninstall-codex` removes only tailshare's hooks (yours stay; a
+Codex runs a new hook only after the person trusts it (see "Trusting the hooks"): from the owner's device
+(Face ID), with `tailshare agent trust-codex` in your own terminal, or in `/hooks` in Codex. `uninstall-codex` removes only tailshare's hooks (yours stay; a
 backup is kept as `hooks.json.bak-tailshare*`) and the MCP server.
 
 The hooks do what Claude's do:
@@ -87,3 +87,39 @@ the name comes from `TAILSHARE_AGENT_NAME`.
 `tailshare sessions` finds Codex threads by id like Claude sessions. `sessions launch` resumes one too
 (`codex resume <id>` in a tmux window, as tailshare-start does; see [sessions.md](sessions.md)), and a device
 reopens one through tailshare-start with `options.resume`.
+
+## Trusting the hooks
+
+Codex runs a hook from `~/.codex/hooks.json` only once it is trusted: `[hooks.state."<key>"] trusted_hash` in
+`config.toml`, at the hash of the hook as it is now (a changed hook is `modified` and stops until trusted again).
+A Codex whose tailshare hooks are not trusted never joins the bus. tailshare reads the trust from Codex's own
+app-server (`codex app-server`, `hooks/list`; no thread is started) and, when asked, writes it the same way
+(`config/batchWrite`, an upsert under `hooks.state`), never by editing `config.toml` itself.
+
+Only tailshare's hooks: a hook is tailshare's when it is in this user's `CODEX_HOME/hooks.json` (source `user`)
+and its command is exactly one `install-codex` writes. A hook of yours, a project's, or one in tailshare's place
+whose command was changed is never trusted, and each is trusted at the hash Codex shows for it at that moment.
+
+On the owner's devices, /hello carries `codex_hooks` on a machine with Codex installed (refreshed at most once a
+minute, in the background; with no `hooks.json` Codex is not run at all):
+
+```json
+{"state": "untrusted", "codex": "0.166.0", "hooks": 9, "untrusted": 9, "fix": {"action": "trust_codex_hooks"}}
+```
+
+| `state` | means | `fix` |
+|---|---|---|
+| `trusted` | every tailshare hook runs | none |
+| `untrusted` | some are not trusted yet | `trust_codex_hooks` |
+| `modified` | some changed since they were trusted (an upgrade) | `trust_codex_hooks` |
+| `not_installed` | no tailshare hooks here | `terminal`: `tailshare agent install-codex` |
+| `unsupported` | this Codex has no `hooks/list`/`trustStatus` | `codex_hooks_tui`: `/hooks` in Codex |
+| `error` | Codex did not answer (`reason`) | `codex_hooks_tui` |
+
+`trust_codex_hooks`: with the start key (Face ID; the plan key gets `no_grant`), on the `tailshare-start`
+channel, alone: `{"v":1, "trust_codex_hooks":{}}`. The answer is `{"v":1, "ok":true, "codex_hooks":{…}}` with the
+new status, or a refusal with a `fix` (`not_found`, `unsupported`, `failed`). It counts against the key's confirm
+rate. It does not need starting to be on. A Codex already running picks the trust up on its next session.
+
+`tailshare agent trust-codex` does the same at the machine: it shows the status and asks before trusting. It
+refuses in an AI agent's shell and without a terminal.

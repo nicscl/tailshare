@@ -33,6 +33,7 @@ With the start key (Face ID; the plan key is refused with `no_grant`), a device 
 | `{"allow": {"kind": "codex"}}` | allows an agent, with every option but `skip_permissions` |
 | `{"allow": {"kind": "claude", "option": "effort"}}` | allows one more option of an allowed agent |
 | `{"revive": {"on": false}}` | turns the revive watchdog off (or on): see "Revive" |
+| `{"trust_codex_hooks": {}}` | trusts tailshare's own Codex hooks here (docs/codex.md, "Trusting the hooks"); works with starting off |
 
 The answer is `{"v":1, "ok":true, "start":{…}}` with the new /hello `start` block, or a refusal with a `fix`.
 Changes count against the key's confirm rate. A device never changes `skip_permissions`, `auto`, `bin`,
