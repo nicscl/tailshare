@@ -13,8 +13,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from tailshare import bus, sessions
+from tailshare import bus, sessions, sessions_cli, start
 from tests.test_bus import StaticNet, free_port, make_bus
 
 SID = "11111111-2222-3333-4444-555555555555"
@@ -262,13 +263,81 @@ class Launch(Fixture):
         self.assertIn("expired", self.refused(*self.request(issued=time.time() - 900, expires=time.time() - 1)))
         self.assertIn("not allowed", self.refused(*self.request(mode="bypassPermissions")))
         self.assertIn("folder", self.refused(*self.request(cwd="/etc")))
-        self.assertIn("only Claude", self.refused(*self.request(session=CODEX_ID, harness="codex")))
+        self.assertIn("folder", self.refused(*self.request(session=CODEX_ID, harness="codex")))  # its cwd is not ours
+        self.assertIn("cannot be launched", self.refused(*self.request(harness="codex")))  # signed as another harness
         # signed by a key this machine does not trust
         other = self.keys / "other"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(other)], check=True)
         p, _ = self.request()
         self.refused(p, sessions.sign(p, other))
         self.assertEqual(self.ran, [])
+
+    def test_a_codex_thread_launches_in_tmux(self):
+        codex = self.index.get(CODEX_ID)
+        got = []
+        saved = sessions.codex_launch
+        sessions.codex_launch = lambda s, mode, prompt, signer: (got.append((s["id"], mode, prompt, signer)),
+                                                                 {"socket": "/tmp/ts-x", "pane": "%3", "bin": "t"})[1]
+        def launch():
+            d = json.loads(sessions.launch_request("nick", "pro", codex, "plan", "look"))
+            payload = sessions.canonical(d)
+            return self.svc.launch_local(payload, sessions.sign(payload, self.key))
+
+        try:
+            with mock.patch.object(sessions, "_procs", return_value=[]):
+                r = launch()
+            with mock.patch.object(sessions, "_procs", return_value=[(21, ["codex", "resume", CODEX_ID])]), \
+                    self.assertRaises(bus.BusError) as e:  # that thread is open in a Codex the bus does not see
+                launch()
+            self.assertIn("would start a copy", str(e.exception))
+        finally:
+            sessions.codex_launch = saved
+        self.assertEqual(got, [(CODEX_ID, "plan", "look", "nick")])
+        self.assertEqual((r["harness"], r["tmux"]), ("codex", {"socket": "/tmp/ts-x", "pane": "%3"}))
+        self.assertEqual(self.ran, [])  # never `claude --bg`
+        self.assertIn("tmux -S /tmp/ts-x attach -t %3", sessions_cli.attach_hint(r))
+        self.assertIn("claude attach", sessions_cli.attach_hint({"host": "pro", "id": SID, "harness": "claude"}))
+
+    def test_a_live_codex_is_not_given_a_second_copy(self):
+        sid = "019a0000-0000-7000-8000-000000000001"
+        procs = [(11, ["/opt/homebrew/bin/node", "/opt/homebrew/bin/codex", "resume", sid]),
+                 (12, ["/Applications/ChatGPT.app/x/codex", "-c", "forced_login_method=chatgpt", "exec-server"]),
+                 (13, ["/usr/bin/vim", sid])]
+        cwds = {11: "/elsewhere", 12: "/work/app", 14: "/work/app", 16: "/work/app", 17: "/work/app", 18: "/work/app"}
+        with mock.patch.object(sessions, "_procs", return_value=procs), \
+                mock.patch.object(sessions, "_cwd", side_effect=lambda pid: cwds.get(pid, "")):
+            self.assertIn("pid 11", sessions.codex_live(sid, "/work/app"))  # resumed with the id
+            procs.pop(0)
+            self.assertEqual(sessions.codex_live(sid, "/work/app"), "")  # the app's exec-server and vim do not count
+            procs.append((14, ["/x/vendor/bin/codex", "--yolo"]))  # a fresh interactive Codex in the same folder
+            self.assertIn("may be this thread", sessions.codex_live(sid, "/work/app"))
+            self.assertEqual(sessions.codex_live(sid, "/work/other"), "")
+            procs[:] = [(15, ["/x/codex", "resume", "--cd=/work/app", "--", sid, "debug", "the", "login", "apply"]),
+                        (16, ["/x/codex", "-m", "exec", "fix", "it"])]  # words of a prompt are never a subcommand
+            self.assertIn("pid 15", sessions.codex_live(sid, "/work/other"))
+            procs.pop(0)
+            self.assertIn("pid 16", sessions.codex_live(sid, "/work/app"))
+            procs[:] = [(17, ["/x/codex", "--version"]), (18, ["/x/codex", "-c", "a=b", "app-server"])]
+            self.assertEqual(sessions.codex_live(sid, "/work/app"), "")
+
+    def test_codex_launch_plan(self):
+        """What a Codex launch runs: `codex resume`, the mode's approval and sandbox, the id and prompt after `--`."""
+        plans = []
+        saved = start.launch, start.binary
+        start.launch = lambda plan, max_running: (plans.append(plan), {"tmux": {"socket": "s", "pane": "%1", "bin": "t"}})[1]
+        start.binary = lambda kind, cfg: "/opt/homebrew/bin/codex"
+        try:
+            for mode in sessions.MODES:
+                sessions.codex_launch({"id": CODEX_ID, "cwd": "/p", "name": "Bob\x1b]"}, mode, "-go", "nick")
+        finally:
+            start.launch, start.binary = saved
+        for p in plans:
+            argv = start.argv_for("codex", p["argv"][0], p["cwd"], p["name"], p["options"], "", p["prompt"], p["session"])
+            self.assertEqual(argv[:3], ["/opt/homebrew/bin/codex", "resume", "--cd=/p"])
+            self.assertEqual(argv[-3:], ["--", CODEX_ID, "-go"])
+            self.assertFalse([a for a in argv if "bypass" in a or "danger" in a])
+            self.assertEqual((p["name"], p["tmux"]["window"]), ("Bob]", "bob"))
+        self.assertIn("--sandbox=read-only", start.argv_for("codex", "c", "/p", "n", plans[1]["options"], "", "", ""))
 
     def test_running_session_is_not_launched(self):
         self.live = True
