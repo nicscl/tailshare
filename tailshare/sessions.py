@@ -482,7 +482,27 @@ def codex_launch(s: dict, mode: str, prompt: str, signer: str) -> dict:
 
 # Codex subcommands that hold no interactive thread (the ChatGPT app's `codex ... exec-server`, `codex exec`, …)
 CODEX_NOT_THREADS = {"exec", "app-server", "exec-server", "mcp", "mcp-server", "proto", "login", "logout",
-                     "completion", "sandbox", "debug", "apply", "cloud", "features", "--version"}
+                     "completion", "sandbox", "debug", "apply", "cloud", "features"}
+CODEX_VALUE_FLAGS = {"-c", "--config", "-m", "--model", "-p", "--profile", "-s", "--sandbox", "-a",
+                     "--ask-for-approval", "-C", "--cd", "-i", "--image", "--enable", "--disable", "--add-dir"}
+
+
+def _codex_subcommand(args: list[str]) -> str:
+    """The subcommand of a Codex command line (the words after `codex`): its first word that is not an option or
+    an option's value, or "" for none. Only that position counts: a word in the prompt is never one."""
+    if args in (["--version"], ["-V"], ["--help"], ["-h"]):
+        return "--version"
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+        elif a == "--":
+            return ""
+        elif a.startswith("-"):
+            skip = a in CODEX_VALUE_FLAGS
+        else:
+            return a
+    return ""
 
 
 def _procs() -> list[tuple[int, list[str]]]:
@@ -520,7 +540,7 @@ def codex_live(sid: str, cwd: str) -> str:
         at = next((i for i, a in enumerate(argv[:2]) if os.path.basename(a) in ("codex", "codex.js")), None)
         if at is None:
             continue
-        if CODEX_NOT_THREADS.intersection(argv[at + 1:]):
+        if (sub := _codex_subcommand(argv[at + 1:])) in CODEX_NOT_THREADS or sub == "--version":
             continue
         if sid in argv:
             return f"a Codex process has this thread open (pid {pid})"

@@ -303,7 +303,7 @@ class Launch(Fixture):
         procs = [(11, ["/opt/homebrew/bin/node", "/opt/homebrew/bin/codex", "resume", sid]),
                  (12, ["/Applications/ChatGPT.app/x/codex", "-c", "forced_login_method=chatgpt", "exec-server"]),
                  (13, ["/usr/bin/vim", sid])]
-        cwds = {11: "/elsewhere", 12: "/work/app", 14: "/work/app"}
+        cwds = {11: "/elsewhere", 12: "/work/app", 14: "/work/app", 16: "/work/app", 17: "/work/app", 18: "/work/app"}
         with mock.patch.object(sessions, "_procs", return_value=procs), \
                 mock.patch.object(sessions, "_cwd", side_effect=lambda pid: cwds.get(pid, "")):
             self.assertIn("pid 11", sessions.codex_live(sid, "/work/app"))  # resumed with the id
@@ -312,6 +312,13 @@ class Launch(Fixture):
             procs.append((14, ["/x/vendor/bin/codex", "--yolo"]))  # a fresh interactive Codex in the same folder
             self.assertIn("may be this thread", sessions.codex_live(sid, "/work/app"))
             self.assertEqual(sessions.codex_live(sid, "/work/other"), "")
+            procs[:] = [(15, ["/x/codex", "resume", "--cd=/work/app", "--", sid, "debug", "the", "login", "apply"]),
+                        (16, ["/x/codex", "-m", "exec", "fix", "it"])]  # words of a prompt are never a subcommand
+            self.assertIn("pid 15", sessions.codex_live(sid, "/work/other"))
+            procs.pop(0)
+            self.assertIn("pid 16", sessions.codex_live(sid, "/work/app"))
+            procs[:] = [(17, ["/x/codex", "--version"]), (18, ["/x/codex", "-c", "a=b", "app-server"])]
+            self.assertEqual(sessions.codex_live(sid, "/work/app"), "")
 
     def test_codex_launch_plan(self):
         """What a Codex launch runs: `codex resume`, the mode's approval and sandbox, the id and prompt after `--`."""
