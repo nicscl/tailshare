@@ -648,6 +648,14 @@ class Bus:
                 json.dumps(tmux) if tmux else "", json.dumps(squad, sort_keys=True) if squad else "", skip, mode,
             )
             self._claim(aid, address, user)
+        if harness == "codex" and tmux and pid and not (was and was["pid"] == pid):  # a new Codex thread's start
+            from . import start
+
+            try:
+                if start.bind_launch(aid, harness, cwd, tmux):
+                    log(f"start: recorded the launch of codex {aid[:8]}")
+            except (OSError, sqlite3.Error) as e:
+                log(f"start: could not record the launch of codex {aid[:8]}: {e}")
         return self.agent(aid)
 
     def _user_for(self, a: dict) -> str:

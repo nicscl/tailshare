@@ -914,6 +914,8 @@ CREATE TABLE IF NOT EXISTS member_starts(squad TEXT NOT NULL, member TEXT NOT NU
   at REAL NOT NULL, PRIMARY KEY(squad, member));
 CREATE TABLE IF NOT EXISTS launched(session TEXT PRIMARY KEY, options TEXT NOT NULL, grant_ TEXT NOT NULL,
   at REAL NOT NULL, key TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS launch_pending(socket TEXT NOT NULL, pane TEXT NOT NULL, cwd TEXT NOT NULL,
+  options TEXT NOT NULL, grant_ TEXT NOT NULL, key TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(socket, pane));
 CREATE TABLE IF NOT EXISTS revives(session TEXT NOT NULL, socket TEXT NOT NULL, at REAL NOT NULL,
   weight INTEGER NOT NULL, host_event INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS revive_flags(key TEXT PRIMARY KEY, at REAL NOT NULL);
@@ -943,6 +945,7 @@ def _db(path: Path | None = None) -> sqlite3.Connection:
     con.execute("DELETE FROM revives WHERE at<?", (now - 86400,))
     con.execute("DELETE FROM revive_stopped WHERE at<?", (now - 86400,))
     con.execute("DELETE FROM launched WHERE at<?", (now - 30 * 86400,))
+    con.execute("DELETE FROM launch_pending WHERE at<?", (now - PENDING_BIND,))
     return con
 
 
@@ -950,11 +953,50 @@ def record_launch(con: sqlite3.Connection, plan: dict, result: dict, key: str) -
     """What a session was started with, and by which start key, so the revive watchdog reopens it the same way
     and never with more than that key may do now (revive.py)."""
     sid = str(result.get("session") or plan.get("session") or "").lower()
-    if not sid:
-        return  # a new Codex thread: its id is not known here
+    if not sid:  # a new Codex thread: its id is known only once it registers from its pane (bind_launch)
+        t = bus.clean_tmux(result.get("tmux"))
+        if plan.get("kind") == "codex" and t:
+            con.execute("INSERT OR REPLACE INTO launch_pending(socket, pane, cwd, options, grant_, key, at)"
+                        " VALUES(?,?,?,?,?,?,?)", (t["socket"], t["pane"], plan["cwd"],
+                                                   json.dumps(plan["options"], sort_keys=True),
+                                                   "skip" if plan["skip"] else "safe", key, time.time()))
+        return
     con.execute("INSERT OR REPLACE INTO launched(session, options, grant_, at, key) VALUES(?,?,?,?,?)",
                 (sid, json.dumps(plan["options"], sort_keys=True), "skip" if plan["skip"] else "safe",
                  time.time(), key))
+
+
+PENDING_BIND = 600  # seconds a new Codex start waits for its thread to register from its pane
+
+
+def bind_launch(sid: str, harness: str, cwd: str, tmux: dict | None, db: Path | None = None) -> bool:
+    """A Codex thread registering from the pane a start launched it in moments ago: record that start's options,
+    grant and key under the thread's id now, so a Reopen, revive or keep-running restart starts it the same way
+    (and never with more than that key may do now). Once per start: the pending record goes, so a second agent
+    in that pane gets nothing. Same folder only. Never creates start.db."""
+    sid = str(sid or "").lower()
+    if harness != "codex" or not tmux or not _UUID.fullmatch(sid):
+        return False
+    db = db or db_path()
+    if not db.exists():
+        return False
+    con = _db(db)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        r = con.execute("SELECT * FROM launch_pending WHERE socket=? AND pane=? AND at>?",
+                        (tmux["socket"], tmux["pane"], time.time() - PENDING_BIND)).fetchone()
+        if r is None:
+            con.execute("ROLLBACK")
+            return False
+        con.execute("DELETE FROM launch_pending WHERE socket=? AND pane=?", (tmux["socket"], tmux["pane"]))
+        same = os.path.realpath(r["cwd"]) == os.path.realpath(cwd or "/nonexistent")
+        if same:
+            con.execute("INSERT OR IGNORE INTO launched(session, options, grant_, at, key) VALUES(?,?,?,?,?)",
+                        (sid, r["options"], r["grant_"], time.time(), r["key"]))
+        con.execute("COMMIT")
+        return same
+    finally:
+        con.close()
 
 
 def squad_session(name: str) -> str:
