@@ -828,7 +828,8 @@ class Keys:
                 "tailscale_ssh": ts, "enroll": not install_problem(),
                 "control": 1,  # ssh-gate takes `-C attach` (tailshare/gate_control.py)
                 "control_size": 1,  # ... and refresh-client -C / select-window there, with the lease
-                "control_zoom": 1}  # ... and zooms a split window on the pane while it sizes
+                "control_zoom": 1,  # ... and zooms a split window on the pane while it sizes
+                "control_still": 1}  # ... and a client that does not size never switches the session's window
 
 
     # -- requests from devices --------------------------------------------------

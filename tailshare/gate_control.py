@@ -9,7 +9,12 @@ tmux, the gate runs it as a child and passes lines through:
 - to the app, only command replies and the notifications about %N and its window. Other panes' output
   never leaves this machine.
 
-When the pane exits (or is left dead by remain-on-exit) the gate writes `%tailshare-gone %N` and exits.
+A client that does not size (-r, or -f ignore-size) is attached to %N's own session by its id ($S), not with
+`-t %N`: attaching to a pane would make its window that session's current one, switching what the Mac's
+terminal shows. Every command it may send targets %N anyway.
+
+When the pane exits (or is left dead by remain-on-exit) the gate writes `%tailshare-gone %N` and exits; also
+before attaching, if there is no such pane.
 Once the app has set a size, it must send a line at least every LEASE seconds, or the gate writes
 `%tailshare-idle %N` and exits, so a phone that dropped off the network gives the window its size back.
 
@@ -252,11 +257,13 @@ def child_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
 
-def control_argv(req: dict, binary: str, session: str = "") -> list[str]:
+def control_argv(req: dict, binary: str, session: str = "", still: str = "") -> list[str]:
     argv = [binary, "-C", "-S", req["socket"], "attach"] + (["-r"] if req["readonly"] else [])
     argv += ["-f", ",".join(req["flags"])] if req["flags"] else []
     if not session:
-        return argv + ["-t", req["pane"]]
+        # %N's session by its id, never `-t %N`: attaching to a pane makes its window the session's current
+        # window, which would switch what the Mac's own terminal shows. Everything else targets %N anyway
+        return argv + ["-t", still]
     # in the same command, once attached (set before, it would remove the session at once): from here on a
     # gate killed by any signal leaves nothing behind
     return argv + ["-t", f"={session}", ";", "set-option", "-t", f"={session}:", "destroy-unattached", "on"]
@@ -291,7 +298,13 @@ def run(req: dict, binary: str, stdin: BinaryIO | None = None, stdout: BinaryIO 
         stdout.write(f"%tailshare-nosize {pane}\n".encode())
         stdout.flush()
         return 0
-    child = subprocess.Popen(control_argv(req, binary, session), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    still = "" if sizing else _display(binary, sock, pane, "#{session_id}")
+    if not sizing and not still.startswith("$"):  # no such pane: nothing to attach to
+        log(f"control {pane}: no session")
+        stdout.write(f"%tailshare-gone {pane}\n".encode())
+        stdout.flush()
+        return 0
+    child = subprocess.Popen(control_argv(req, binary, session, still), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, env=child_env())
     write = threading.Lock()
     done = threading.Event()
