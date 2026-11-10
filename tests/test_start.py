@@ -606,6 +606,50 @@ class Isolated(Base):
         self.assertEqual(self.sessions(sock), ["AppDev:mgr"])
         self.assertEqual(self.argvs(0.3), [])
 
+    def test_a_server_left_with_only_shells_is_free(self):
+        """tmux-resurrect fills every new server with the user's saved shells: once the agent's own session is
+        gone, those keep the server up, and keep said "starting" for good while start refused the name."""
+        (self.tmp / "tmux").mkdir(mode=0o700)
+        sock = self.tmp / "tmux" / "ts-appdev"
+        subprocess.run([TMUX, "-f", os.devnull, "-S", str(sock), "new-session", "-d", "-s", "workspace", "-n",
+                        "shell", "/bin/sh"], check=True)
+        from tailshare import keep
+
+        self.assertFalse(start.occupied(TMUX, str(sock)))
+        self.assertFalse(keep._Windows()({"name": "Squad"}, {"name": "AppDev"}))
+        r = self.run_one()
+        self.assertNotIn("error", r)
+        self.assertEqual(r["tmux"]["socket"], str(sock))
+        self.assertEqual(sorted(self.sessions(sock)), ["tailshare-start:appdev", "workspace:shell"])
+        self.assertTrue(start.occupied(TMUX, str(sock)))  # its own session now
+        self.assertTrue(keep._Windows()({"name": "Squad"}, {"name": "AppDev"}))
+        self.assertEqual(self.run_one()["error"], "running")
+
+    def test_a_server_running_more_than_a_shell_still_counts(self):
+        (self.tmp / "tmux").mkdir(mode=0o700)
+        sock = self.tmp / "tmux" / "ts-appdev"
+        subprocess.run([TMUX, "-f", os.devnull, "-S", str(sock), "new-session", "-d", "-s", "workspace", "/bin/sh"],
+                       check=True)
+        subprocess.run([TMUX, "-S", str(sock), "new-window", "-d", "-t", "workspace:", "sleep 30"], check=True)
+        from tailshare import keep
+
+        self.assertTrue(start.occupied(TMUX, str(sock)))
+        self.assertTrue(keep._Windows()({"name": "Squad"}, {"name": "AppDev"}))
+        self.assertEqual(self.run_one()["error"], "running")
+        self.assertFalse(start.occupied(TMUX, str(self.tmp / "tmux" / "ts-none")))  # no server at all
+
+    def test_a_new_agent_server_reads_no_tmux_conf(self):
+        """Only tailshare's (empty) config: never the user's ~/.tmux.conf and its plugins."""
+        conf = self.tmp / "conf"
+        conf.write_text("set -g @tailshare-conf yes\n")
+        with mock.patch.object(start, "NO_CONFIG", str(conf)):
+            r = self.run_one()
+        self.assertNotIn("error", r)
+        out = subprocess.run([TMUX, "-S", r["tmux"]["socket"], "show-options", "-gv", "@tailshare-conf"],
+                             capture_output=True, text=True, check=False).stdout.strip()
+        self.assertEqual(out, "yes")
+        self.assertEqual(start.NO_CONFIG, os.devnull)
+
     def test_the_limit_counts_every_server_and_the_old_one(self):
         self.config(max_running=3)
         subprocess.run([TMUX, "-S", str(self.tmp / "legacy"), "new-session", "-d", "-s", start.SESSION, "-n", "old",

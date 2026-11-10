@@ -860,13 +860,27 @@ def _windows(t: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def _sessions(t: str, sock: str) -> list[str]:
+SHELLS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "login"})
+NO_CONFIG = os.devnull  # an agent server reads no tmux.conf: a user's tmux-resurrect would restore their whole
+# workspace into it (and tmux-continuum save from it), which keeps the server alive after its agent is gone
+
+
+def occupied(t: str, sock: str) -> bool:
+    """Whether server `sock` still runs something a start must not land next to: a session tailshare started, or
+    any pane running more than a shell (ts-agents' agent, say). A server left with only shells, as when a
+    tmux-resurrect restore filled it, holds no agent: its agent's pane closed with it."""
     try:
-        r = subprocess.run([t, "-S", sock, "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True,
-                           timeout=5, stdin=subprocess.DEVNULL)
+        r = subprocess.run([t, "-S", sock, "list-panes", "-a", "-F", "#{session_name}\t#{pane_current_command}"],
+                           capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
-        return []
-    return r.stdout.split() if r.returncode == 0 else []
+        return True  # cannot tell: never a second copy
+    if r.returncode != 0:
+        return False  # no server there (or no sessions)
+    for line in r.stdout.splitlines():
+        s, _, cmd = line.partition("\t")
+        if s == SESSION or s.startswith("squad-") or os.path.basename(cmd.lstrip("-")) not in SHELLS:
+            return True
+    return False
 
 
 def server_env() -> dict:
@@ -884,7 +898,7 @@ def launch(plan: dict, max_running: int) -> dict:
     sock = socket_for(plan["name"])
     wins = _windows(t)
     w = plan["tmux"]
-    if any((s, n) == (w["session"], w["window"]) for _, s, n in wins) or (not TMUX_SOCKET and _sessions(t, sock)):
+    if any((s, n) == (w["session"], w["window"]) for _, s, n in wins) or (not TMUX_SOCKET and occupied(t, sock)):
         raise Refused("running", "name", "a session with this name is still running here")
     if len(wins) >= max_running:
         raise Refused("limit", reason=f"{len(wins)} started sessions are running here (at most {max_running})",
@@ -894,7 +908,7 @@ def launch(plan: dict, max_running: int) -> dict:
     argv = argv_for(plan["kind"], plan["argv"][0], plan["cwd"], plan["name"], plan["options"], plan["instructions"],
                     plan["prompt"], plan["session"])
     common = ["-n", w["window"], "-c", plan["cwd"], *env, *fmt, "--", *argv]
-    tmux = [t, "-S", sock]
+    tmux = [t, "-f", NO_CONFIG, "-S", sock]  # -f counts only when this starts the server
     has = bool(TMUX_SOCKET) and subprocess.run([*tmux, "has-session", "-t", "=" + w["session"]], capture_output=True,
                                                timeout=10, stdin=subprocess.DEVNULL).returncode == 0
     cmd = ["new-window", "-d", "-t", f"={w['session']}:"] if has else ["new-session", "-d", "-s", w["session"]]
