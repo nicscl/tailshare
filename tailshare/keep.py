@@ -138,7 +138,7 @@ class _Windows:
             try:
                 t = start._tmux_bin()
                 self._seen = {(s, w) for _, s, w in start._windows(t)}
-                self._servers = {os.path.basename(p) for p in start._servers() if p and start._sessions(t, p)}
+                self._servers = {os.path.basename(p) for p in start._servers() if p and start.occupied(t, p)}
             except (start.Refused, OSError):
                 self._seen, self._servers = set(), set()
         return ((start.squad_session(sq["name"]), start.slug(m["name"])) in self._seen

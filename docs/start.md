@@ -165,8 +165,13 @@ never attaches to the returned pane directly.
   default server: a crash or `kill-server` there takes down one agent, not all of them. The server holds one
   session, `tailshare-start` (or `squad-<squad>` for a squad member), with one window named after the agent.
   The folder must be this user's and closed to others (0700), or the start is refused (`no_tmux`).
-- If a server of that name already has any session, the start is refused (`running`), so a start never lands
-  inside a server it did not make (such as one `ts-agents` runs).
+- If a server of that name still runs an agent, the start is refused (`running`), so a start never lands
+  inside a server it did not make (such as one `ts-agents` runs). "Runs an agent" means a session tailshare
+  started there, or any pane running more than a shell. A server left with only shells holds no agent, since an
+  agent's pane closes with it, so the start goes in next to them. keep-running counts that server the same way.
+- The server reads no tmux.conf (`-f /dev/null`). Your own tmux plugins never run in it. With tmux-resurrect
+  and tmux-continuum, every new server would restore your whole saved workspace, which keeps the server up once
+  its agent is gone, and continuum would save from it.
 - The server, and so the agent, starts with a clean environment: HOME, USER, LOGNAME, SHELL, a fixed PATH,
   LANG and TERM, plus the variables below. Nothing from the ssh login or the gate's own process.
 - Its pane is (socket, pane) everywhere, in the answer, in `/hello` and at the gate: `%N` alone is never enough,
