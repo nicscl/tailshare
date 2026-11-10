@@ -529,6 +529,34 @@ class Proxy(unittest.TestCase):
         self.assertEqual(self.zoomed()[:1], "0")
         self.assertEqual(self.t("display", "-p", "-t", self.a, "#{@tailshare-zoom}"), "")
 
+    def test_a_client_that_does_not_size_leaves_the_macs_window(self):
+        """`attach -t %N` would make %N's window current: what the Mac's own terminal shows would switch."""
+        self.t("select-window", "-t", ":1")  # the Mac shows %B's window
+        for kw in ({}, {"readonly": True, "flags": ()}):
+            self.out = b""
+            self.start(**kw)
+            self.say(f"display -p -t {self.a} {FMT}")
+            self.assertTrue(self.wait_for(b"80 24 "))
+            self.assertEqual(self.t("display", "-p", "-t", "$0", "#{window_index}"), "1")
+            self.assertEqual(self.sessions(), ["0"])
+            self.assertEqual(self.stop(), 0)
+        self.start()  # and its pane's output still reaches it, though its window is not the current one
+        self.say(f"send-keys -H -t {self.a} 68 69 0d")
+        self.assertTrue(self.wait_for(b"%output " + self.a.encode()))
+        self.assertNotIn(b"SECRET", self.out)
+        self.stop()
+
+    def test_no_such_pane_is_gone_without_attaching(self):
+        self.a = "%99"
+        req = {"socket": self.sock, "pane": "%99", "readonly": True, "flags": [], "cc": "-C", "tail": []}
+        rin, win = os.pipe()
+        rout, wout = os.pipe()
+        with os.fdopen(rin, "rb") as i, os.fdopen(wout, "wb") as o:
+            self.assertEqual(gate_control.run(req, self.tmux, i, o), 0)
+        os.close(win)
+        with os.fdopen(rout, "rb") as fh:
+            self.assertEqual(fh.read(), b"%tailshare-gone %99\n")
+
     def test_says_when_the_pane_is_gone(self):
         self.start()
         self.t("kill-pane", "-t", self.a)

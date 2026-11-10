@@ -182,7 +182,13 @@ detach, close stdin.
 Other panes' output and the names of other windows and sessions never leave the machine.
 
 When %N exits, or is left dead by `remain-on-exit`, the gate sends `%tailshare-gone %N` as its last line
-and exits 0.
+and exits 0. It sends the same, without attaching, when there is no pane %N.
+
+A client attached with `-r` or `-f ignore-size` (one that does not size) is attached to %N's own session by
+its id (`-t $S`), not to the pane. `attach -t %N` would make %N's window that session's current window and
+%N its active pane, so each Watch would switch what the Mac's terminal shows. A gate that sends
+`"control_still": 1` in `/hello` does this; older gates switch the window. A sizing client has a session of
+its own (below), so it never moved the Mac's window.
 
 #### Sizing
 
@@ -251,7 +257,7 @@ plain `attach`, which is a full tmux client.
 ```json
 "ssh": {"login": "Glaciar", "owner": "nick@example.com", "port": 22,
         "host_keys": ["ssh-ed25519 AAAA..."], "tailscale_ssh": false, "enroll": true, "control": 1,
-        "control_size": 1, "control_zoom": 1}
+        "control_size": 1, "control_zoom": 1, "control_still": 1}
 ```
 
 - `host_keys` go straight into `known_hosts`, so there is no trust-on-first-use.
@@ -263,6 +269,8 @@ plain `attach`, which is a full tmux client.
 - `control: 1` means the gate takes `-C attach` (see "Control mode" above). Older versions leave it out.
 - `control_size: 1` means it also takes the sizing commands and the lease (see "Sizing" above).
 - `control_zoom: 1` means a sizing attach to a pane in a split window zooms it (see "Zoom" above).
+- `control_still: 1` means an attach that does not size never changes the current window of %N's session
+  (see "Control mode" above): a device may keep such connections open in the background.
 - `tailscale_ssh: true` means Tailscale SSH answers port 22 on that machine, and `host_keys` are then
   tailscaled's keys from `tailscale status`, not `/etc/ssh`. It ignores `authorized_keys`;
   access there follows the tailnet's SSH policy instead.
