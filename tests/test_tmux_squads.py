@@ -35,6 +35,7 @@ while :; do
   case "$mode" in
     exit*) exit "${mode#exit }" ;;
     ask) printf '\033[2J\033[H Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n' ;;
+    draft2) printf '\033[2J\033[H● Done: all tests pass.\n────────\n❯\302\240\n  git push --force\n────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
     draft) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240git push --force │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
     *) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240\033[2mTry "x"\033[0m │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
   esac
@@ -186,6 +187,37 @@ class SquadUp(unittest.TestCase):
         self.assertFalse((self.proj / "one" / "typed").exists())
         self.mode("one", "idle")  # the person sent or cleared it: now the stop goes through
         self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once the prompt is empty", secs=20)
+
+    def test_stop_never_types_over_a_draft_that_starts_with_an_empty_line(self):
+        self.mode("one", "draft2")
+        self.up()
+        self.wait(lambda: "git push" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the draft")
+        self.assertIn("stops when it finishes", self.up("stop", "One"))
+        time.sleep(4)
+        self.assertFalse((self.proj / "one" / "typed").exists())
+
+    def test_stop_never_types_while_a_grouped_session_client_is_active(self):
+        self.up()
+        self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
+        subprocess.run([*self.tmux, "new-session", "-d", "-t", "=squad-test", "-s", "viewer"], check=True,
+                       env=self.env)
+        subprocess.run([*self.tmux, "select-window", "-t", "=viewer:" + self.member("One")["window_id"]], check=True)
+        client = subprocess.Popen([*self.tmux, "-C", "attach", "-t", "=viewer"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
+        try:
+            self.wait(lambda: subprocess.run([*self.tmux, "list-clients"], capture_output=True, text=True,
+                                             check=False).stdout, "a client")
+            self.assertIn("stops when it finishes", self.up("stop", "One"))
+            time.sleep(4)
+            self.assertFalse((self.proj / "one" / "typed").exists())
+        finally:
+            client.stdin.close()
+            client.wait(timeout=10)
+
+    def test_a_lock_left_without_a_pid_goes_stale(self):
+        (self.proj / ".squad" / "state" / ".up.lock").mkdir(parents=True)
+        self.assertIn("One: started", self.up("up", "One"))
+        self.assertFalse((self.proj / ".squad" / "state" / ".up.lock").exists())
 
     def test_stop_never_types_while_someone_is_attached_and_active(self):
         self.up()

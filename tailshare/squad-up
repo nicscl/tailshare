@@ -107,38 +107,52 @@ wopt() { t show-options -wqv -t "$1" "$2" 2>/dev/null; }
 wset() { t set-option -wq -t "$1" "$2" "$3"; }
 fmt() { t display-message -p -t "$1" "$2" 2>/dev/null; }
 
-# typing <window>: 0 when a client on the squad session did something in the last $QUIET seconds
+# typing <window>: 0 when a client showing this window (from any session: grouped, linked, a viewer's) did
+# something in the last $QUIET seconds
 typing() {
+    wid=$(fmt "$1" '#{window_id}')
     now=$(date +%s)
-    for a in $(t list-clients -t "=$S" -F '#{client_activity}' 2>/dev/null); do
+    for a in $(t list-clients -F '#{window_id} #{client_activity}' 2>/dev/null | awk -v w="$wid" '$1 == w { print $2 }'); do
         [ $((now - a)) -ge "$QUIET" ] || return 0
     done
     return 1
 }
 
-# empty_prompt <window>: 0 when the agent's input line holds nothing a person typed. Claude and Codex show a
-# dim placeholder in an empty prompt, so the line is read with its colours (capture-pane -e).
+# empty_prompt <window>: 0 when the agent's input box holds nothing a person typed. Claude and Codex show a dim
+# placeholder in an empty prompt, so the box is read with its colours (capture-pane -e). Every line from the
+# prompt down to the box's lower border (or the screen's end) must be empty, dim, a border or a known footer:
+# a draft may start with an empty line (Shift+Enter) and go on below.
 empty_prompt() {
     plain=$(t capture-pane -p -t "$1" 2>/dev/null)
     n=$(printf '%s\n' "$plain" | grep -nE "^[[:space:]│]*(>|❯|›)( |$NB|\$)" | tail -n 1 | cut -d: -f1)
     [ -n "$n" ] || return 1
-    line=$(t capture-pane -e -p -t "$1" 2>/dev/null | sed -n "${n}p")
-    case "$line" in *❯*) rest=${line#*❯} ;; *›*) rest=${line#*›} ;; *) rest=${line#*>} ;; esac
-    printf '%s\n' "$rest" | LC_ALL=C awk -v E="$E" '{
+    box=$(t capture-pane -e -p -t "$1" 2>/dev/null | sed -n "${n},\$p")
+    first=$(printf '%s\n' "$box" | sed -n 1p)
+    case "$first" in *❯*) first=${first#*❯} ;; *›*) first=${first#*›} ;; *) first=${first#*>} ;; esac
+    { printf '%s\n' "$first"; printf '%s\n' "$box" | sed 1d; } | LC_ALL=C awk -v E="$E" '
+    function sgr(code) {
+        if (code ~ /(^|;)(2|90)(;|$)/ || code ~ /(^|;)38;5;(8|23[2-9]|24[0-9]|25[0-5])(;|$)/) dim = 1
+        else if (code ~ /^(0|22|39)?$/) dim = 0
+    }
+    {
         s = $0; dim = 0
+        gsub(/\033\][^\033]*\033\\/, "", s)  # hyperlinks
+        bare = s; gsub(/\033\[[0-9;]*m/, "", bare)
+        if (NR > 1 && bare ~ /^[ ]*(\342\224\200|\342\224\201|\342\225\260|\342\225\257|\342\225\255|\342\225\256|\342\224\202| )+$/ &&
+            bare ~ /\342\224\200|\342\224\201|\342\225\260|\342\225\257/) exit 0  # the lower border: the box ends
         while (length(s)) {
             if (substr(s, 1, 1) == " ") { s = substr(s, 2); continue }
             if (substr(s, 1, 2) == "\302\240") { s = substr(s, 3); continue }
+            if (substr(s, 1, 3) == "\342\224\202") { s = substr(s, 4); continue }  # │
             if (substr(s, 1, 2) == E "[" && match(s, /^\033\[[0-9;]*m/)) {
-                code = substr(s, 3, RLENGTH - 3)
-                if (code ~ /(^|;)(2|90)(;|$)/ || code ~ /(^|;)38;5;(8|23[2-9]|24[0-9])(;|$)/) dim = 1
-                else if (code ~ /^(0|22|39)?$/) dim = 0
-                s = substr(s, RLENGTH + 1); continue
+                sgr(substr(s, 3, RLENGTH - 3)); s = substr(s, RLENGTH + 1); continue
             }
             break
         }
         gsub(/\033\[[0-9;]*m/, "", s); sub(/[ ]*(\342\224\202)?[ ]*$/, "", s)
-        exit (s == "" || dim) ? 0 : 1
+        if (s == "" || dim) next
+        if (NR > 1 && tolower(s) ~ /for shortcuts|for agents|\342\217\265\342\217\265|shift\+tab|bypass permissions|esc to |\/effort|\302\267 ~\/|context left|^ctrl[+-]/) next
+        exit 1
     }'
 }
 
@@ -165,6 +179,8 @@ lock() {
     until mkdir "$L" 2>/dev/null; do
         p=$(cat "$L/pid" 2>/dev/null || true)
         if [ -n "$p" ] && ! ps -p "$p" >/dev/null 2>&1; then rm -rf "$L"; continue; fi
+        # no pid 3 s on: its owner died between mkdir and writing it
+        if [ -z "$p" ] && [ "$n" -ge 30 ] && [ -d "$L" ] && [ ! -s "$L/pid" ]; then rm -rf "$L"; continue; fi
         n=$((n + 1))
         [ "$n" -lt 150 ] || die "another squad-up is changing this squad ($L)"
         sleep 0.1

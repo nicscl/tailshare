@@ -47,7 +47,7 @@ old copy, and it refuses when any of `.squad`, `squad-up`, `squad` or `.gitignor
 ```
 
 `up` is safe to run again, and two at once are safe: a lock in `.squad/state` lets one change the squad at a
-time, and a window `up` just created counts as its agent before its runner has started.
+time (a lock whose owner died is taken over), and a window `up` just created counts as its agent before its runner has started.
 - A missing session is created.
 - A missing agent gets a window.
 - An agent whose pane has ended is respawned.
@@ -96,10 +96,12 @@ Each agent window runs `squad-up run <Name>`, which works like this:
 Idle means all of:
 - the screen shows none of: "esc to interrupt/cancel", "Do you want", "Would you like", `(y/n)`, "Press enter",
   or a numbered choice;
-- the prompt line is empty. Claude and Codex show a dim placeholder in an empty prompt, so the line is read with
-  its colours (`capture-pane -e`): dim text counts as empty, normal text is a draft and blocks the stop;
-- no client attached to the squad session did anything in the last 60 s (`client_activity`,
-  SQUAD_QUIET_SECS).
+- the input box is empty, from the prompt line down to the box's lower border. Claude and Codex show a dim
+  placeholder in an empty prompt, so the box is read with its colours (`capture-pane -e`): dim text, borders
+  and known footers count as empty; normal text on any line is a draft and blocks the stop (a draft may start
+  with an empty line);
+- no client showing the agent's window, from any session (grouped, linked, a viewer's), did anything in the
+  last 60 s (`client_activity`, SQUAD_QUIET_SECS).
 
 Right before typing, the waiter reads `@keep` and its own `@stop_waiter` again, so a `start` in between wins.
 This is still a screen heuristic, so it waits rather than guesses: when in doubt the agent keeps running.
