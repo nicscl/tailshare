@@ -35,9 +35,10 @@ while :; do
   case "$mode" in
     exit*) exit "${mode#exit }" ;;
     ask) printf '\033[2J\033[H Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n' ;;
+    bgshell) printf '\033[2J\033[H● Ran 1 shell command\n● Started it in the background.\n────────\n❯\302\240\n────────\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n' ;;
     draft2) printf '\033[2J\033[H● Done: all tests pass.\n────────\n❯\302\240\n  git push --force\n────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
     draft) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240git push --force │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
-    *) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240\033[2mTry "x"\033[0m │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
+    *) printf '\033[2J\033[H● Ran 1 shell command\n● Done: all tests pass.\n╭────────╮\n│ ❯\302\240\033[2mTry "x"\033[0m │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
   esac
   if IFS= read -r -t 1 line; then
     printf '%s|%s\n' "$mode" "$line" >> "$d/typed"
@@ -195,6 +196,16 @@ class SquadUp(unittest.TestCase):
         self.assertIn("stops when it finishes", self.up("stop", "One"))
         time.sleep(4)
         self.assertFalse((self.proj / "one" / "typed").exists())
+
+    def test_stop_waits_for_the_agents_background_shells(self):
+        self.mode("one", "bgshell")
+        self.up()
+        self.wait(lambda: "1 shell" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the shell")
+        self.assertIn("stops when it finishes", self.up("stop", "One"))
+        time.sleep(4)
+        self.assertFalse((self.proj / "one" / "typed").exists())
+        self.mode("one", "idle")
+        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once its shell ended", secs=20)
 
     def test_stop_never_types_while_a_grouped_session_client_is_active(self):
         self.up()

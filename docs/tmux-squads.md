@@ -94,8 +94,9 @@ Each agent window runs `squad-up run <Name>`, which works like this:
 - **`start` before then:** the pending stop is cancelled.
 
 Idle means all of:
-- the screen shows none of: "esc to interrupt/cancel", "Do you want", "Would you like", `(y/n)`, "Press enter",
-  or a numbered choice;
+- the screen shows none of: "esc to interrupt/cancel", "Enter to confirm", "Do you want", "Would you like",
+  `(y/n)`, "Press enter", a numbered choice, or a footer naming background work (`· 1 shell`, "to manage").
+  Claude answers `/exit` with a menu while one of its background shells runs, so the stop waits for it;
 - the input box is empty, from the prompt line down to the box's lower border. Claude and Codex show a dim
   placeholder in an empty prompt, so the box is read with its colours (`capture-pane -e`): dim text, borders
   and known footers count as empty; normal text on any line is a draft and blocks the stop (a draft may start

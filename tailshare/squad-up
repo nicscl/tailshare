@@ -156,13 +156,14 @@ empty_prompt() {
     }'
 }
 
-# idle <window>: 0 when the agent sits at its own empty prompt: not working, not asking, nobody typing
+# idle <window>: 0 when the agent sits at its own empty prompt: not working, not asking, nobody typing, and no
+# background shell of its own still running (Claude answers /exit with a menu then)
 idle() {
     [ "$(fmt "$1" '#{pane_dead}')" = 0 ] || return 1
     [ "$(wopt "$1" @state)" = running ] || return 1
     typing "$1" && return 1
     screen=$(t capture-pane -p -t "$1" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15)
-    printf '%s\n' "$screen" | grep -qiE 'esc to (interrupt|cancel)|do you want|would you like|\(y/n\)|\[y/n\]|press enter|(^|[[:space:]│])(❯|›|>)( |'"$NB"')*[0-9]+\.' && return 1
+    printf '%s\n' "$screen" | grep -qiE 'esc to (interrupt|cancel)|enter to confirm|· [0-9]+ (shells?|background)|background (work|task|terminal)|to manage|do you want|would you like|\(y/n\)|\[y/n\]|press enter|(^|[[:space:]│])(❯|›|>)( |'"$NB"')*[0-9]+\.' && return 1
     empty_prompt "$1"
 }
 
@@ -179,8 +180,11 @@ lock() {
     until mkdir "$L" 2>/dev/null; do
         p=$(cat "$L/pid" 2>/dev/null || true)
         if [ -n "$p" ] && ! ps -p "$p" >/dev/null 2>&1; then rm -rf "$L"; continue; fi
-        # no pid 3 s on: its owner died between mkdir and writing it
-        if [ -z "$p" ] && [ "$n" -ge 30 ] && [ -d "$L" ] && [ ! -s "$L/pid" ]; then rm -rf "$L"; continue; fi
+        # a lock 3 s old with no pid: its owner died between mkdir and writing it
+        if [ -z "$p" ]; then
+            m=$(stat -c %Y "$L" 2>/dev/null || stat -f %m "$L" 2>/dev/null || true)
+            if [ -n "$m" ] && [ $(($(date +%s) - m)) -ge 3 ] && [ ! -s "$L/pid" ]; then rm -rf "$L"; continue; fi
+        fi
         n=$((n + 1))
         [ "$n" -lt 150 ] || die "another squad-up is changing this squad ($L)"
         sleep 0.1
