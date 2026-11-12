@@ -31,7 +31,10 @@ PAGE_PORT = int(os.environ.get("TAILSHARE_SQUAD_PAGE_PORT", "8792"))
 ASKING = re.compile(r"do you want|would you like|\(y/n\)|\[y/n\]|press enter|(^|[\s│])(❯|›|>) *\d+\.", re.IGNORECASE)
 WORKING = re.compile(r"esc to interrupt", re.IGNORECASE)
 CHROME = re.compile(r"^[\s│╭╮╰╯─━┃┏┓┗┛>❯›⏵·•*]*$")  # borders, an empty prompt, spinners
-FOOTER = re.compile(r"^(\? for shortcuts|⏵⏵|bypass permissions|esc to |ctrl[+-]|accept edits|plan mode)", re.IGNORECASE)
+PROMPT = re.compile(r"^(>|❯|›)(\s|$)")  # the input line, with its placeholder text
+FOOTER = re.compile(
+    r"for shortcuts|for agents|⏵⏵|shift\+tab|bypass permissions|esc to |/effort|· ~/|^ctrl[+-]", re.IGNORECASE
+)
 
 
 def tmux_argv() -> list[str]:
@@ -81,9 +84,7 @@ def last_line(lines: list[str]) -> str:
     """The last line of real output: not borders, not the empty prompt, not the footer hints."""
     for ln in reversed(lines):
         s = ln.strip().strip("│").strip()
-        if not s or CHROME.match(s) or FOOTER.match(s):
-            continue
-        if re.match(r"^(>|❯|›)\s*$", s):
+        if not s or CHROME.match(s) or PROMPT.match(s) or FOOTER.search(s):
             continue
         return s[:200]
     return ""
@@ -180,6 +181,10 @@ def render(squads: list[dict], title: str = "Squads") -> str:
 
 class _Page(BaseHTTPRequestHandler):
     def do_GET(self):
+        port = self.server.server_address[1]
+        if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self.send_error(421)  # DNS rebinding: only answer requests addressed to this machine by name
+            return
         if self.path.split("?")[0] not in ("/", "/index.html"):
             self.send_error(404)
             return
@@ -215,10 +220,17 @@ agent {name}Dev claude . keep
 def init(folder: Path, name: str) -> list[str]:
     """Copy squad-up into <folder>/.squad and write a squad file if there is none. Never overwrites a squad file."""
     d = folder / ".squad"
+    if d.is_symlink():
+        raise ValueError(f"{d} is a symlink; refusing")
     d.mkdir(parents=True, exist_ok=True)
+    for f in ("squad-up", "squad", ".gitignore", ".squad-up.new"):
+        if (d / f).is_symlink():
+            raise ValueError(f"{d / f} is a symlink; refusing")
     done = []
-    shutil.copyfile(SCRIPT, d / "squad-up")
-    (d / "squad-up").chmod(0o755)
+    tmp = d / ".squad-up.new"  # replace, never rewrite in place: running windows' sh still reads the old file
+    shutil.copyfile(SCRIPT, tmp)
+    tmp.chmod(0o755)
+    tmp.replace(d / "squad-up")
     done.append(str(d / "squad-up"))
     if not (d / "squad").exists():
         (d / "squad").write_text(TEMPLATE.format(name=name))
@@ -255,7 +267,11 @@ def cmd(args) -> None:
         serve(args.bind, args.port)
     elif args.tsq == "init":
         folder = Path(args.folder).resolve()
-        for p in init(folder, args.name or re.sub(r"[^A-Za-z0-9]", "", folder.name) or "Squad"):
+        try:
+            made = init(folder, args.name or re.sub(r"[^A-Za-z0-9]", "", folder.name) or "Squad")
+        except ValueError as e:
+            raise SystemExit(f"tmux-squad init: {e}") from None
+        for p in made:
             print(p)
     elif args.tsq == "script":
         print(SCRIPT)

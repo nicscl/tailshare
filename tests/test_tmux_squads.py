@@ -15,17 +15,28 @@ from tailshare import tmux_squads as ts
 
 TMUX = shutil.which("tmux")
 
-# A stand-in for claude/codex. Its folder's `mode` file says what it shows: `idle` (an empty prompt), `ask`
-# (a permission question), `exit N`. Typed lines go to `typed`; argv to `argv`.
+# A stand-in for claude/codex. Its folder's `mode` file says what it shows: `idle` (an empty prompt with a dim
+# placeholder), `draft` (an undimmed line a person typed but did not send), `ask` (a permission question), `exit N`.
+# Typed lines go to `typed`; argv to `argv`. With a `rollout` file in its folder it behaves like Codex: it keeps
+# a session file open under $CODEX_HOME/sessions (`resume <id>` reopens that one) and logs "<pid> <id>" to rollouts.
 FAKE = r"""#!/bin/bash
 d=$PWD
 printf '%s\n' "$*" >> "$d/argv"
+if [ -f "$d/rollout" ]; then
+  if [ "${1:-}" = resume ]; then id=$2; else id=$(uuidgen | tr A-Z a-z); fi
+  mkdir -p "$CODEX_HOME/sessions/2026/11/12"
+  f="$CODEX_HOME/sessions/2026/11/12/rollout-2026-11-12T00-00-00-$id.jsonl"
+  [ -s "$f" ] || printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "$id" "$d" > "$f"
+  exec 9>>"$f"
+  echo "$$ $id" >> "$d/rollouts"
+fi
 while :; do
   mode=$(cat "$d/mode" 2>/dev/null || echo idle)
   case "$mode" in
     exit*) exit "${mode#exit }" ;;
     ask) printf '\033[2J\033[H Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n' ;;
-    *) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ >      │\n╰────────╯\n  ? for shortcuts\n' ;;
+    draft) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240git push --force │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
+    *) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240\033[2mTry "x"\033[0m │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
   esac
   if IFS= read -r -t 1 line; then
     printf '%s|%s\n' "$mode" "$line" >> "$d/typed"
@@ -131,7 +142,7 @@ class SquadUp(unittest.TestCase):
 
     def test_stop_at_the_idle_prompt_types_exit_and_the_window_stays(self):
         self.up()
-        self.wait(lambda: "> " in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
+        self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
         self.assertIn("asked to exit", self.up("stop", "One"))
         self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped")
         self.assertEqual((self.proj / "one" / "typed").read_text(), "idle|/exit\n")
@@ -166,6 +177,66 @@ class SquadUp(unittest.TestCase):
         self.assertEqual(self.member("One")["state"], "running")
         self.assertFalse((self.proj / "one" / "typed").exists())
 
+    def test_stop_never_types_over_a_draft(self):
+        self.mode("one", "draft")
+        self.up()
+        self.wait(lambda: "git push" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the draft")
+        self.assertIn("stops when it finishes", self.up("stop", "One"))
+        time.sleep(4)
+        self.assertFalse((self.proj / "one" / "typed").exists())
+        self.mode("one", "idle")  # the person sent or cleared it: now the stop goes through
+        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once the prompt is empty", secs=20)
+
+    def test_stop_never_types_while_someone_is_attached_and_active(self):
+        self.up()
+        self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
+        client = subprocess.Popen([*self.tmux, "-C", "attach", "-t", "=squad-test"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
+        try:
+            self.wait(lambda: subprocess.run([*self.tmux, "list-clients"], capture_output=True, text=True, check=False).stdout,
+                      "a client")
+            self.assertIn("stops when it finishes", self.up("stop", "One"))
+            time.sleep(4)
+            self.assertFalse((self.proj / "one" / "typed").exists())
+        finally:
+            client.stdin.close()
+            client.wait(timeout=10)
+
+    def test_two_quick_ups_make_one_window_per_agent(self):
+        ps = [subprocess.Popen(["sh", str(ts.SCRIPT), "-C", str(self.proj), "up"], env=self.env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(3)]
+        for p in ps:
+            self.assertEqual(p.wait(timeout=30), 0, p.stderr.read())
+        self.up("up", "One", "One")
+        self.wait(lambda: sorted(w["agent"] for w in self.windows()) == ["One", "Two"], "both agents")
+        names = subprocess.run([*self.tmux, "list-windows", "-a", "-F", "#{window_name}"], capture_output=True,
+                               text=True, check=True).stdout.split()
+        self.assertEqual(sorted(names), ["one", "two"])
+
+    def test_codex_agents_sharing_a_folder_keep_their_own_ids(self):
+        (self.proj / ".squad" / "squad").write_text("squad Test\nagent A codex two\nagent B codex two\n")
+        (self.proj / "two" / "rollout").write_text("")
+        self.up()
+        state = self.proj / ".squad" / "state"
+        self.wait(lambda: all((state / f"{n}.id").exists() and (state / f"{n}.id").read_text().strip()
+                              for n in "AB"), "both ids", secs=20)
+        a, b = ((state / f"{n}.id").read_text().strip() for n in "AB")
+        opened = {ln.split()[1] for ln in (self.proj / "two" / "rollouts").read_text().splitlines()}
+        self.assertNotEqual(a, b)
+        self.assertEqual({a, b}, opened)
+        self.assertEqual({self.member("A")["resume"], self.member("B")["resume"]}, {a, b})
+
+    def test_env_that_picks_programs_is_refused_and_args_are_not_globbed(self):
+        (self.proj / ".squad" / "squad").write_text("squad Test\nenv DYLD_INSERT_LIBRARIES=/x\nagent One claude one\n")
+        self.up("up", "One")
+        self.wait(lambda: self.windows() and self.windows()[0]["pane_dead"] == "1", "the runner refuses")
+        self.assertFalse((self.proj / "one" / "argv").exists())
+        (self.proj / ".squad" / "squad").write_text("squad Test\nagent One claude one --x *\n")
+        (self.proj / "one" / "zz-a-file").write_text("")
+        self.up("start", "One")
+        self.wait(lambda: (self.proj / "one" / "argv").exists(), "a start")
+        self.assertEqual((self.proj / "one" / "argv").read_text().split()[2:], ["--x", "*"])
+
     def test_a_restored_look_alike_is_renamed_never_killed(self):
         subprocess.run([*self.tmux, "new-session", "-d", "-s", "squad-test", "-n", "one", "sleep 60"], check=True,
                        env=self.env)
@@ -181,6 +252,7 @@ class SquadUp(unittest.TestCase):
         subprocess.run([*self.tmux, "set-option", "-wq", "-t", "work", "@agent", "Fake"], check=True)
         self.up("up", "One")
         self.wait(lambda: [w["agent"] for w in self.windows()] == ["One"], "only One")
+        self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
         snap = ts.snapshot(self.tmux)
         self.assertEqual([(s["name"], s["dir"]) for s in snap], [("Test", str(self.proj.resolve()))])
         page = ts.render(snap)
@@ -192,6 +264,12 @@ class Reader(unittest.TestCase):
     def test_last_line_skips_borders_prompt_and_footer(self):
         lines = ["● Wrote 3 files", "", "╭───╮", "│ > │", "╰───╯", "  ? for shortcuts", ""]
         self.assertEqual(ts.last_line(lines), "● Wrote 3 files")
+        claude = ["● Fixed it.", "◐ medium · /effort", "────", "❯\u00a0Try \"create a util\"", "────",
+                  "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"]
+        self.assertEqual(ts.last_line(claude), "● Fixed it.")
+        codex = ["• Ran the tests.", "› Ask Codex to do anything", "  GPT-6 medium · ~/Projects/x",
+                 "  ← for agents · ? for shortcuts"]
+        self.assertEqual(ts.last_line(codex), "• Ran the tests.")
         self.assertEqual(ts.last_line([]), "")
 
     def test_state_names(self):
@@ -220,6 +298,30 @@ class Reader(unittest.TestCase):
             ts.init(Path(d), "Other")
             self.assertEqual((Path(d) / ".squad" / "squad").read_text(), "squad Mine\n")
             self.assertTrue(os.access(Path(d) / ".squad" / "squad-up", os.X_OK))
+
+    def test_init_refuses_symlinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / ".squad").mkdir()
+            target = Path(d) / "elsewhere"
+            target.write_text("keep me\n")
+            (Path(d) / ".squad" / "squad-up").symlink_to(target)
+            with self.assertRaises(ValueError):
+                ts.init(Path(d), "X")
+            self.assertEqual(target.read_text(), "keep me\n")
+
+    def test_page_answers_only_its_own_host(self):
+        import http.client
+        import threading
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), ts._Page)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            c.request("GET", "/", headers={"Host": "evil.example:80"})
+            self.assertEqual(c.getresponse().status, 421)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_the_script_never_kills(self):
         text = ts.SCRIPT.read_text()

@@ -24,12 +24,18 @@ agent Reviewer     codex  .       once
 - `agent <Name> <claude|codex> <folder> [keep|once] [args...]`.
 - `keep` (the default) restarts the agent when it exits. `once` runs it a single time.
 - Folders are relative to the project.
-- Extra args are split on spaces, with no quoting.
+- Extra args and env values are split on spaces, with no quoting and no globbing. They cannot hold spaces.
+- Agent names are unique; a repeated name uses the first line.
+
+**The squad file is code.** It decides which program runs, with which flags (skip-permissions included) and
+environment. Review a change to it like a change to a Makefile. `env` lines may not set PATH, DYLD_*, LD_*,
+NODE_OPTIONS, NODE_PATH, BASH_ENV, ENV, PYTHONPATH or PYTHONSTARTUP: the runner refuses to start.
 - Claude instructions go in `.squad/<Name>.md` and are passed with `--append-system-prompt`. For Codex, use the
   folder's AGENTS.md.
 
 `tailshare tmux-squad init [folder]` copies `squad-up` into `.squad/` and writes a starter squad file if there is
-none. It never overwrites a squad file. Without tailshare, copy `tailshare/squad-up` there by hand.
+none. It never overwrites a squad file. It replaces the script atomically, so running windows keep reading the
+old copy, and it refuses when any of `.squad`, `squad-up`, `squad` or `.gitignore` is a symlink. Without tailshare, copy `tailshare/squad-up` there by hand.
 
 ## Commands
 
@@ -40,7 +46,8 @@ none. It never overwrites a squad file. Without tailshare, copy `tailshare/squad
 .squad/squad-up start Name      # auto-restart on; runs a stopped or failed agent again, in its window
 ```
 
-`up` is safe to run again:
+`up` is safe to run again, and two at once are safe: a lock in `.squad/state` lets one change the squad at a
+time, and a window `up` just created counts as its agent before its runner has started.
 - A missing session is created.
 - A missing agent gets a window.
 - An agent whose pane has ended is respawned.
@@ -68,7 +75,9 @@ in `.squad/state/<Name>.id` (git-ignored), because tmux options do not survive t
 Each agent window runs `squad-up run <Name>`, which works like this:
 - It starts the agent, and resumes its own session when there is one.
   - Claude gets a fixed `--session-id` the first time and `--resume <id>` afterwards.
-  - For Codex, the id is read from its newest session file for that folder after each run.
+  - For Codex, the id is the session file that this run's own Codex process holds open (`lsof`, or /proc on
+    Linux). If none was seen, it falls back to the oldest session file for that folder created during the run
+    that no other agent in the squad already claims. Two Codex agents in one folder keep their own sessions.
 - When the agent exits and `@keep` is on, it waits and starts it again. The waits are 10 s, 20 s, 40 s and so on,
   at most 10 min.
 - A run of at least 5 min resets the count.
@@ -84,9 +93,16 @@ Each agent window runs `squad-up run <Name>`, which works like this:
   types the exit as soon as the agent is idle.
 - **`start` before then:** the pending stop is cancelled.
 
-Idle means the screen shows the agent's empty prompt and none of: "esc to interrupt/cancel", "Do you want",
-"Would you like", `(y/n)`, "Press enter", or a numbered choice. That is a screen heuristic. If a person is typing
-in the window when it fires, `/exit` is appended to their text.
+Idle means all of:
+- the screen shows none of: "esc to interrupt/cancel", "Do you want", "Would you like", `(y/n)`, "Press enter",
+  or a numbered choice;
+- the prompt line is empty. Claude and Codex show a dim placeholder in an empty prompt, so the line is read with
+  its colours (`capture-pane -e`): dim text counts as empty, normal text is a draft and blocks the stop;
+- no client attached to the squad session did anything in the last 60 s (`client_activity`,
+  SQUAD_QUIET_SECS).
+
+Right before typing, the waiter reads `@keep` and its own `@stop_waiter` again, so a `start` in between wins.
+This is still a screen heuristic, so it waits rather than guesses: when in doubt the agent keeps running.
 
 ## tmux-resurrect
 
@@ -103,6 +119,8 @@ resumes from `.squad/state`. Nothing in `~/.tmux.conf` is changed.
 - a **Needs you** list: failed, exited without restarting, or asking something.
 
 It reads tmux only (`list-windows`, `capture-pane -p`). It runs no scripts and loads nothing from elsewhere.
+It answers only requests whose Host is `127.0.0.1:<port>` or `localhost:<port>` (421 otherwise), so a web page
+cannot read it through DNS rebinding.
 
 ## Not in this step
 

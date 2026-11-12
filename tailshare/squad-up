@@ -8,10 +8,11 @@
 #
 # The squad is described by <dir>/.squad/squad (see docs/tmux-squads.md). Session `squad-<name>` on the default
 # tmux server, one window per agent; who is who lives in tmux user options (@agent, @harness, @keep, @state...).
+# The squad file is code: it decides what runs, with which flags and environment. Trust it like a Makefile.
 #
 # Hard rule: this script never kills anything. No kill-server/-session/-window/-pane, no respawn-pane -k
 # (respawn-pane without -k is refused by tmux on a live pane). Stopping an agent means typing /exit into it,
-# and only when it sits idle at its prompt.
+# and only when it sits idle at its own empty prompt with nobody typing.
 set -u
 
 T=${SQUAD_TMUX:-tmux}
@@ -20,6 +21,9 @@ HEALTHY=${SQUAD_HEALTHY_SECS:-300}   # a run this long resets the retry count
 BACKOFF=${SQUAD_BACKOFF_SECS:-10}    # first wait; doubles per failed try, at most BACKOFF_MAX
 BACKOFF_MAX=${SQUAD_BACKOFF_MAX:-600}
 STOP_WAIT=${SQUAD_STOP_WAIT:-21600}  # how long a pending stop waits for the agent to go idle
+QUIET=${SQUAD_QUIET_SECS:-60}        # a client active this recently on the squad session may be typing
+E=$(printf '\033')
+NB=$(printf '\302\240')  # Claude puts a no-break space after its ❯ prompt
 
 die() { printf 'squad-up: %s\n' "$*" >&2; exit 1; }
 t() { $T "$@"; }  # $T unquoted on purpose: SQUAD_TMUX may be "tmux -S /path"
@@ -51,13 +55,13 @@ SQUAD_NAME=$(awk '$1 == "squad" { print $2; exit }' "$FILE")
 [ -n "$SQUAD_NAME" ] || die "$FILE has no 'squad <name>' line"
 S=squad-$(slug "$SQUAD_NAME")
 
-agents() { awk '$1 == "agent" { print $2 }' "$FILE"; }
+agents() { awk '$1 == "agent" && !seen[$2]++ { print $2 }' "$FILE"; }
 
 # load <name>: A_HARNESS A_DIR (absolute) A_KEEP (on|off) A_ARGS for one agent line
 load() {
+    case "$1" in ""|*[!A-Za-z0-9._-]*) die "agent names use letters, digits, . _ - only: $1" ;; esac
     line=$(awk -v n="$1" '$1 == "agent" && $2 == n { $1 = ""; $2 = ""; print; exit }' "$FILE")
     [ -n "$line" ] || die "no agent $1 in $FILE"
-    case "$1" in *[!A-Za-z0-9._-]*) die "agent names use letters, digits, . _ - only: $1" ;; esac
     set -f
     # shellcheck disable=SC2086
     set -- $line
@@ -73,34 +77,79 @@ load() {
     case "$A_DIR" in *"'"*) die "folder paths may not contain a single quote" ;; esac
 }
 
-# `env KEY=VALUE` lines apply to every agent
+# `env KEY=VALUE` lines apply to every agent. Variables that choose which program or library runs are refused.
 export_env() {
+    set -f
     for kv in $(awk '$1 == "env" { print $2 }' "$FILE"); do
-        case "$kv" in [A-Za-z_]*=*) export "${kv?}" ;; *) die "bad env line: $kv" ;; esac
+        case "$kv" in
+        PATH=*|DYLD_*|LD_*|NODE_OPTIONS=*|NODE_PATH=*|BASH_ENV=*|ENV=*|PYTHONPATH=*|PYTHONSTARTUP=*)
+            set +f; die "env ${kv%%=*} is not allowed in a squad file" ;;
+        [A-Za-z_]*=*) export "${kv?}" ;;
+        *) set +f; die "bad env line: $kv" ;;
+        esac
     done
+    set +f
 }
 
 # --------------------------------------------------------------------------- tmux
 
 has_session() { t has-session -t "=$S" 2>/dev/null; }
 
-# window <name>: the id of the window in the squad session whose @agent is <name>
+# window <name>: the agent's window in the squad session: the one whose @agent is <name>, or one squad-up just
+# created for it and whose run loop has not set @agent yet
 window() {
     has_session || return 0
-    t list-windows -t "=$S" -F '#{window_id}|#{@agent}' 2>/dev/null | awk -F'|' -v n="$1" '$2 == n { print $1; exit }'
+    t list-windows -t "=$S" -F '#{window_id}|#{@agent}|#{pane_start_command}' 2>/dev/null |
+        awk -F'|' -v n="$1" -v r="run '$1'" '$2 == n || ($2 == "" && index($0, "squad-up") && index($0, r)) { print $1; exit }'
 }
 
 wopt() { t show-options -wqv -t "$1" "$2" 2>/dev/null; }
 wset() { t set-option -wq -t "$1" "$2" "$3"; }
 fmt() { t display-message -p -t "$1" "$2" 2>/dev/null; }
 
-# idle <window>: 0 when the agent sits at its own empty prompt: not working, not asking anything
+# typing <window>: 0 when a client on the squad session did something in the last $QUIET seconds
+typing() {
+    now=$(date +%s)
+    for a in $(t list-clients -t "=$S" -F '#{client_activity}' 2>/dev/null); do
+        [ $((now - a)) -ge "$QUIET" ] || return 0
+    done
+    return 1
+}
+
+# empty_prompt <window>: 0 when the agent's input line holds nothing a person typed. Claude and Codex show a
+# dim placeholder in an empty prompt, so the line is read with its colours (capture-pane -e).
+empty_prompt() {
+    plain=$(t capture-pane -p -t "$1" 2>/dev/null)
+    n=$(printf '%s\n' "$plain" | grep -nE "^[[:space:]│]*(>|❯|›)( |$NB|\$)" | tail -n 1 | cut -d: -f1)
+    [ -n "$n" ] || return 1
+    line=$(t capture-pane -e -p -t "$1" 2>/dev/null | sed -n "${n}p")
+    case "$line" in *❯*) rest=${line#*❯} ;; *›*) rest=${line#*›} ;; *) rest=${line#*>} ;; esac
+    printf '%s\n' "$rest" | LC_ALL=C awk -v E="$E" '{
+        s = $0; dim = 0
+        while (length(s)) {
+            if (substr(s, 1, 1) == " ") { s = substr(s, 2); continue }
+            if (substr(s, 1, 2) == "\302\240") { s = substr(s, 3); continue }
+            if (substr(s, 1, 2) == E "[" && match(s, /^\033\[[0-9;]*m/)) {
+                code = substr(s, 3, RLENGTH - 3)
+                if (code ~ /(^|;)(2|90)(;|$)/ || code ~ /(^|;)38;5;(8|23[2-9]|24[0-9])(;|$)/) dim = 1
+                else if (code ~ /^(0|22|39)?$/) dim = 0
+                s = substr(s, RLENGTH + 1); continue
+            }
+            break
+        }
+        gsub(/\033\[[0-9;]*m/, "", s); sub(/[ ]*(\342\224\202)?[ ]*$/, "", s)
+        exit (s == "" || dim) ? 0 : 1
+    }'
+}
+
+# idle <window>: 0 when the agent sits at its own empty prompt: not working, not asking, nobody typing
 idle() {
     [ "$(fmt "$1" '#{pane_dead}')" = 0 ] || return 1
     [ "$(wopt "$1" @state)" = running ] || return 1
+    typing "$1" && return 1
     screen=$(t capture-pane -p -t "$1" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15)
-    printf '%s\n' "$screen" | grep -qiE 'esc to (interrupt|cancel)|do you want|would you like|\(y/n\)|\[y/n\]|press enter|(^|[[:space:]│])(❯|›|>) *[0-9]+\.' && return 1
-    printf '%s\n' "$screen" | grep -qE '^[[:space:]│╭╰─]*(>|❯|›)( |$)'
+    printf '%s\n' "$screen" | grep -qiE 'esc to (interrupt|cancel)|do you want|would you like|\(y/n\)|\[y/n\]|press enter|(^|[[:space:]│])(❯|›|>)( |'"$NB"')*[0-9]+\.' && return 1
+    empty_prompt "$1"
 }
 
 say_exit() {  # type the harness's own quit command; never a signal
@@ -108,17 +157,37 @@ say_exit() {  # type the harness's own quit command; never a signal
     t send-keys -t "$1" -l "$cmd" && sleep 0.3 && t send-keys -t "$1" Enter
 }
 
+# one `up` at a time per squad, so two quick ones cannot both create the same agent
+lock() {
+    mkdir -p "$STATE"
+    L=$STATE/.up.lock
+    n=0
+    until mkdir "$L" 2>/dev/null; do
+        p=$(cat "$L/pid" 2>/dev/null || true)
+        if [ -n "$p" ] && ! ps -p "$p" >/dev/null 2>&1; then rm -rf "$L"; continue; fi
+        n=$((n + 1))
+        [ "$n" -lt 150 ] || die "another squad-up is changing this squad ($L)"
+        sleep 0.1
+    done
+    echo $$ >"$L/pid"
+    trap 'rm -rf "$L"' EXIT
+}
+
 # --------------------------------------------------------------------------- commands
 
 cmd_up() {
+    [ -n "${L:-}" ] || lock
     [ $# -gt 0 ] || set -- $(agents)
+    seen=" "
     for name in "$@"; do
+        case "$seen" in *" $name "*) continue ;; esac
+        seen="$seen$name "
         load "$name"
         w=$(window "$name")
         if [ -z "$w" ]; then
             if has_session; then  # a window that only looks like this agent (e.g. restored by tmux-resurrect)
-                for lw in $(t list-windows -t "=$S" -F '#{window_id}|#{window_name}|#{@agent}' |
-                    awk -F'|' -v n="$(slug "$name")" '$2 == n && $3 == "" { print $1 }'); do
+                for lw in $(t list-windows -t "=$S" -F '#{window_id}|#{window_name}|#{@agent}|#{pane_start_command}' |
+                    awk -F'|' -v n="$(slug "$name")" '$2 == n && $3 == "" && !(index($0, "squad-up") && index($0, " run ")) { print $1 }'); do
                     t rename-window -t "$lw" "$(slug "$name")~restored"
                     echo "$name: renamed a look-alike window to $(slug "$name")~restored (left running)"
                 done
@@ -132,6 +201,10 @@ cmd_up() {
                 t set-option -q -t "$S" @squad_dir "$SQUAD_DIR"
             fi
             wset "$w" remain-on-exit on
+            wset "$w" @agent "$name"
+            wset "$w" @harness "$A_HARNESS"
+            wset "$w" @cwd "$A_DIR"
+            wset "$w" @keep "$A_KEEP"
             echo "$name: started in $S"
         elif [ "$(fmt "$w" '#{pane_dead}')" = 1 ]; then
             wset "$w" @keep "$A_KEEP"
@@ -167,7 +240,7 @@ cmd_stop() {
         wset "$w" @stopping 1
         sock=$(t display-message -p '#{socket_path}')
         t run-shell -b "SQUAD_TMUX='tmux -S $sock' exec sh '$self' -C '$SQUAD_DIR' stop-wait '$1'"
-        echo "$1: busy or asking something; stops when it finishes"
+        echo "$1: busy, asking something or being typed in; stops when it finishes"
     fi
 }
 
@@ -177,10 +250,12 @@ cmd_stop_wait() {  # in the background: type the exit once the agent is idle, un
     wset "$w" @stop_waiter "$$"
     waited=0
     while [ "$waited" -lt "$STOP_WAIT" ]; do
-        [ "$(wopt "$w" @stop_waiter)" = "$$" ] || return 0  # a newer stop took over
+        [ "$(wopt "$w" @stop_waiter)" = "$$" ] || return 0  # a newer stop took over, or start cancelled it
         [ "$(wopt "$w" @keep)" = off ] || { wset "$w" @stopping ""; return 0; }
         [ "$(fmt "$w" '#{pane_dead}')" = 0 ] && [ "$(wopt "$w" @state)" = running ] || return 0
         if idle "$w"; then
+            # read again right before typing: a start in between wins
+            [ "$(wopt "$w" @stop_waiter)" = "$$" ] && [ "$(wopt "$w" @keep)" = off ] || return 0
             say_exit "$w"
             return 0
         fi
@@ -191,6 +266,7 @@ cmd_stop_wait() {  # in the background: type the exit once the agent is idle, un
 
 cmd_start() {
     [ $# -eq 1 ] || die "start <agent>"
+    lock
     w=$(window "$1")
     if [ -z "$w" ]; then
         cmd_up "$1"
@@ -212,11 +288,54 @@ new_uuid() {
     fi
 }
 
-codex_id() {  # the id of the newest Codex session file for <folder> written since <marker>
-    find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -newer "$2" 2>/dev/null |
+UUID_RE='[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}'
+rollout_id() { sed -n "s/.*-\($UUID_RE\)\.jsonl\$/\1/p"; }
+
+tree() {  # <pid> and its descendants, comma-separated
+    ps -axo pid=,ppid= 2>/dev/null | awk -v root="$1" '
+        { kids[$2] = kids[$2] " " $1 }
+        END { out = root; q = root
+              while (q != "") { split(q, a, " "); q = ""
+                  for (i in a) { n = split(kids[a[i]], k, " "); for (j = 1; j <= n; j++) { out = out "," k[j]; q = q " " k[j] } } }
+              print out }'
+}
+
+open_rollout() {  # the Codex session file <pid> (or a child) holds open
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -p "$(tree "$1")" -Fn 2>/dev/null | sed -n 's/^n//p'
+    else
+        for p in $(tree "$1" | tr ',' ' '); do
+            for fd in /proc/"$p"/fd/*; do readlink "$fd"; done
+        done 2>/dev/null
+    fi | grep '/rollout-.*\.jsonl$' | tail -n 1
+}
+
+track_codex() {  # background, during one Codex run: record the id of the session file this run has open
+    n=0
+    while [ ! -s "$1" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+    p=$(cat "$1" 2>/dev/null || true)
+    [ -n "$p" ] || return 0
+    while ps -p "$p" >/dev/null 2>&1; do
+        id=$(open_rollout "$p" | rollout_id)
+        if [ -n "$id" ] && [ "$id" != "$(cat "$2" 2>/dev/null || true)" ]; then
+            printf '%s\n' "$id" >"$2"
+            wset "$W" @resume "$id"
+        fi
+        sleep 2
+    done
+}
+
+codex_fallback_id() {  # after a run with no id seen: the oldest new session file for <folder> no other agent claims
+    claimed=$(cat "$STATE"/*.id 2>/dev/null || true)
+    find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -newer "$2" 2>/dev/null | sort |
         while read -r f; do
-            head -n 1 "$f" | grep -qF "\"cwd\":\"$1\"" && printf '%s\n' "$f"
-        done | xargs ls -t 2>/dev/null | head -n 1 | sed 's/.*-\([0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}\)\.jsonl$/\1/'
+            head -n 1 "$f" | grep -qF "\"cwd\":\"$1\"" || continue
+            id=$(printf '%s\n' "$f" | rollout_id)
+            [ -n "$id" ] || continue
+            printf '%s\n' "$claimed" | grep -qxF "$id" && continue
+            printf '%s\n' "$id"
+            break
+        done
 }
 
 harness() {  # run the agent once, resuming its own session when there is one
@@ -234,24 +353,32 @@ harness() {  # run the agent once, resuming its own session when there is one
             set -- --session-id "$id"
         fi
         [ -f "$SQUAD_DIR/.squad/$NAME.md" ] && set -- "$@" --append-system-prompt "$(cat "$SQUAD_DIR/.squad/$NAME.md")"
+        set -f
         # shellcheck disable=SC2086
-        "$bin" "$@" $A_ARGS
+        set -- "$@" $A_ARGS
+        set +f
+        "$bin" "$@"
         ;;
     codex)
         bin=${SQUAD_CODEX:-codex}
         marker=$STATE/.$NAME.started
+        pidf=$STATE/.$NAME.pid
         : >"$marker"
-        if [ -n "$id" ]; then
-            wset "$W" @resume "$id"
-            # shellcheck disable=SC2086
-            "$bin" resume "$id" $A_ARGS
-        else
-            # shellcheck disable=SC2086
-            "$bin" $A_ARGS
-        fi
+        rm -f "$pidf"
+        [ -n "$id" ] && set -- resume "$id" || set --
+        [ -n "$id" ] && wset "$W" @resume "$id"
+        set -f
+        # shellcheck disable=SC2086
+        set -- "$@" $A_ARGS
+        set +f
+        track_codex "$pidf" "$idf" &
+        sh -c 'echo $$ >"$1"; shift; exec "$@"' sh "$pidf" "$bin" "$@"
         rc=$?
-        new=$(codex_id "$A_DIR" "$marker")
-        [ -n "$new" ] && printf '%s\n' "$new" >"$idf" && wset "$W" @resume "$new"
+        wait
+        if [ -z "$(cat "$idf" 2>/dev/null || true)" ]; then
+            new=$(codex_fallback_id "$A_DIR" "$marker")
+            [ -n "$new" ] && printf '%s\n' "$new" >"$idf" && wset "$W" @resume "$new"
+        fi
         return $rc
         ;;
     esac
@@ -319,6 +446,6 @@ stop) shift; cmd_stop "$@" ;;
 start) shift; cmd_start "$@" ;;
 stop-wait) shift; cmd_stop_wait "$@" ;;
 run) shift; cmd_run "$@" ;;
--h|--help|help) sed -n '2,15p' "$self" | sed 's/^# \{0,1\}//' ;;
+-h|--help|help) sed -n '2,16p' "$self" | sed 's/^# \{0,1\}//' ;;
 *) die "unknown command $1 (up, status, stop, start)" ;;
 esac
