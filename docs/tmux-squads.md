@@ -5,6 +5,11 @@ with tmux can create one, attach to it and read it, with or without tailshare. t
 is no database and no reconciler. This sits next to the older `tailshare start`/keep path and replaces nothing
 yet.
 
+`up`, `start`, `stop` and `status` always use the default server, even when run from a pane of another tmux
+server: they drop an inherited `$TMUX`, which would otherwise build a second squad on that server with a duplicate
+agent on the same session id. `SQUAD_TMUX` picks another server on purpose. Only the runner inside an agent's
+window trusts `$TMUX`.
+
 **The tooling never kills anything.** It never runs kill-server, kill-session, kill-window or kill-pane, and never
 `respawn-pane -k`. tmux refuses `respawn-pane` without `-k` on a live pane. To stop an agent, it types the agent's
 own `/exit` into the window, and only while the agent sits idle at its prompt.
@@ -93,14 +98,22 @@ Each agent window runs `squad-up run <Name>`, which works like this:
   types the exit as soon as the agent is idle.
 - **`start` before then:** the pending stop is cancelled.
 
-Idle means all of:
+Idle means all of, and anything else counts as busy. It fails closed: a screen it does not recognise means
+"did not stop yet", never "typed into something".
 - the screen shows none of: "esc to interrupt/cancel", "Enter to confirm", "Do you want", "Would you like",
-  `(y/n)`, "Press enter", a numbered choice, or a footer naming background work (`· 1 shell`, "to manage").
-  Claude answers `/exit` with a menu while one of its background shells runs, so the stop waits for it;
-- the input box is empty, from the prompt line down to the box's lower border. Claude and Codex show a dim
-  placeholder in an empty prompt, so the box is read with its colours (`capture-pane -e`): dim text, borders
-  and known footers count as empty; normal text on any line is a draft and blocks the stop (a draft may start
-  with an empty line);
+  `(y/n)`, "Press enter", a numbered choice, or a footer naming background work (`· 1 shell`, "to manage");
+- from the prompt line down, the screen matches a known idle shape (an allowlist). The prompt line holds nothing,
+  or only dim text (Claude and Codex's placeholder; read with colours, `capture-pane -e`). Every line below it is
+  empty, a box border, or one of these footers:
+  - Claude: `⏵⏵ <mode> (shift+tab to cycle)` with an optional `· PR #N` and `· ← N agents`; `← for agents · ? for
+    shortcuts`; `? for shortcuts`;
+  - Codex: `<model> [effort] · <folder>`; `NN% context left`.
+
+  A new footer, a menu or a draft (normal text on any line, also after an empty first line) blocks the stop until
+  the allowlist learns it;
+- when tailshare's hooks report the agent's state (`/bus/v1/agents` on 127.0.0.1, by its resume id), it is
+  `idle`. Hooks can only hold a stop back, never allow one: Claude's Stop hook says idle while a background shell
+  of its own still runs;
 - no client showing the agent's window, from any session (grouped, linked, a viewer's), did anything in the
   last 60 s (`client_activity`, SQUAD_QUIET_SECS).
 

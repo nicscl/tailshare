@@ -3,6 +3,7 @@ person's own tmux server)."""
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -69,6 +70,7 @@ class SquadUp(unittest.TestCase):
             "SQUAD_TMUX": " ".join(self.tmux), "SQUAD_CLAUDE": str(fake), "SQUAD_CODEX": str(fake),
             "CLAUDE_CONFIG_DIR": str(self.claude_home), "CODEX_HOME": str(self.tmp / "codex"),
             "SQUAD_BACKOFF_SECS": "1", "SQUAD_HEALTHY_SECS": "60", "SQUAD_MAX_TRIES": "3",
+            "TAILSHARE_BUS_PORT": "1",  # never the real bus: nothing listens there
         }
 
     def tearDown(self):
@@ -207,6 +209,40 @@ class SquadUp(unittest.TestCase):
         self.mode("one", "idle")
         self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once its shell ended", secs=20)
 
+    def test_stop_waits_while_the_hooks_say_the_agent_is_working(self):
+        import http.server
+        import threading
+        state = {"v": "working"}
+
+        class Bus(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                sid = (outer.proj / ".squad" / "state" / "One.id").read_text().strip()
+                body = json.dumps({"agents": [{"id": sid, "state": {"v": state["v"]}}]}).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        outer = self
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bus)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            self.env["TAILSHARE_BUS_PORT"] = str(srv.server_address[1])
+            self.up()
+            self.wait(lambda: (self.proj / ".squad" / "state" / "One.id").exists() and self.member("One")["resume"],
+                      "One's id")
+            self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
+            self.assertIn("stops when it finishes", self.up("stop", "One"))  # an idle screen, but the hooks say working
+            time.sleep(4)
+            self.assertFalse((self.proj / "one" / "typed").exists())
+            state["v"] = "idle"
+            self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once its hooks said idle", secs=20)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
     def test_stop_never_types_while_a_grouped_session_client_is_active(self):
         self.up()
         self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
@@ -279,6 +315,30 @@ class SquadUp(unittest.TestCase):
         self.up("start", "One")
         self.wait(lambda: (self.proj / "one" / "argv").exists(), "a start")
         self.assertEqual((self.proj / "one" / "argv").read_text().split()[2:], ["--x", "*"])
+
+    def test_up_from_inside_another_tmux_server_still_uses_the_default_server(self):
+        # TMUX_TMPDIR makes a private "default" server; TMUX points at another private server, as in a pane there
+        tdir = self.tmp / "tt"
+        tdir.mkdir()
+        default = [TMUX, "-S", str(tdir / f"tmux-{os.getuid()}" / "default")]
+        subprocess.run([*self.tmux, "new-session", "-d", "-s", "elsewhere", "sleep 60"], check=True, env=self.env)
+        pid = subprocess.run([*self.tmux, "display-message", "-p", "-t", "=elsewhere", "#{pid}"], capture_output=True,
+                             text=True, check=True).stdout.strip()
+        env = {k: v for k, v in self.env.items() if k != "SQUAD_TMUX"}
+        env.update(TMUX_TMPDIR=str(tdir), TMUX=f"{self.sock},{pid},0")
+        try:
+            p = subprocess.run(["sh", str(ts.SCRIPT), "-C", str(self.proj), "up", "One"], env=env, capture_output=True,
+                               text=True, timeout=30, check=False)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.wait(lambda: [w["agent"] for w in ts.discover(default)] == ["One"], "One on the default server")
+            others = subprocess.run([*self.tmux, "list-sessions", "-F", "#{session_name}"], capture_output=True,
+                                    text=True, check=True).stdout.split()
+            self.assertEqual(others, ["elsewhere"])
+            st = subprocess.run(["sh", str(ts.SCRIPT), "-C", str(self.proj), "status"], env=env, capture_output=True,
+                                text=True, timeout=30, check=False).stdout
+            self.assertIn("One", st)
+        finally:
+            subprocess.run([*default, "kill-server"], capture_output=True, check=False)  # our private one only
 
     def test_a_restored_look_alike_is_renamed_never_killed(self):
         subprocess.run([*self.tmux, "new-session", "-d", "-s", "squad-test", "-n", "one", "sleep 60"], check=True,

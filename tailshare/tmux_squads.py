@@ -44,7 +44,9 @@ def tmux_argv() -> list[str]:
 
 def _run(argv: list[str]) -> str:
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+        # the default server, even from inside another server's pane (an inherited $TMUX would pick that one)
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return p.stdout if p.returncode == 0 else ""
