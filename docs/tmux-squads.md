@@ -10,9 +10,10 @@ server: they drop an inherited `$TMUX`, which would otherwise build a second squ
 agent on the same session id. `SQUAD_TMUX` picks another server on purpose. Only the runner inside an agent's
 window trusts `$TMUX`.
 
-**The tooling never kills anything.** It never runs kill-server, kill-session, kill-window or kill-pane, and never
-`respawn-pane -k`. tmux refuses `respawn-pane` without `-k` on a live pane. To stop an agent, it types the agent's
-own `/exit` into the window, and only while the agent sits idle at its prompt.
+**The tooling never kills anything and never types into an agent.** It never runs kill-server, kill-session,
+kill-window or kill-pane, never `respawn-pane -k` (tmux refuses `respawn-pane` without `-k` on a live pane), and
+never `send-keys`. An agent ends only when a person types its `/exit` (`/quit` for Codex) in its window, from a
+terminal or from Hive.
 
 ## The squad file
 
@@ -47,7 +48,7 @@ old copy, and it refuses when any of `.squad`, `squad-up`, `squad` or `.gitignor
 ```sh
 .squad/squad-up up [Name...]    # create what is missing; start agents whose window has stopped
 .squad/squad-up status          # agents, state, tries, folder
-.squad/squad-up stop Name       # auto-restart off; asks the agent to exit once it is idle
+.squad/squad-up stop Name       # auto-restart off; the agent runs until someone types /exit
 .squad/squad-up start Name      # auto-restart on; runs a stopped or failed agent again, in its window
 ```
 
@@ -69,7 +70,6 @@ The script finds the squad by walking up from the current folder, or from `-C <f
 | `@harness`, `@cwd` | window | `claude`/`codex`, the agent's folder |
 | `@keep` | window | `on`/`off`: auto-restart |
 | `@state` | window | `running`, `waiting` (between tries), `failed` (retry limit), `stopped` |
-| `@stopping` | window | set while a stop waits for the agent to go idle |
 | `@tries`, `@last_exit`, `@resume` | window | retry count, last exit code, session id |
 
 Discovery is one `tmux list-windows -a` with those formats (`tailshare tmux-squad ls`). Resume ids are also kept
@@ -91,34 +91,14 @@ Each agent window runs `squad-up run <Name>`, which works like this:
 - `squad-up start` runs it again.
 - These limits can be changed with SQUAD_MAX_TRIES, SQUAD_BACKOFF_SECS, SQUAD_BACKOFF_MAX and SQUAD_HEALTHY_SECS.
 
-`stop` turns `@keep` off first. What happens next depends on what the agent is doing:
-- **Idle at its prompt:** `stop` types `/exit` (`/quit` for Codex), and the window ends as `stopped`.
-- **Working, or asking a question** (a permission prompt, `(y/n)`, a numbered choice): nothing is typed, because
-  it would land as an answer. Status shows **stops when it finishes**. A background `tmux run-shell -b` waiter
-  types the exit as soon as the agent is idle.
-- **`start` before then:** the pending stop is cancelled.
+`stop` only turns `@keep` off. It types nothing (Nicholas, 2026-11-12):
+- a running agent keeps running. Status shows **stops when it exits**. When someone types its `/exit` (in a
+  terminal or in Hive), the runner sees `@keep` off and ends; the pane stays as `stopped` with its last output;
+- an agent waiting between tries ends at once: the wait checks `@keep` every few seconds and does not restart;
+- `start` turns `@keep` on again. A running agent then restarts as usual when it exits; a dead pane runs again.
 
-Idle means all of, and anything else counts as busy. It fails closed: a screen it does not recognise means
-"did not stop yet", never "typed into something".
-- the screen shows none of: "esc to interrupt/cancel", "Enter to confirm", "Do you want", "Would you like",
-  `(y/n)`, "Press enter", a numbered choice, or a footer naming background work (`· 1 shell`, "to manage");
-- from the prompt line down, the screen matches a known idle shape (an allowlist). The prompt line holds nothing,
-  or only dim text (Claude and Codex's placeholder; read with colours, `capture-pane -e`). Every line below it is
-  empty, a box border, or one of these footers:
-  - Claude: `⏵⏵ <mode> (shift+tab to cycle)` with an optional `· PR #N` and `· ← N agents`; `← for agents · ? for
-    shortcuts`; `? for shortcuts`;
-  - Codex: `<model> [effort] · <folder>`; `NN% context left`.
-
-  A new footer, a menu or a draft (normal text on any line, also after an empty first line) blocks the stop until
-  the allowlist learns it;
-- when tailshare's hooks report the agent's state (`/bus/v1/agents` on 127.0.0.1, by its resume id), it is
-  `idle`. Hooks can only hold a stop back, never allow one: Claude's Stop hook says idle while a background shell
-  of its own still runs;
-- no client showing the agent's window, from any session (grouped, linked, a viewer's), did anything in the
-  last 60 s (`client_activity`, SQUAD_QUIET_SECS).
-
-Right before typing, the waiter reads `@keep` and its own `@stop_waiter` again, so a `start` in between wins.
-This is still a screen heuristic, so it waits rather than guesses: when in doubt the agent keeps running.
+Typing `/exit` for the person was tried and dropped: reading the screen to tell when an agent is idle missed a
+background shell (Claude answered with a menu) and needed constant updates as Claude and Codex change.
 
 ## tmux-resurrect
 

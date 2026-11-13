@@ -21,7 +21,7 @@ SCRIPT = Path(__file__).with_name("squad-up")
 SEP = "\x1f"
 FIELDS = (
     "session_name", "window_id", "window_name", "pane_id", "pane_dead", "pane_dead_status", "pane_current_command",
-    "@squad", "@squad_dir", "@agent", "@harness", "@cwd", "@keep", "@state", "@stopping", "@tries", "@last_exit",
+    "@squad", "@squad_dir", "@agent", "@harness", "@cwd", "@keep", "@state", "@tries", "@last_exit",
     "@resume",
 )
 FORMAT = SEP.join("#{" + f + "}" for f in FIELDS)
@@ -57,7 +57,7 @@ def state(w: dict) -> str:
     st = w.get("@state", "")
     if w.get("pane_dead") == "1":
         return st if st in ("failed", "stopped") else "exited"
-    if st == "running" and w.get("@keep") == "off" and w.get("@stopping"):
+    if st == "running" and w.get("@keep") == "off":  # stop turned the restart off; it ends when someone types /exit
         return "stopping"
     return st or "running"
 

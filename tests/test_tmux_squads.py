@@ -3,7 +3,6 @@ person's own tmux server)."""
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -17,7 +16,7 @@ from tailshare import tmux_squads as ts
 TMUX = shutil.which("tmux")
 
 # A stand-in for claude/codex. Its folder's `mode` file says what it shows: `idle` (an empty prompt with a dim
-# placeholder), `draft` (an undimmed line a person typed but did not send), `ask` (a permission question), `exit N`.
+# placeholder), `ask` (a permission question), `exit N`.
 # Typed lines go to `typed`; argv to `argv`. With a `rollout` file in its folder it behaves like Codex: it keeps
 # a session file open under $CODEX_HOME/sessions (`resume <id>` reopens that one) and logs "<pid> <id>" to rollouts.
 FAKE = r"""#!/bin/bash
@@ -36,9 +35,6 @@ while :; do
   case "$mode" in
     exit*) exit "${mode#exit }" ;;
     ask) printf '\033[2J\033[H Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n' ;;
-    bgshell) printf '\033[2J\033[H● Ran 1 shell command\n● Started it in the background.\n────────\n❯\302\240\n────────\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n' ;;
-    draft2) printf '\033[2J\033[H● Done: all tests pass.\n────────\n❯\302\240\n  git push --force\n────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
-    draft) printf '\033[2J\033[H● Done: all tests pass.\n╭────────╮\n│ ❯\302\240git push --force │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
     *) printf '\033[2J\033[H● Ran 1 shell command\n● Done: all tests pass.\n╭────────╮\n│ ❯\302\240\033[2mTry "x"\033[0m │\n╰────────╯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n' ;;
   esac
   if IFS= read -r -t 1 line; then
@@ -70,7 +66,6 @@ class SquadUp(unittest.TestCase):
             "SQUAD_TMUX": " ".join(self.tmux), "SQUAD_CLAUDE": str(fake), "SQUAD_CODEX": str(fake),
             "CLAUDE_CONFIG_DIR": str(self.claude_home), "CODEX_HOME": str(self.tmp / "codex"),
             "SQUAD_BACKOFF_SECS": "1", "SQUAD_HEALTHY_SECS": "60", "SQUAD_MAX_TRIES": "3",
-            "TAILSHARE_BUS_PORT": "1",  # never the real bus: nothing listens there
         }
 
     def tearDown(self):
@@ -144,142 +139,49 @@ class SquadUp(unittest.TestCase):
         self.wait(lambda: self.member("One")["state"] == "running", "One runs again")
         self.assertEqual(self.member("One")["window_id"], one["window_id"])
 
-    def test_stop_at_the_idle_prompt_types_exit_and_the_window_stays(self):
+    def test_stop_types_nothing_and_the_agent_runs_until_it_exits(self):
         self.up()
         self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
-        self.assertIn("asked to exit", self.up("stop", "One"))
-        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped")
-        self.assertEqual((self.proj / "one" / "typed").read_text(), "idle|/exit\n")
-        self.assertEqual(self.member("Two")["state"], "running")
-        self.assertIn("stopped", self.up("status"))
-        self.up("start", "One")
-        self.wait(lambda: self.member("One")["state"] == "running", "One runs again")
-
-    def test_stop_while_it_asks_types_nothing_until_it_is_idle(self):
-        self.mode("one", "ask")
-        self.up()
-        self.wait(lambda: "Do you want" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the ask")
-        self.assertEqual(ts.attention(self.member("One"), ts.screen(self.member("One")["pane_id"], self.tmux)),
-                         "is asking something")
-        self.assertIn("stops when it finishes", self.up("stop", "One"))
+        self.assertIn("stops when it exits", self.up("stop", "One"))
         self.assertEqual(self.member("One")["state"], "stopping")
-        self.assertIn("stops when it finishes", self.up("status"))
-        time.sleep(4)
-        self.assertFalse((self.proj / "one" / "typed").exists())  # nothing landed as an answer
+        self.assertIn("stops when it exits", self.up("status"))
+        time.sleep(3)
+        self.assertFalse((self.proj / "one" / "typed").exists())  # nothing typed, ever
+        self.assertEqual(self.member("One")["pane_dead"], "0")
+        self.mode("one", "exit 0")  # the person typed /exit
+        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped")
+        time.sleep(2)
+        one = self.member("One")
+        self.assertEqual((one["pane_dead"], one["state"]), ("1", "stopped"))
+        self.assertEqual(len((self.proj / "one" / "argv").read_text().splitlines()), 1)  # no restart
+        self.assertEqual(self.member("Two")["state"], "running")
         self.mode("one", "idle")
-        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once idle", secs=20)
-        self.assertEqual((self.proj / "one" / "typed").read_text(), "idle|/exit\n")
+        self.assertIn("started again", self.up("start", "One"))
+        self.wait(lambda: self.member("One")["state"] == "running", "One runs again")
+        self.assertEqual(self.member("One")["window_id"], one["window_id"])
 
-    def test_start_cancels_a_pending_stop(self):
-        self.mode("one", "ask")
-        self.up()
-        self.wait(lambda: "Do you want" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the ask")
-        self.up("stop", "One")
-        self.up("start", "One")
-        self.mode("one", "idle")
-        time.sleep(5)
-        self.assertEqual(self.member("One")["state"], "running")
-        self.assertFalse((self.proj / "one" / "typed").exists())
-
-    def test_stop_never_types_over_a_draft(self):
-        self.mode("one", "draft")
-        self.up()
-        self.wait(lambda: "git push" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the draft")
-        self.assertIn("stops when it finishes", self.up("stop", "One"))
-        time.sleep(4)
-        self.assertFalse((self.proj / "one" / "typed").exists())
-        self.mode("one", "idle")  # the person sent or cleared it: now the stop goes through
-        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once the prompt is empty", secs=20)
-
-    def test_stop_never_types_over_a_draft_that_starts_with_an_empty_line(self):
-        self.mode("one", "draft2")
-        self.up()
-        self.wait(lambda: "git push" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the draft")
-        self.assertIn("stops when it finishes", self.up("stop", "One"))
-        time.sleep(4)
-        self.assertFalse((self.proj / "one" / "typed").exists())
-
-    def test_stop_waits_for_the_agents_background_shells(self):
-        self.mode("one", "bgshell")
-        self.up()
-        self.wait(lambda: "1 shell" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the shell")
-        self.assertIn("stops when it finishes", self.up("stop", "One"))
-        time.sleep(4)
-        self.assertFalse((self.proj / "one" / "typed").exists())
-        self.mode("one", "idle")
-        self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once its shell ended", secs=20)
-
-    def test_stop_waits_while_the_hooks_say_the_agent_is_working(self):
-        import http.server
-        import threading
-        state = {"v": "working"}
-
-        class Bus(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                sid = (outer.proj / ".squad" / "state" / "One.id").read_text().strip()
-                body = json.dumps({"agents": [{"id": sid, "state": {"v": state["v"]}}]}).encode()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *a):
-                pass
-
-        outer = self
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bus)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        try:
-            self.env["TAILSHARE_BUS_PORT"] = str(srv.server_address[1])
-            self.up()
-            self.wait(lambda: (self.proj / ".squad" / "state" / "One.id").exists() and self.member("One")["resume"],
-                      "One's id")
-            self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
-            self.assertIn("stops when it finishes", self.up("stop", "One"))  # an idle screen, but the hooks say working
-            time.sleep(4)
-            self.assertFalse((self.proj / "one" / "typed").exists())
-            state["v"] = "idle"
-            self.wait(lambda: self.member("One")["state"] == "stopped", "One stopped once its hooks said idle", secs=20)
-        finally:
-            srv.shutdown()
-            srv.server_close()
-
-    def test_stop_never_types_while_a_grouped_session_client_is_active(self):
+    def test_start_after_stop_restarts_it_again(self):
         self.up()
         self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
-        subprocess.run([*self.tmux, "new-session", "-d", "-t", "=squad-test", "-s", "viewer"], check=True,
-                       env=self.env)
-        subprocess.run([*self.tmux, "select-window", "-t", "=viewer:" + self.member("One")["window_id"]], check=True)
-        client = subprocess.Popen([*self.tmux, "-C", "attach", "-t", "=viewer"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
-        try:
-            self.wait(lambda: subprocess.run([*self.tmux, "list-clients"], capture_output=True, text=True,
-                                             check=False).stdout, "a client")
-            self.assertIn("stops when it finishes", self.up("stop", "One"))
-            time.sleep(4)
-            self.assertFalse((self.proj / "one" / "typed").exists())
-        finally:
-            client.stdin.close()
-            client.wait(timeout=10)
+        self.up("stop", "One")
+        self.assertIn("auto-restart on", self.up("start", "One"))
+        self.mode("one", "exit 3")
+        self.wait(lambda: len((self.proj / "one" / "argv").read_text().splitlines()) >= 2, "One restarted", secs=20)
+
+    def test_stop_during_a_backoff_wait_ends_it_without_a_restart(self):
+        self.env["SQUAD_BACKOFF_SECS"] = "30"
+        self.mode("one", "exit 3")
+        self.up()
+        self.wait(lambda: self.member("One")["state"] == "waiting", "One waits to restart")
+        self.assertIn("stopped", self.up("stop", "One"))
+        self.wait(lambda: self.member("One")["pane_dead"] == "1", "the wait ended", secs=15)
+        self.assertEqual(self.member("One")["state"], "stopped")
+        self.assertEqual(len((self.proj / "one" / "argv").read_text().splitlines()), 1)
 
     def test_a_lock_left_without_a_pid_goes_stale(self):
         (self.proj / ".squad" / "state" / ".up.lock").mkdir(parents=True)
         self.assertIn("One: started", self.up("up", "One"))
         self.assertFalse((self.proj / ".squad" / "state" / ".up.lock").exists())
-
-    def test_stop_never_types_while_someone_is_attached_and_active(self):
-        self.up()
-        self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
-        client = subprocess.Popen([*self.tmux, "-C", "attach", "-t", "=squad-test"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
-        try:
-            self.wait(lambda: subprocess.run([*self.tmux, "list-clients"], capture_output=True, text=True, check=False).stdout,
-                      "a client")
-            self.assertIn("stops when it finishes", self.up("stop", "One"))
-            time.sleep(4)
-            self.assertFalse((self.proj / "one" / "typed").exists())
-        finally:
-            client.stdin.close()
-            client.wait(timeout=10)
 
     def test_two_quick_ups_make_one_window_per_agent(self):
         ps = [subprocess.Popen(["sh", str(ts.SCRIPT), "-C", str(self.proj), "up"], env=self.env,
@@ -378,7 +280,7 @@ class Reader(unittest.TestCase):
     def test_state_names(self):
         self.assertEqual(ts.state({"pane_dead": "1", "@state": "running"}), "exited")
         self.assertEqual(ts.state({"pane_dead": "1", "@state": "failed"}), "failed")
-        self.assertEqual(ts.state({"pane_dead": "0", "@state": "running", "@keep": "off", "@stopping": "1"}), "stopping")
+        self.assertEqual(ts.state({"pane_dead": "0", "@state": "running", "@keep": "off"}), "stopping")
         self.assertEqual(ts.state({"pane_dead": "0", "@state": "waiting"}), "waiting")
 
     def test_attention(self):
@@ -426,11 +328,11 @@ class Reader(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
-    def test_the_script_never_kills(self):
+    def test_the_script_never_kills_or_types(self):
         text = ts.SCRIPT.read_text()
         code = "\n".join(ln.split("#")[0] for ln in text.splitlines())  # comments may name what it never does
         for bad in ("kill-server", "kill-session", "kill-window", "kill-pane", "respawn-pane -k", "pkill", "killall",
-                    "kill "):
+                    "kill ", "send-keys"):
             self.assertNotIn(bad, code)
 
 
