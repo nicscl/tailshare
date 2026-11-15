@@ -68,7 +68,7 @@ The script finds the squad by walking up from the current folder, or from `-C <f
 | `@squad`, `@squad_dir` | session | squad name, project folder |
 | `@agent` | window | agent name. **Only a window with `@agent` is an agent.** |
 | `@harness`, `@cwd` | window | `claude`/`codex`, the agent's folder |
-| `@keep` | window | `on`/`off`: auto-restart |
+| `@keep` | window | `on`: auto-restart; `once`: a `once` agent, no restart; `off`: stopped by `stop` |
 | `@state` | window | `running`, `waiting` (between tries), `failed` (retry limit), `stopped` |
 | `@tries`, `@last_exit`, `@resume` | window | retry count, last exit code, session id |
 
