@@ -58,7 +58,7 @@ S=squad-$(slug "$SQUAD_NAME")
 
 agents() { awk '$1 == "agent" && !seen[$2]++ { print $2 }' "$FILE"; }
 
-# load <name>: A_HARNESS A_DIR (absolute) A_KEEP (on|off) A_ARGS for one agent line
+# load <name>: A_HARNESS A_DIR (absolute) A_KEEP (on|once) A_ARGS for one agent line
 load() {
     case "$1" in ""|*[!A-Za-z0-9._-]*) die "agent names use letters, digits, . _ - only: $1" ;; esac
     line=$(awk -v n="$1" '$1 == "agent" && $2 == n { $1 = ""; $2 = ""; print; exit }' "$FILE")
@@ -70,7 +70,7 @@ load() {
     [ $# -ge 2 ] || die "agent line needs: agent <name> <claude|codex> <folder> [keep|once] [args...]"
     A_HARNESS=$1 A_DIR=$2 A_KEEP=on
     shift 2
-    case "${1:-}" in keep) shift ;; once) A_KEEP=off; shift ;; esac
+    case "${1:-}" in keep) shift ;; once) A_KEEP=once; shift ;; esac
     A_ARGS=$*
     case "$A_HARNESS" in claude|codex) ;; *) die "harness must be claude or codex: $A_HARNESS" ;; esac
     case "$A_DIR" in /*) ;; *) A_DIR=$SQUAD_DIR/$A_DIR ;; esac

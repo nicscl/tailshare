@@ -160,6 +160,17 @@ class SquadUp(unittest.TestCase):
         self.wait(lambda: self.member("One")["state"] == "running", "One runs again")
         self.assertEqual(self.member("One")["window_id"], one["window_id"])
 
+    def test_a_once_agent_runs_as_running_and_is_not_restarted(self):
+        (self.proj / ".squad" / "squad").write_text("squad Test\nagent One claude one once\n")
+        self.up()
+        self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
+        self.assertEqual(self.member("One")["state"], "running")
+        self.assertNotIn("stops when it exits", self.up("status"))
+        self.mode("one", "exit 0")
+        self.wait(lambda: self.member("One")["state"] == "stopped", "One ended")
+        time.sleep(2)
+        self.assertEqual(len((self.proj / "one" / "argv").read_text().splitlines()), 1)
+
     def test_start_after_stop_restarts_it_again(self):
         self.up()
         self.wait(lambda: "Try" in "\n".join(ts.screen(self.member("One")["pane_id"], self.tmux)), "the prompt")
@@ -281,6 +292,7 @@ class Reader(unittest.TestCase):
         self.assertEqual(ts.state({"pane_dead": "1", "@state": "running"}), "exited")
         self.assertEqual(ts.state({"pane_dead": "1", "@state": "failed"}), "failed")
         self.assertEqual(ts.state({"pane_dead": "0", "@state": "running", "@keep": "off"}), "stopping")
+        self.assertEqual(ts.state({"pane_dead": "0", "@state": "running", "@keep": "once"}), "running")
         self.assertEqual(ts.state({"pane_dead": "0", "@state": "waiting"}), "waiting")
 
     def test_attention(self):
@@ -332,8 +344,9 @@ class Reader(unittest.TestCase):
         text = ts.SCRIPT.read_text()
         code = "\n".join(ln.split("#")[0] for ln in text.splitlines())  # comments may name what it never does
         for bad in ("kill-server", "kill-session", "kill-window", "kill-pane", "respawn-pane -k", "pkill", "killall",
-                    "kill ", "send-keys"):
+                    "kill ", "send-keys", "paste-buffer", "pasteb"):
             self.assertNotIn(bad, code)
+        self.assertNotRegex(code, r"(^|[\s;|&(])(t|tmux|\$T)\s+(-\S+\s+(\S+\s+)?)*send\b")  # tmux's own short alias
 
 
 if __name__ == "__main__":
