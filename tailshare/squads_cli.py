@@ -240,10 +240,12 @@ def _suggestion_target(ref: str, me: dict) -> dict:
     return _get(f"/squads/{sid}")
 
 
-def suggest(ref: str, ops: list, why: str, me: dict, snapshot: dict | None = None) -> dict:
+def suggest(ref: str, ops: list, why: str, me: dict, snapshot: dict | None = None, nonce: str | None = None) -> dict:
     d = snapshot if snapshot is not None else _suggestion_target(ref, me)
-    return agent.call(f"/squads/{d['squad']['id']}/suggestions",
-                      {"agent": me["id"], "base": d["version"], "why": why, "ops": ops})
+    body = {"agent": me["id"], "base": d["version"], "why": why, "ops": ops}
+    if nonce is not None:
+        body["nonce"] = nonce
+    return agent.call(f"/squads/{d['squad']['id']}/suggestions", body)
 
 
 def cmd_suggest(args):
@@ -279,7 +281,7 @@ def cmd_suggest(args):
             ops.append({"op": "set", "member": member(ref), "field": "instructions", "value": f.read()})
     for ref in args.remove:
         ops.append({"op": "remove_member", "member": member(ref)})
-    print(json.dumps(suggest(sq["id"], ops, args.why, me, snapshot), indent=2))
+    print(json.dumps(suggest(sq["id"], ops, args.why, me, snapshot, args.nonce), indent=2))
 
 
 def add_parser(sub) -> None:
@@ -310,7 +312,9 @@ def add_parser(sub) -> None:
         q = s.add_parser(command, help=f"{command} a local suggestion (in your own terminal)")
         q.add_argument("sid")
         q.set_defaults(fn=fn)
-    q = s.add_parser("suggest", help="propose changes for the owner to review")
+    q = s.add_parser("suggest", help="propose changes for the owner to review",
+                     epilog="Correcting a proposal? Pass the nonce it answered with: the new one replaces it "
+                            "(the old one can no longer be applied), and the owner sees it as a correction.")
     q.add_argument("ref", nargs="?", default="", help="squad name or id; defaults to this session's squad")
     q.add_argument("--add", action="append", default=[], metavar="FILE")
     q.add_argument("--join", metavar="NAME")
@@ -319,4 +323,5 @@ def add_parser(sub) -> None:
     q.add_argument("--set", action="append", default=[], metavar="MEMBER.FIELD=VALUE")
     q.add_argument("--instructions", action="append", nargs=2, default=[], metavar=("MEMBER", "FILE"))
     q.add_argument("--why", required=True)
+    q.add_argument("--nonce", metavar="KEY", help="intent key; reuse the earlier suggestion's to replace it (default: new)")
     q.set_defaults(fn=cmd_suggest)

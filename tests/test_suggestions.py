@@ -122,11 +122,63 @@ class Writing(Base):
         self.m.bus.store.x("UPDATE squad_suggestions SET created=0, status='pending' WHERE rowid IN "
                            "(SELECT rowid FROM squad_suggestions LIMIT 0)")
         for i in range(20):
-            self.m.bus.store.x("INSERT INTO squad_suggestions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+            self.m.bus.store.x("INSERT INTO squad_suggestions(id, owner, squad, base, created, status, why, by_, agent, ops, diff, key) "
+                               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                                suggestions.new_id(), "nick@example.com", "sq1", self.version(), time.time(), "pending", "w",
                                "{}", f"other{i}", "[]", "[]", f"k{i}")
         reg(self.m.bus, "fresh", "f", cwd="/u/projects/f")
         self.assertIn("this squad", self.refused(429, "fresh").extra["reason"])
+
+
+class Nonces(Base):
+    def sg(self, value, nonce=None, aid="pm"):
+        body = {"agent": aid, "base": self.version(), "why": "it helps",
+                "ops": [{"op": "set", "member": "m1", "field": "role", "value": value}]}
+        if nonce is not None:
+            body["nonce"] = nonce
+        return self.r("POST", "/suggestions", body)["suggestion"]
+
+    def test_the_same_nonce_replaces_the_pending_one(self):
+        a = self.sg("first")
+        self.assertRegex(a["nonce"], r"^[0-9a-f]{16}$")  # a fresh one by default
+        self.assertNotEqual(self.sg("other")["nonce"], a["nonce"])
+        b = self.sg("second", nonce=a["nonce"])
+        self.assertEqual((b["status"], b["supersedes"], b["nonce"]), ("pending", a["id"], a["nonce"]))
+        old = self.r("GET", f"/suggestions/{a['id']}")["suggestion"]
+        self.assertEqual((old["status"], old["superseded_by"], old["resolved"]["how"]), ("superseded", b["id"], "superseded"))
+        for action in ("apply", "dismiss"):
+            with self.subTest(action), self.assertRaises(bus.BusError) as c:
+                self.r("POST", f"/suggestions/{a['id']}/{action}", {"base": a["base"]}, token=TOKEN)
+            self.assertEqual((c.exception.code, str(c.exception)), (409, "not_pending"))
+        c = self.sg("third", nonce=a["nonce"])  # does not count against the 3 pending: only 2 are
+        self.assertEqual(c["supersedes"], b["id"])
+        listed = {s["id"]: s["status"] for s in self.r("GET", "/suggestions")["suggestions"]}
+        self.assertEqual([listed[x["id"]] for x in (a, b, c)], ["superseded", "superseded", "pending"])
+
+    def test_only_the_same_agent_and_a_stale_one_too(self):
+        a = self.sg("first", nonce="role-fix")
+        other = self.sg("theirs", nonce="role-fix", aid="s1")
+        self.assertIsNone(other["supersedes"])  # another agent's intent is its own
+        self.assertEqual(self.r("GET", f"/suggestions/{a['id']}")["suggestion"]["status"], "pending")
+        self.apply(other)  # a's base is now stale
+        self.assertEqual(self.r("GET", f"/suggestions/{a['id']}")["suggestion"]["status"], "stale")
+        b = self.sg("again", nonce="role-fix")
+        self.assertEqual(b["supersedes"], a["id"])
+        self.assertEqual(self.r("GET", f"/suggestions/{a['id']}")["suggestion"]["status"], "superseded")
+
+    def test_a_correction_of_an_applied_one_links_to_it(self):
+        a = self.sg("first", nonce="role-fix")
+        self.apply(a)
+        b = self.sg("fixed", nonce="role-fix")
+        self.assertEqual((b["corrects"], b["supersedes"], b["status"]), (a["id"], None, "pending"))
+        self.assertEqual(self.r("GET", f"/suggestions/{a['id']}")["suggestion"]["status"], "applied")
+        self.apply(b)
+
+    def test_a_bad_nonce(self):
+        for bad in ("", "x" * 65, "a b", 7, "é"):
+            with self.subTest(bad), self.assertRaises(bus.BusError) as c:
+                self.sg("r", nonce=bad)
+            self.assertEqual((c.exception.code, c.exception.extra.get("field")), (400, "nonce"))
 
 
 class Contract(Base):
@@ -339,6 +391,12 @@ class Cli(Base):
         self.assertEqual(sg["base"], self.version())
         self.assertIn(sg["id"], self.run_cmd("suggestions", "--json"))
 
+    def test_nonce_flag(self):
+        first = json.loads(self.run_cmd("suggest", "--set", "m1.role=one", "--why", "w"))["suggestion"]
+        second = json.loads(self.run_cmd("suggest", "--set", "m1.role=two", "--why", "w",
+                                         "--nonce", first["nonce"]))["suggestion"]
+        self.assertEqual(second["supersedes"], first["id"])
+
     def test_files_and_join(self):
         with tempfile.TemporaryDirectory() as td:
             add, instructions = td + "/member.json", td + "/instructions.txt"
@@ -384,6 +442,9 @@ class Cli(Base):
             out = json.loads(mcp._tool("squad", {"action": "suggest", "ops": ops, "why": "help"}))
             self.assertEqual(out["suggestion"]["ops"], ops)
             self.assertEqual(out["suggestion"]["status"], "pending")
+            again = json.loads(mcp._tool("squad", {"action": "suggest", "ops": [{**ops[0], "value": "MCP2"}], "why": "fix",
+                                                   "nonce": out["suggestion"]["nonce"]}))
+            self.assertEqual(again["suggestion"]["supersedes"], out["suggestion"]["id"])
             with self.assertRaises(ValueError):
                 mcp._tool("squad", {"action": "apply"})
 
