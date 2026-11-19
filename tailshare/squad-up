@@ -280,6 +280,7 @@ harness() {  # run the agent once, resuming its own session when there is one
         else
             set -- --session-id "$id"
         fi
+        set -- "$@" --name "$NAME"
         [ -f "$SQUAD_DIR/.squad/$NAME.md" ] && set -- "$@" --append-system-prompt "$(cat "$SQUAD_DIR/.squad/$NAME.md")"
         set -f
         # shellcheck disable=SC2086
@@ -318,6 +319,8 @@ cmd_run() {  # the window's own loop; started by `up`, never by hand
     T=tmux  # $TMUX names the server this window lives on
     load "$NAME"
     export_env
+    SQUAD_AGENT=$NAME
+    export SQUAD_NAME SQUAD_AGENT  # which squad and agent this is, for any tool the agent runs (tailshare's hooks)
     mkdir -p "$STATE"
     wset "$W" remain-on-exit on
     wset "$W" @agent "$NAME"
