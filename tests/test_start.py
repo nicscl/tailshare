@@ -34,6 +34,8 @@ sleep 30
 
 
 class Base(unittest.TestCase):
+    legacy = False  # True: start.json turns the old start path on (see Retired)
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="tst")).resolve()  # short: a tmux socket path must fit in sun_path
         self.state = self.tmp / "state"
@@ -73,6 +75,8 @@ class Base(unittest.TestCase):
              "kinds": {"claude": {"bin": str(self.bin / "claude"), "options": list(start.KINDS["claude"])},
                        "codex": {"bin": str(self.bin / "codex"), "options": list(start.KINDS["codex"]),
                                  "models": ["gpt-5.5"]}}}
+        if self.legacy:
+            d["legacy"] = True  # a gate in its own process ignores TAILSHARE_LEGACY_START; start.json turns it on
         d.update(kw)
         p = self.state / "start.json"
         p.write_text(json.dumps(d))
@@ -99,6 +103,53 @@ class Base(unittest.TestCase):
                 return [f.read_bytes().decode().split("\0")[:-1] for f in files]
             time.sleep(0.05)
         return []
+
+
+class Retired(Base):
+    """The old start path is off on real hosts (Nicholas, 2026-11-19) unless start.json says "legacy": true."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.dict(os.environ)
+        p.start()
+        self.addCleanup(p.stop)
+        os.environ.pop("TAILSHARE_LEGACY_START", None)
+
+    def test_off_by_default_and_on_only_with_legacy_true(self):
+        self.assertTrue(start.retired())
+        self.config(legacy="yes")
+        self.assertTrue(start.retired())
+        self.config(legacy=True)
+        self.assertFalse(start.retired())
+        (self.state / "start.json").unlink()
+        self.assertTrue(start.retired())
+
+    def test_a_bad_start_json_counts_as_retired(self):
+        self.config(legacy=True)
+        (self.state / "start.json").chmod(0o622)
+        self.assertTrue(start.retired())
+
+    def test_nothing_launches_and_devices_are_told_why(self):
+        plan = start.build(self.item(), start.load_config(), "safe", "air")
+        with self.assertRaises(start.Refused) as e:
+            start.launch(plan, 4)
+        self.assertEqual(e.exception.out["error"], "retired")
+        self.assertIn("squad-up", e.exception.out["fix"])
+        self.assertIsNone(start.capabilities())
+        self.assertEqual(start.off_reason()["error"], "retired")
+        self.assertEqual(self.argvs(wait=0.3), [])
+
+    def test_the_gate_refuses_a_start(self):
+        doc = json.dumps({"v": 1, "dry_run": True, "starts": [self.item()]}).encode()
+        with mock.patch.object(sys, "stdin", mock.Mock(buffer=mock.Mock(read=lambda n: doc))), \
+                mock.patch.object(sys, "stdout", new_callable=__import__("io").StringIO) as out:
+            self.assertEqual(start.gate("safe", KEY), 1)
+        self.assertEqual(json.loads(out.getvalue())["error"], "retired")
+
+    def test_legacy_true_brings_it_back(self):
+        self.config(legacy=True)
+        self.assertIsNotNone(start.capabilities())
+        self.assertIsNone(start.off_reason())
 
 
 class Config(Base):
@@ -723,6 +774,8 @@ class Confirm(Base):
 
 
 class Gate(Base):
+    legacy = True
+
     def run_gate(self, cmd, stdin=b"", grant="safe"):
         env = {**os.environ, "SSH_ORIGINAL_COMMAND": cmd}
         return subprocess.run([sys.executable, "-m", "tailshare", "ssh-gate", f"--start={grant}", f"--key={KEY}",
@@ -796,6 +849,8 @@ class Gate(Base):
 class OverSSH(Base):
     """The real path: ssh to a throwaway sshd on a private loopback port, with its own host key, authorized_keys and
     state dir. Not the machine's sshd, ~/.ssh or ~/.tailshare."""
+
+    legacy = True
 
     def setUp(self):
         super().setUp()

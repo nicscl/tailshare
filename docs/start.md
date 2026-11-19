@@ -1,5 +1,10 @@
 # Starting sessions from a device
 
+> **Retired (2026-11-19).** Squads now run with squad-up on plain tmux ([tmux-squads.md](tmux-squads.md)). This
+> path refuses every start (`"error": "retired"`), and keep-running, revive and launch requests are off. To bring it
+> back on one machine, add `"legacy": true` to `~/.tailshare/start.json` and restart tailshare. The code goes once
+> no machine or Hive build uses it.
+
 A device of yours (the Hive app on a phone or iPad) can start a Claude Code or Codex session on one of your
 machines, on a tmux server of its own there, and then attach to it like any other agent. It is **off** on every
 machine until that machine's own config turns it on, and it needs a separate key that a person approves.

@@ -186,7 +186,7 @@ def _nearest_harness() -> tuple[str, int]:
 
 def _codex(tid: str, cwd: str = "") -> Identity:
     # Codex has no --name: a session tailshare started is named by TAILSHARE_AGENT_NAME until it is renamed
-    title = _codex_title(tid) or os.environ.get("TAILSHARE_AGENT_NAME", "")
+    title = _codex_title(tid) or os.environ.get("TAILSHARE_AGENT_NAME", "") or os.environ.get("SQUAD_AGENT", "")
     return Identity(tid, "codex", cwd or os.getcwd(), title, _codex_pid())
 
 
@@ -235,9 +235,31 @@ def call(path: str, payload: dict | None = None, timeout: float = 15.0) -> dict:
 
 
 def squad_tag() -> dict:
-    """The squad member this session was started as, from the environment the start gate set."""
+    """The squad member this session was started as: from the environment the start gate set, or, for a squad-up
+    window (docs/tmux-squads.md), the member of squad TAILSHARE_SQUAD (an `env` line of the squad file) named
+    SQUAD_AGENT that runs on this machine."""
     sid, mid = os.environ.get("TAILSHARE_SQUAD", ""), os.environ.get("TAILSHARE_MEMBER", "")
+    if sid and not mid and os.environ.get("SQUAD_AGENT"):
+        mid = member_named(sid, os.environ["SQUAD_AGENT"])
     return {"id": sid, "member": mid} if sid and mid else {}
+
+
+def member_named(sid: str, name: str, db=None) -> str:
+    """The id of squad `sid`'s one live member called `name`, from bus.db read-only; "" if none or more than one."""
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{db or bus.STATE_DIR / 'bus.db'}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return ""
+    try:
+        rows = con.execute("SELECT id FROM squad_members WHERE squad=? AND deleted=0 "
+                           "AND json_extract(doc, '$.name')=?", (sid, name)).fetchall()
+    except sqlite3.Error:
+        return ""
+    finally:
+        con.close()
+    return rows[0][0] if len(rows) == 1 else ""
 
 
 def register(ident: Identity) -> dict:
