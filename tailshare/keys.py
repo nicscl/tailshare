@@ -12,7 +12,7 @@ security key they trust (the same ~/.tailshare/allowed_signers as launches, name
 Without one, the approval still reaches those of them where a person ran `tailshare keys trust-machine
 <this machine>`: this machine's own key signs it (docs/ssh-keys.md#machine-trust). Keys are written into a
 managed block of ~/.ssh/authorized_keys and, by default, can only run `tailshare ssh-gate`, which attaches
-to a tmux pane an agent on that machine registered.
+to a tmux pane an agent on that machine registered, or to any live pane on this account's default tmux server.
 That still lets the client type into an agent or a shell, so approving a key is approving shell-level
 access as this account; the gate only keeps the key from doing anything else (no other commands,
 no port or agent forwarding). An attached client can still run tmux commands (`run-shell`, new windows,
@@ -600,6 +600,13 @@ def own_socket(path: str) -> bool:
     return stat.S_ISSOCK(st.st_mode) and st.st_uid == os.geteuid()
 
 
+def default_socket() -> str:
+    """This account's default tmux server: where squads (squad-up) and the person's own sessions live. Every live
+    pane on it may be attached to; a pane key is already a shell key on it (an attached client can open windows)."""
+    base = os.environ.get("TMUX_TMPDIR") or "/tmp"
+    return os.path.realpath(os.path.join(base, f"tmux-{os.geteuid()}", "default"))
+
+
 def tmux_binary(registered: str) -> str:
     for c in (registered, shutil.which("tmux") or "", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
         if c and c.startswith("/") and os.path.basename(c) == "tmux" and trusted_file(c):
@@ -608,7 +615,8 @@ def tmux_binary(registered: str) -> str:
 
 
 def cmd_gate(args) -> None:
-    """Forced command of pane keys: attach to a registered agent pane, or refuse. Of start keys: start sessions."""
+    """Forced command of pane keys: attach to a registered agent pane or any pane on this account's default tmux
+    server, or refuse. Of start keys: start sessions."""
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "")
     if getattr(args, "start", ""):
         from . import start
@@ -634,9 +642,11 @@ def cmd_gate(args) -> None:
         sys.exit(1)
     req = parse_attach(cmd)
     if req is None:
-        sys.exit("tailshare ssh-gate: this key may only run `tmux -S <socket> attach -t %N` for an agent's pane")
+        sys.exit("tailshare ssh-gate: this key may only run `tmux -S <socket> attach -t %N`")
     t = next((p["tmux"] for p in panes
               if p["tmux"]["socket"] == req["socket"] and p["tmux"]["pane"] == req["pane"]), None)
+    if t is None and os.path.realpath(req["socket"]) == default_socket():
+        t = {"socket": req["socket"], "pane": req["pane"], "bin": ""}  # any live window there (GET /windows)
     if t is None:
         sys.exit(f"tailshare ssh-gate: no agent here registered pane {req['pane']} on {req['socket']}")
     binary = tmux_binary(t.get("bin") or "")

@@ -938,6 +938,19 @@ class GateEndToEnd(unittest.TestCase):
             self.assertIsInstance(cm.exception.code, str)
         self.assertEqual(self.execs, [])
 
+    def test_any_live_pane_on_the_default_server(self):
+        """Not only agents' panes: every window GET /windows lists, on this account's default server and no other."""
+        shell = subprocess.run([self.tmux, "-S", self.sock, "new-window", "-d", "-P", "-F", "#{pane_id}", "sleep 60"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        with self.assertRaises(SystemExit):  # not registered, and not the default server
+            self.gate(f"tmux -S {self.sock} attach -t {shell}")
+        with mock.patch.object(keys, "default_socket", return_value=os.path.realpath(self.sock)):
+            self.gate(f"tmux -S {self.sock} attach -t {shell}")
+            with self.assertRaises(SystemExit):  # still only a live pane
+                self.gate(f"tmux -S {self.sock} attach -t %999")
+        self.assertEqual(self.execs, [[self.tmux, "-S", self.sock, "attach", "-t", shell]])
+        self.assertTrue(keys.default_socket().endswith(f"/tmux-{os.geteuid()}/default"))
+
     def test_refuses(self):
         for cmd in ("", "id", f"tmux -S {self.sock} attach -t %999", f"tmux -S {self.sock} attach -t {self.pane} ; run-shell id",
                     f"tmux -S /tmp/elsewhere attach -t {self.pane}"):

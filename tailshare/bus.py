@@ -602,10 +602,24 @@ def _check_message(m: object) -> dict:
 # --------------------------------------------------------------------------- the mailbox
 
 
+def _pid_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class Bus:
     def __init__(self, store: Store, net: Net, port: int = BUS_PORT) -> None:
         self.store, self.net, self.port = store, net, port
         self._alive: dict[tuple[str, str], tuple[float, bool]] = {}
+        self._windows_lock = threading.Lock()
+        self._windows_cache: tuple[float, dict] | None = None
         self._pair_tokens: dict[str, dict] = {}  # one-time tokens of `tailshare hive pair` codes, in memory only
         self.kick = threading.Event()  # wakes the delivery loop
         self._peer_server: ThreadingHTTPServer | None = None
@@ -936,7 +950,7 @@ class Bus:
                 if f["cwd"]:  # the folder it works in: a squad member's folder is this absolute path
                     a["cwd"] = f["cwd"]
         out = {"v": PROTOCOL, "version": self.version(), "host": self.net.host, "agents": agents, "ssh": ssh,
-               "sessions_dead": 1}
+               "sessions_dead": 1, "windows": 1}
         if ip:
             out["you"] = {"user": u, "node": self.net.host_for_ip(ip) or ""}
             if self.squads is not None:
@@ -1108,6 +1122,40 @@ class Bus:
         if not self.net.user or self.net.user == "tagged-devices":
             raise BusError("this machine has no single tailnet owner", 403)
         return dead.listing(self.net.host)
+
+    WINDOWS_TTL = 2.0  # devices poll; tmux and ps run at most this often
+
+    def live_windows(self, ip: str = "") -> dict:
+        """GET /windows: every live window on this account's default tmux server, for the owner's devices (and this
+        machine). What a person can attach to, whether or not an agent registered it: squads, their own sessions,
+        plain shells. A window whose pane an agent registered carries that agent's address and session. Reading
+        only: tmux list-windows, capture-pane and one ps."""
+        if ip:
+            self.require_same_user(ip)
+            if not self.net.user or self.net.user == "tagged-devices":
+                raise BusError("this machine has no single tailnet owner", 403)
+        from . import keys, tmux_squads
+
+        with self._windows_lock:
+            hit = self._windows_cache
+            if hit and hit[0] > time.time() - self.WINDOWS_TTL:
+                return hit[1]
+            binary = keys.tmux_binary("")
+            rows = tmux_squads.windows([binary]) if binary else []
+            agents = {}
+            for a in self.local_agents():  # newest first: pane ids restart at %0 with the server, so the
+                t = a["tmux"] or {}         # newest registration of a pane, and only while its process lives
+                k = (os.path.realpath(t.get("socket") or ""), t.get("pane") or "")
+                if k[1] and k not in agents:
+                    agents[k] = a if _pid_alive(a["pid"]) else None
+            for r in rows:
+                a = agents.get((os.path.realpath(r["socket"]), r["pane_id"]))
+                if a:
+                    r.update(address=a["address"], session_id=a["id"], online=a["online"])
+            out = {"host": self.net.host, "login": LOGIN, "bin": binary, "at": time.time(),
+                   "socket": rows[0]["socket"] if rows else "", "windows": rows}
+            self._windows_cache = (time.time(), out)
+            return out
 
     def require_same_user(self, ip: str) -> None:
         """Only machines owned by this machine's tailnet user may update it or read its sessions."""
@@ -1410,6 +1458,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not local:
                 if (method, path) == ("GET", "/hello"):
                     return self._reply(200, b.hello(ip))
+                if (method, path) == ("GET", "/windows"):
+                    return self._reply(200, b.live_windows(ip))
                 if (method, path) == ("GET", "/sessions/dead"):
                     return self._reply(200, b.dead_sessions(ip))
                 if (method, path) == ("GET", "/sessions/start/folders"):
@@ -1448,6 +1498,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if "pid" in qs:
                     return self._reply(200, {"agent": b.by_pid(int(qs["pid"]))})
                 return self._reply(200, b.directory())
+            elif (method, path) == ("GET", "/windows"):
+                return self._reply(200, b.live_windows())
             elif (method, path) == ("GET", "/outbox"):
                 return self._reply(200, {"outbox": b.outbox()})
             elif (method, path) == ("POST", "/hive/token"):

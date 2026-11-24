@@ -31,9 +31,11 @@ PAGE_PORT = int(os.environ.get("TAILSHARE_SQUAD_PAGE_PORT", "8792"))
 ASKING = re.compile(r"do you want|would you like|\(y/n\)|\[y/n\]|press enter|(^|[\s│])(❯|›|>) *\d+\.", re.IGNORECASE)
 WORKING = re.compile(r"esc to interrupt", re.IGNORECASE)
 CHROME = re.compile(r"^[\s│╭╮╰╯─━┃┏┓┗┛>❯›⏵·•*]*$")  # borders, an empty prompt, spinners
+LABELED_RULE = re.compile(r"^[─━]{3,}.*[─━]$")  # the input box's top border, with the session's --name in it
 PROMPT = re.compile(r"^(>|❯|›)(\s|$)")  # the input line, with its placeholder text
 FOOTER = re.compile(
-    r"for shortcuts|for agents|⏵⏵|shift\+tab|bypass permissions|esc to |/effort|· ~/|^ctrl[+-]", re.IGNORECASE
+    r"for shortcuts|for agents|⏵⏵|shift\+tab|bypass permissions|esc to |/effort|· ~/|^ctrl[+-]|/restart to apply",
+    re.IGNORECASE,
 )
 
 
@@ -86,7 +88,7 @@ def last_line(lines: list[str]) -> str:
     """The last line of real output: not borders, not the empty prompt, not the footer hints."""
     for ln in reversed(lines):
         s = ln.strip().strip("│").strip()
-        if not s or CHROME.match(s) or PROMPT.match(s) or FOOTER.search(s):
+        if not s or CHROME.match(s) or LABELED_RULE.match(s) or PROMPT.match(s) or FOOTER.search(s):
             continue
         return s[:200]
     return ""
@@ -105,6 +107,97 @@ def attention(w: dict, lines: list[str]) -> str:
         if ASKING.search(tail) and not WORKING.search(tail):
             return "is asking something"
     return ""
+
+
+# --------------------------------------------------------------------------- every live window
+
+WFIELDS = (
+    "socket_path", "session_name", "session_attached", "window_id", "window_index", "window_name", "window_active",
+    "window_activity", "window_panes", "pane_id", "pane_pid", "pane_dead", "pane_dead_status", "pane_current_command",
+    "pane_current_path", "pane_title", "@squad", "@agent", "@harness", "@keep", "@state", "@tries", "@last_exit",
+)
+WFORMAT = SEP.join("#{" + f + "}" for f in WFIELDS)
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "login"}
+AGENTS = ("claude", "codex")
+GATE_SESSION = re.compile(r"tailshare-[0-9]{1,6}-[0-9]{1,10}")  # a viewing gate's own session (gate_control)
+
+
+def processes() -> tuple[dict[int, list[int]], dict[int, str]]:
+    """Every process's children and program name, from one `ps` for every window: ({ppid: [pid, ...]}, {pid: name})."""
+    kids: dict[int, list[int]] = {}
+    names: dict[int, str] = {}
+    for line in _run(["ps", "-axo", "pid=,ppid=,args="]).splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        argv = parts[2].split()
+        name = os.path.basename(argv[0]).lstrip("-") if argv else ""
+        if name in ("node", "bun", "deno") and len(argv) > 1:  # an npm-installed codex/claude runs as a script
+            name = os.path.basename(argv[1])
+        pid = int(parts[0])
+        names[pid] = name
+        kids.setdefault(int(parts[1]), []).append(pid)
+    return kids, names
+
+
+def harness_under(pid: int, procs: tuple[dict, dict], depth: int = 4) -> str:
+    """claude or codex if one is this pane's process or runs under it (its shell, a squad-up loop, an ssh...)."""
+    kids, names = procs
+    todo, seen = [(pid, 0)], {pid}
+    while todo:
+        p, d = todo.pop()
+        if names.get(p) in AGENTS:
+            return names[p]
+        if d < depth:
+            for c in kids.get(p, []):
+                if c not in seen:
+                    seen.add(c)
+                    todo.append((c, d + 1))
+    return ""
+
+
+def windows(tmux: list[str] | None = None, procs: tuple[dict, dict] | None = None, lines: bool = True) -> list[dict]:
+    """Every live window on the server (its active pane), in session then window order: what a person can attach to.
+    `kind` is claude, codex, shell or program; `last` the last line of real output; `needs` why an agent waits on a
+    person. Squad windows also carry squad, agent and their squad-up state. Gate sessions (a device viewing) and the
+    windows they link twice are left out."""
+    out = _run([*(tmux or tmux_argv()), "list-windows", "-a", "-F", WFORMAT])
+    procs = processes() if procs is None else procs
+    rows, seen = [], set()
+    for line in out.splitlines():
+        vals = line.split(SEP)
+        if len(vals) != len(WFIELDS):
+            continue
+        w = dict(zip(WFIELDS, vals, strict=True))
+        if GATE_SESSION.fullmatch(w["session_name"]) or w["window_id"] in seen:
+            continue
+        seen.add(w["window_id"])
+        squad = w["@agent"] and w["session_name"].startswith("squad-")
+        cmd = w["pane_current_command"]
+        kind = w["@harness"] if squad and w["@harness"] in AGENTS else ""
+        if not kind and w["pane_pid"].isdigit():
+            kind = harness_under(int(w["pane_pid"]), procs)
+        if not kind:
+            kind = "shell" if cmd.lstrip("-") in SHELLS else "program"
+        dead = w["pane_dead"] == "1"
+        r = {
+            "session": w["session_name"], "window_id": w["window_id"], "index": int(w["window_index"] or 0),
+            "name": w["window_name"], "active": w["window_active"] == "1",
+            "attached": int(w["session_attached"] or 0), "activity": int(w["window_activity"] or 0),
+            "panes": int(w["window_panes"] or 1), "pane_id": w["pane_id"], "command": cmd,
+            "cwd": w["pane_current_path"], "title": w["pane_title"], "kind": kind, "socket": w["socket_path"],
+            "state": state(w) if squad else ("exited" if dead else "running"),
+        }
+        if squad:
+            r.update(squad=w["@squad"] or w["session_name"][len("squad-"):], agent=w["@agent"], keep=w["@keep"],
+                     tries=w["@tries"], last_exit=w["@last_exit"])
+        screen_lines = screen(w["pane_id"], tmux) if lines and not dead else []
+        r["last"] = last_line(screen_lines)
+        r["needs"] = attention({**w, "state": r["state"], "tries": w["@tries"], "last_exit": w["@last_exit"]},
+                               screen_lines) if kind in AGENTS else ""
+        rows.append(r)
+    rows.sort(key=lambda r: (r["session"], r["index"]))
+    return rows
 
 
 def snapshot(tmux: list[str] | None = None) -> list[dict]:
