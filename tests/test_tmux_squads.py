@@ -360,6 +360,8 @@ class Reader(unittest.TestCase):
         claude = ["● Fixed it.", "◐ medium · /effort", "────", "❯\u00a0Try \"create a util\"", "────",
                   "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"]
         self.assertEqual(ts.last_line(claude), "● Fixed it.")
+        named = ["● Fixed it.", "          ✔ Update installed · /restart to apply", "──────── TailsharePM ─", "❯", "────"]
+        self.assertEqual(ts.last_line(named), "● Fixed it.")
         codex = ["• Ran the tests.", "› Ask Codex to do anything", "  GPT-6 medium · ~/Projects/x",
                  "  ← for agents · ? for shortcuts"]
         self.assertEqual(ts.last_line(codex), "• Ran the tests.")
@@ -423,6 +425,73 @@ class Reader(unittest.TestCase):
                     "kill ", "send-keys"):
             self.assertNotIn(bad, code)
 
+
+
+@unittest.skipUnless(TMUX, "needs tmux")
+class LiveWindows(unittest.TestCase):
+    """Every live window on a private tmux server: shells, programs, agents run by hand, and none of a gate's."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="tsw", dir="/tmp"))
+        self.sock = self.tmp / "s"
+        self.tmux = [TMUX, "-f", os.devnull, "-S", str(self.sock)]
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(subprocess.run, [TMUX, "-S", str(self.sock), "kill-server"], capture_output=True)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.tmp), "TERM": "xterm"}
+        t = self.tmux
+        subprocess.run([*t, "new-session", "-d", "-s", "work", "-n", "sh", "sh"], check=True, env=env)
+        subprocess.run([*t, "new-window", "-d", "-t", "work:1", "-n", "cc", "bash -c 'exec -a claude sleep 60'"],
+                       check=True, env=env)
+        subprocess.run([*t, "new-window", "-d", "-t", "work:2", "-n", "cx",
+                        "sh -c 'bash -c \"exec -a codex sleep 60\"; :'"], check=True, env=env)
+        subprocess.run([*t, "new-window", "-d", "-t", "work:3", "-n", "zz", "sleep 60"], check=True, env=env)
+        subprocess.run([*t, "new-session", "-d", "-s", "tailshare-123-456", "sleep 60"], check=True, env=env)
+        subprocess.run([*t, "link-window", "-s", "work:1", "-t", "tailshare-123-456:5"], check=True)
+
+    def rows(self):
+        end = time.time() + 10
+        while time.time() < end:
+            rows = ts.windows(self.tmux)
+            if [r["kind"] for r in rows] == ["shell", "claude", "codex", "program"]:
+                return rows
+            time.sleep(0.2)
+        self.fail(f"kinds: {[(r['name'], r['kind'], r['command']) for r in ts.windows(self.tmux)]}")
+
+    def test_every_window_once_with_its_kind_and_none_of_a_gates(self):
+        rows = self.rows()
+        self.assertEqual([(r["session"], r["index"], r["name"]) for r in rows],
+                         [("work", 0, "sh"), ("work", 1, "cc"), ("work", 2, "cx"), ("work", 3, "zz")])
+        self.assertEqual({r["socket"] for r in rows}, {str(self.sock)})
+        self.assertTrue(all(r["state"] == "running" and r["pane_id"].startswith("%") for r in rows))
+        self.assertNotIn("agent", rows[1])
+
+    def test_the_bus_answers_only_the_owners_devices_and_names_registered_panes(self):
+        from tailshare import bus
+        from tests.test_bus import StaticNet, make_bus
+
+        net = StaticNet("air", usermap={"100.1.1.1": "nick@example.com", "100.2.2.2": "eve@example.com"})
+        b = make_bus("air", net)
+        pane = self.rows()[1]["pane_id"]
+        b.register({"id": "A", "harness": "claude", "cwd": "/x/api", "pid": os.getpid(),
+                    "tmux": {"socket": str(self.sock), "pane": pane, "target": "", "bin": TMUX}})
+        b.register({"id": "B", "harness": "claude", "cwd": "/x/old", "pid": 999999,  # a dead process that had %0
+                    "tmux": {"socket": str(self.sock), "pane": self.rows()[0]["pane_id"], "target": "", "bin": TMUX}})
+        real = ts.windows
+        with unittest.mock.patch.object(ts, "windows", lambda _t: real(self.tmux)):
+            out = b.live_windows("100.1.1.1")
+            with self.assertRaises(bus.BusError):
+                b.live_windows("100.2.2.2")
+        self.assertEqual([r.get("address", "") for r in out["windows"]], ["", "air/claude/api", "", ""])
+        self.assertEqual(out["socket"], str(self.sock))
+        self.assertEqual(b.hello()["windows"], 1)
+
+    def test_the_process_tree(self):
+        procs = ({1: [2], 2: [3], 3: [4]}, {1: "zsh", 2: "bash", 3: "node", 4: "x"})
+        self.assertEqual(ts.harness_under(1, procs), "")
+        self.assertEqual(ts.harness_under(1, ({1: [2]}, {1: "zsh", 2: "codex"})), "codex")
+        self.assertEqual(ts.harness_under(7, ({}, {7: "claude"})), "claude")
+        deep = ({i: [i + 1] for i in range(1, 10)}, {9: "claude"})
+        self.assertEqual(ts.harness_under(1, deep), "")  # not past a few levels
 
 if __name__ == "__main__":
     unittest.main()

@@ -139,9 +139,12 @@ tmux -S <socket> -C attach [-r] [-f <flags>] -t %N
 
 - `<flags>` may combine `read-only`, `ignore-size`, `active-pane` and `no-output`. `ignore-size` keeps a small
   phone screen from shrinking the window on the desktop.
-- The socket and pane must have been registered by an agent on this machine. A registration lasts as long
-  as the agent's row, 30 days after it was last seen. The gate reads them from this user's database file,
-  not over the mailbox port.
+- The socket and pane must have been registered by an agent on this machine, or be on this account's default
+  tmux server (`$TMUX_TMPDIR` or `/tmp`, then `tmux-<uid>/default`, compared after resolving symlinks): every live
+  window there is one a client may attach to, as `GET /bus/v1/windows` lists them (docs/tmux-squads.md#live-windows).
+  That gives no access a pane key did not have: an attached client can open windows on the same server.
+  A registration lasts as long as the agent's row, 30 days after it was last seen. The gate reads them from this
+  user's database file, not over the mailbox port.
 - The socket must belong to this user, and the pane must still exist (`tmux display` checks it).
 - The gate then execs tmux directly, with no shell in between. It uses the registered tmux binary only if
   just this user or root can change that file.
