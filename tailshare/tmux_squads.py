@@ -54,6 +54,14 @@ def _run(argv: list[str]) -> str:
     return p.stdout if p.returncode == 0 else ""
 
 
+def _split(line: str, n: int) -> list[str]:
+    """One -F line's fields. tmux 3.5 prints the separator escaped, as the four characters \\037; later ones as is."""
+    vals = line.split(SEP)
+    if len(vals) != n:
+        vals = line.split("\\037")
+    return vals
+
+
 def state(w: dict) -> str:
     """What a person should read: running, stopping, waiting (between tries), failed, stopped, exited."""
     st = w.get("@state", "")
@@ -69,7 +77,7 @@ def discover(tmux: list[str] | None = None) -> list[dict]:
     out = _run([*(tmux or tmux_argv()), "list-windows", "-a", "-F", FORMAT])
     rows = []
     for line in out.splitlines():
-        vals = line.split(SEP)
+        vals = _split(line, len(FIELDS))
         if len(vals) != len(FIELDS):
             continue
         w = dict(zip(FIELDS, vals, strict=True))
@@ -168,7 +176,7 @@ def windows(tmux: list[str] | None = None, procs: tuple[dict, dict] | None = Non
     rows: list[dict] = []
     seen: dict[str, dict] = {}
     for line in out.splitlines():
-        vals = line.split(SEP)
+        vals = _split(line, len(WFIELDS))
         if len(vals) != len(WFIELDS):
             continue
         w = dict(zip(WFIELDS, vals, strict=True))
