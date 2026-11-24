@@ -298,7 +298,15 @@ class Export(unittest.TestCase):
         m("m_gone", "Gone", str(self.tmp / "nope"))
         tag = lambda mid: json.dumps({"id": "sq_1", "member": mid}, sort_keys=True)
         con.executemany("INSERT INTO agents VALUES(?,?,?,?)", [
-            ("old-pm", tag("m_pm"), "claude", 1), ("new-pm", tag("m_pm"), "claude", 2), ("cx-1", tag("m_cx"), "codex", 1)])
+            ("old-pm", tag("m_pm"), "claude", 1), ("new-pm", tag("m_pm"), "claude", 2), ("empty-pm", tag("m_pm"), "claude", 3),
+            ("cx-1", tag("m_cx"), "codex", 1)])
+        # empty-pm is newest but never wrote a transcript (started, then ended before any turn)
+        (self.tmp / "claude" / "projects" / "p").mkdir(parents=True)
+        for sid in ("old-pm", "new-pm"):
+            (self.tmp / "claude" / "projects" / "p" / f"{sid}.jsonl").write_text("{}\n")
+        env = unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp / "claude")})
+        env.start()
+        self.addCleanup(env.stop)
         con.commit()
         con.close()
 
