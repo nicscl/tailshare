@@ -146,7 +146,7 @@ sessions for a day or more. `/hello` says `"windows": 1` when a machine has it.
 ```json
 {"host": "macbook-air", "login": "nicholas", "bin": "/opt/homebrew/bin/tmux", "at": 1795000000.0,
  "socket": "/private/tmp/tmux-501/default",
- "windows": [{"session": "squad-tailshare", "index": 0, "name": "TailsharePM", "window_id": "@3", "pane_id": "%3",
+ "windows": [{"session": "squad-tailshare", "sessions": ["squad-tailshare"], "index": 0, "name": "TailsharePM", "window_id": "@3", "pane_id": "%3",
               "kind": "claude", "state": "running", "last": "● Merged #79.", "needs": "", "active": true,
               "attached": 1, "activity": 1795000000, "panes": 1, "command": "bash", "cwd": "/Users/nicholas/Projects/tailshare",
               "title": "…", "socket": "/private/tmp/tmux-501/default",
@@ -154,8 +154,9 @@ sessions for a day or more. `/hello` says `"windows": 1` when a machine has it.
               "address": "macbook-air/claude/tailshare/tailsharepm", "session_id": "…", "online": true}]}
 ```
 
-- One row per window (its active pane), sorted by session then window index. A viewing gate's own sessions
-  (`tailshare-<pid>-<n>`) and the windows they link a second time are left out.
+- One row per window (its active pane), sorted by session then window index. A session group (`new-session -t`)
+  shares its windows: each is listed once, `session` is the group's name and `sessions` its sessions. A viewing
+  gate's own sessions (`tailshare-<pid>-<n>`) and the windows they link a second time are left out.
 - `kind` is `claude` or `codex` when one runs in the pane's process tree (its shell, a squad-up loop), else `shell`
   or `program`. Squad windows (`squad-*` with `@agent`) use their `@harness` and carry squad, agent, keep, tries
   and last_exit; their `state` is squad-up's (running, stopping, waiting, failed, stopped, exited).

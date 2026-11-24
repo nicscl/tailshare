@@ -447,6 +447,7 @@ class LiveWindows(unittest.TestCase):
         subprocess.run([*t, "new-window", "-d", "-t", "work:3", "-n", "zz", "sleep 60"], check=True, env=env)
         subprocess.run([*t, "new-session", "-d", "-s", "tailshare-123-456", "sleep 60"], check=True, env=env)
         subprocess.run([*t, "link-window", "-s", "work:1", "-t", "tailshare-123-456:5"], check=True)
+        subprocess.run([*t, "new-session", "-d", "-t", "work", "-s", "work-2"], check=True, env=env)  # a group
 
     def rows(self):
         end = time.time() + 10
@@ -461,6 +462,7 @@ class LiveWindows(unittest.TestCase):
         rows = self.rows()
         self.assertEqual([(r["session"], r["index"], r["name"]) for r in rows],
                          [("work", 0, "sh"), ("work", 1, "cc"), ("work", 2, "cx"), ("work", 3, "zz")])
+        self.assertEqual({tuple(r["sessions"]) for r in rows}, {("work", "work-2")})
         self.assertEqual({r["socket"] for r in rows}, {str(self.sock)})
         self.assertTrue(all(r["state"] == "running" and r["pane_id"].startswith("%") for r in rows))
         self.assertNotIn("agent", rows[1])

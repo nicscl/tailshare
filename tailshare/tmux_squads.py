@@ -112,7 +112,8 @@ def attention(w: dict, lines: list[str]) -> str:
 # --------------------------------------------------------------------------- every live window
 
 WFIELDS = (
-    "socket_path", "session_name", "session_attached", "window_id", "window_index", "window_name", "window_active",
+    "socket_path", "session_name", "session_attached", "session_grouped", "session_group", "session_group_attached",
+    "window_id", "window_index", "window_name", "window_active",
     "window_activity", "window_panes", "pane_id", "pane_pid", "pane_dead", "pane_dead_status", "pane_current_command",
     "pane_current_path", "pane_title", "@squad", "@agent", "@harness", "@keep", "@state", "@tries", "@last_exit",
 )
@@ -159,19 +160,24 @@ def harness_under(pid: int, procs: tuple[dict, dict], depth: int = 4) -> str:
 def windows(tmux: list[str] | None = None, procs: tuple[dict, dict] | None = None, lines: bool = True) -> list[dict]:
     """Every live window on the server (its active pane), in session then window order: what a person can attach to.
     `kind` is claude, codex, shell or program; `last` the last line of real output; `needs` why an agent waits on a
-    person. Squad windows also carry squad, agent and their squad-up state. Gate sessions (a device viewing) and the
-    windows they link twice are left out."""
+    person. Squad windows also carry squad, agent and their squad-up state. A session group's windows are listed once,
+    under the group's name, with its sessions in `sessions`. Gate sessions (a device viewing) are left out, and so
+    are the windows they link a second time."""
     out = _run([*(tmux or tmux_argv()), "list-windows", "-a", "-F", WFORMAT])
     procs = processes() if procs is None else procs
-    rows, seen = [], set()
+    rows: list[dict] = []
+    seen: dict[str, dict] = {}
     for line in out.splitlines():
         vals = line.split(SEP)
         if len(vals) != len(WFIELDS):
             continue
         w = dict(zip(WFIELDS, vals, strict=True))
-        if GATE_SESSION.fullmatch(w["session_name"]) or w["window_id"] in seen:
+        if GATE_SESSION.fullmatch(w["session_name"]):
             continue
-        seen.add(w["window_id"])
+        if w["window_id"] in seen:  # a session group shares its windows: one row, every session named on it
+            seen[w["window_id"]]["sessions"].append(w["session_name"])
+            continue
+        group = w["session_group"] if w["session_grouped"] == "1" else ""
         squad = w["@agent"] and w["session_name"].startswith("squad-")
         cmd = w["pane_current_command"]
         kind = w["@harness"] if squad and w["@harness"] in AGENTS else ""
@@ -181,9 +187,9 @@ def windows(tmux: list[str] | None = None, procs: tuple[dict, dict] | None = Non
             kind = "shell" if cmd.lstrip("-") in SHELLS else "program"
         dead = w["pane_dead"] == "1"
         r = {
-            "session": w["session_name"], "window_id": w["window_id"], "index": int(w["window_index"] or 0),
-            "name": w["window_name"], "active": w["window_active"] == "1",
-            "attached": int(w["session_attached"] or 0), "activity": int(w["window_activity"] or 0),
+            "session": group or w["session_name"], "sessions": [w["session_name"]], "window_id": w["window_id"],
+            "index": int(w["window_index"] or 0), "name": w["window_name"], "active": w["window_active"] == "1",
+            "attached": int((w["session_group_attached"] if group else w["session_attached"]) or 0), "activity": int(w["window_activity"] or 0),
             "panes": int(w["window_panes"] or 1), "pane_id": w["pane_id"], "command": cmd,
             "cwd": w["pane_current_path"], "title": w["pane_title"], "kind": kind, "socket": w["socket_path"],
             "state": state(w) if squad else ("exited" if dead else "running"),
@@ -196,6 +202,7 @@ def windows(tmux: list[str] | None = None, procs: tuple[dict, dict] | None = Non
         r["needs"] = attention({**w, "state": r["state"], "tries": w["@tries"], "last_exit": w["@last_exit"]},
                                screen_lines) if kind in AGENTS else ""
         rows.append(r)
+        seen[w["window_id"]] = r
     rows.sort(key=lambda r: (r["session"], r["index"]))
     return rows
 
