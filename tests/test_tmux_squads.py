@@ -367,6 +367,10 @@ class Reader(unittest.TestCase):
         self.assertEqual(ts.last_line(codex), "• Ran the tests.")
         self.assertEqual(ts.last_line([]), "")
 
+    def test_fields_from_tmux_3_5_and_later(self):
+        self.assertEqual(ts._split("a\x1fb\x1fc", 3), ["a", "b", "c"])
+        self.assertEqual(ts._split("a\\037b\\037c", 3), ["a", "b", "c"])  # 3.5a escapes the separator
+
     def test_state_names(self):
         self.assertEqual(ts.state({"pane_dead": "1", "@state": "running"}), "exited")
         self.assertEqual(ts.state({"pane_dead": "1", "@state": "failed"}), "failed")
