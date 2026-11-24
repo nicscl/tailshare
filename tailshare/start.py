@@ -105,6 +105,30 @@ def config_path() -> Path:
     return bus.STATE_DIR / "start.json"
 
 
+# The old start path is retired (Nicholas, 2026-11-19): squads run on plain tmux with squad-up
+# (docs/tmux-squads.md). Start keys, keep running, revive and launches start nothing unless start.json has
+# "legacy": true (or TAILSHARE_LEGACY_START=1, which the tests set). The code stays until no host or Hive build uses it.
+RETIRED_REASON = "starting agents moved to squad-up (docs/tmux-squads.md)"
+RETIRED_FIX = ("run `.squad/squad-up up` in the squad's folder; \"legacy\": true in ~/.tailshare/start.json "
+               "brings the old path back after a restart of tailshare")
+
+
+def retired(path: Path | None = None) -> bool:
+    """Whether the old start path is off here: always, unless start.json says "legacy": true."""
+    if os.environ.get("TAILSHARE_LEGACY_START") == "1":
+        return False
+    try:
+        d = _read_raw(path or config_path())
+    except Refused:
+        return True
+    return not (d and d.get("legacy") is True)
+
+
+def refuse_retired(path: Path | None = None) -> None:
+    if retired(path):
+        raise Refused("retired", reason=RETIRED_REASON, fix=RETIRED_FIX)
+
+
 def db_path() -> Path:
     return bus.STATE_DIR / "start.db"
 
@@ -328,6 +352,8 @@ def off_reason(path: Path | None = None) -> dict | None:
     on a tagged machine or as root, where a device cannot turn it on."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return None
+    if retired(path):
+        return {"error": "retired", "reason": RETIRED_REASON, "fix": RETIRED_FIX}
     try:
         cfg = load_config(path)
     except Refused as e:
@@ -373,7 +399,9 @@ def revived(sessions: list[str], now: float | None = None) -> dict[str, dict]:
 
 
 def capabilities(path: Path | None = None, owner: str = "") -> dict | None:
-    """The /hello `start` block for the owner's devices: what this host takes, never its folders."""
+    """The /hello `start` block for the owner's devices: what this host takes, never its folders. None if retired."""
+    if retired(path):
+        return None
     try:
         cfg = load_config(path)
     except Refused:
@@ -880,6 +908,7 @@ def server_env() -> dict:
 
 
 def launch(plan: dict, max_running: int) -> dict:
+    refuse_retired()  # the one place every old start goes through: devices, keep running, revive, Codex launches
     t = _tmux_bin()
     sock = socket_for(plan["name"])
     wins = _windows(t)
@@ -1476,6 +1505,7 @@ def gate(grant: str, key: str, plan_only: bool = False) -> int:
         except (ValueError, UnicodeDecodeError):
             doc = None
         try:
+            refuse_retired()
             host, owner = machine()
         except Refused as e:
             out = {"v": 1, **e.out}

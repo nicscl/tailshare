@@ -244,6 +244,109 @@ def init(folder: Path, name: str) -> list[str]:
     return done
 
 
+# --------------------------------------------------------------------------- export (from the old squad path)
+
+_ARG = re.compile(r"[^\s'\"\\]+")  # squad-up splits args on spaces, with no quoting: values must not need it
+
+
+def member_args(kind: str, opts: dict) -> tuple[list[str], list[str]]:
+    """(squad-file args, options left out) for a member's start options, as the old start path passed them."""
+    out, left = [], []
+    flags = ({"permission_mode": "--permission-mode", "model": "--model", "effort": "--effort"} if kind == "claude"
+             else {"model": "--model", "approval": "--ask-for-approval", "sandbox": "--sandbox"})
+    for k, v in sorted((opts or {}).items()):
+        if k in flags and isinstance(v, str):
+            a = [f"{flags[k]}={v}"]
+        elif k == "effort" and kind == "codex" and isinstance(v, str):
+            a = [f"--config=model_reasoning_effort={v}"]  # a bare word: codex reads a non-TOML value as a string
+        elif k == "add_dirs" and isinstance(v, list):
+            a = [f"--add-dir={d}" for d in v if isinstance(d, str)]
+        elif k == "skip_permissions":
+            a = ([] if v is not True else ["--dangerously-skip-permissions"] if kind == "claude"
+                 else ["--dangerously-bypass-approvals-and-sandbox"])
+        else:
+            left.append(k)
+            continue
+        if all(_ARG.fullmatch(x) for x in a):
+            out += a
+        else:
+            left.append(k)
+    return out, left
+
+
+def export(squad: str, host: str, folder: Path | None = None, db: Path | None = None) -> dict:
+    """Write a squad-up folder for the members of tailshare squad `squad` (name or id) that run on `host`: the squad
+    file, each Claude member's instructions (with the reporting section the old path added) and each member's last
+    session id, so `squad-up up` resumes it. Never overwrites a squad file. Returns what it wrote and skipped."""
+    import json
+    import sqlite3
+
+    from . import bus
+    from .reports_cli import HOW
+
+    con = sqlite3.connect(f"file:{db or bus.STATE_DIR / 'bus.db'}?mode=ro", uri=True, timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        heads = [h for h in con.execute("SELECT * FROM squads WHERE deleted=0")
+                 if squad in (h["id"], json.loads(h["doc"]).get("name"))]
+        if len(heads) != 1:
+            raise ValueError(f"no single squad named {squad!r} on this machine ({len(heads)} found)")
+        h = heads[0]
+        hdoc = json.loads(h["doc"])
+        members = [{"id": m["id"], **json.loads(m["doc"])} for m in con.execute(
+            "SELECT * FROM squad_members WHERE squad=? AND owner=? AND deleted=0", (h["id"], h["owner"]))]
+        members = sorted((m for m in members if m.get("host") == host), key=lambda m: (m.get("order") or 0, m["name"]))
+        if not members:
+            raise ValueError(f"squad {hdoc.get('name')} has no member on {host}")
+        last = {}
+        for m in members:
+            tag = json.dumps({"id": h["id"], "member": m["id"]}, sort_keys=True)
+            r = con.execute("SELECT id FROM agents WHERE squad=? AND harness=? ORDER BY last_seen DESC LIMIT 1",
+                            (tag, m.get("kind") or "claude")).fetchone()
+            if r and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", r["id"] or ""):
+                last[m["name"]] = r["id"]
+    finally:
+        con.close()
+    name = re.sub(r"[^A-Za-z0-9._-]", "", hdoc.get("name") or "") or "Squad"
+    folder = folder or Path.home() / "squads" / re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    sq = folder / ".squad"
+    if (sq / "squad").exists():
+        raise ValueError(f"{sq / 'squad'} exists; edit it by hand or move it away first")
+    folder.mkdir(parents=True, exist_ok=True)
+    lines = [f"# Exported from tailshare squad {hdoc.get('name')} ({h['id']}) on {host}, "
+             f"{time.strftime('%Y-%m-%d')}: its members here. Edit by hand from now on.",
+             f"squad {name}", f"env TAILSHARE_SQUAD={h['id']}"]
+    out = {"folder": str(folder), "agents": [], "skipped": [], "left_out": {}}
+    texts = {}
+    for m in members:
+        n, kind, cwd = m["name"], m.get("kind") or "claude", m.get("folder") or ""
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", n) or kind not in ("claude", "codex") or not _ARG.fullmatch(cwd) \
+                or not os.path.isdir(cwd):
+            out["skipped"].append(n)
+            continue
+        args, left = member_args(kind, (m.get("start") or {}).get("options") or {})
+        if left:
+            out["left_out"][n] = left
+        lines.append(" ".join(["agent", n, kind, cwd, "keep", *args]))
+        instr = (m.get("instructions") or "").strip()
+        if kind == "claude":
+            texts[n] = f"{instr}\n\n{HOW}\n" if instr else HOW + "\n"
+        elif instr:
+            out["left_out"].setdefault(n, []).append("instructions (Codex: put them in the folder's AGENTS.md)")
+        out["agents"].append(n)
+    init(folder, name)  # squad-up, .gitignore; the squad file is ours, below
+    (sq / "squad").write_text("\n".join(lines) + "\n")
+    for n, t in texts.items():
+        (sq / f"{n}.md").write_text(t)
+    st = sq / "state"
+    st.mkdir(exist_ok=True)
+    for n in out["agents"]:
+        if n in last and not (st / f"{n}.id").exists():
+            (st / f"{n}.id").write_text(last[n] + "\n")
+    out["resumes"] = {n: last[n] for n in out["agents"] if n in last}
+    return out
+
+
 def cmd(args) -> None:
     import json
 
@@ -275,12 +378,28 @@ def cmd(args) -> None:
             raise SystemExit(f"tmux-squad init: {e}") from None
         for p in made:
             print(p)
+    elif args.tsq == "export":
+        from . import start
+
+        try:
+            host = args.host or start.host_name()
+            out = export(args.squad, host, Path(args.dir).expanduser().resolve() if args.dir else None)
+        except (ValueError, start.Refused) as e:
+            raise SystemExit(f"tmux-squad export: {e}") from None
+        print(f"{out['folder']}/.squad: {len(out['agents'])} agents ({', '.join(out['agents'])})")
+        for n, sid in out["resumes"].items():
+            print(f"  {n} resumes {sid}")
+        for n in out["skipped"]:
+            print(f"  skipped {n}: its name or folder does not fit a squad file, or the folder is missing")
+        for n, left in out["left_out"].items():
+            print(f"  {n}: left out {', '.join(left)}")
+        print(f"next: {out['folder']}/.squad/squad-up up")
     elif args.tsq == "script":
         print(SCRIPT)
 
 
 def add_parser(sub) -> None:
-    p = sub.add_parser("tmux-squad", help="squads on plain tmux (squad-up): list, page, init")
+    p = sub.add_parser("tmux-squad", help="squads on plain tmux (squad-up): list, page, init, export")
     s = p.add_subparsers(dest="tsq", required=True)
     ls = s.add_parser("ls", help="squad sessions and their agents on this tmux server")
     ls.add_argument("--json", action="store_true")
@@ -292,5 +411,9 @@ def add_parser(sub) -> None:
     it = s.add_parser("init", help="put squad-up and a squad file into a project folder")
     it.add_argument("folder", nargs="?", default=".")
     it.add_argument("--name")
+    ex = s.add_parser("export", help="write a squad-up folder for a tailshare squad's members on this machine")
+    ex.add_argument("squad", help="the squad's name or id")
+    ex.add_argument("--dir", help="the folder to put .squad in (default ~/squads/<name>)")
+    ex.add_argument("--host", help="this machine's tailnet name (default: asked from tailshare)")
     s.add_parser("script", help="print the path of the squad-up script")
     p.set_defaults(fn=cmd)

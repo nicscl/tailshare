@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tailshare import tmux_squads as ts
@@ -22,6 +23,7 @@ TMUX = shutil.which("tmux")
 FAKE = r"""#!/bin/bash
 d=$PWD
 printf '%s\n' "$*" >> "$d/argv"
+printf '%s %s %s\n' "$SQUAD_NAME" "$SQUAD_AGENT" "${SQUAD_TEST:-}" >> "$d/squadenv"
 if [ -f "$d/rollout" ]; then
   if [ "${1:-}" = resume ]; then id=$2; else id=$(uuidgen | tr A-Z a-z); fi
   mkdir -p "$CODEX_HOME/sessions/2026/11/12"
@@ -115,7 +117,10 @@ class SquadUp(unittest.TestCase):
         self.wait(lambda: (self.proj / "one" / "argv").exists(), "first start")
         sid = idf.read_text().strip()
         self.assertRegex(sid, r"^[0-9a-f-]{36}$")
-        self.assertEqual((self.proj / "one" / "argv").read_text().split()[:4], ["--session-id", sid, "--model", "x"])
+        self.assertEqual((self.proj / "one" / "argv").read_text().split()[:6],
+                         ["--session-id", sid, "--name", "One", "--model", "x"])
+        # which squad and agent it is, for the tools it runs (tailshare's hooks map it to the squad member)
+        self.assertEqual((self.proj / "one" / "squadenv").read_text().split(), ["Test", "One", "1"])
         self.assertEqual(self.member("One")["resume"], sid)
         (self.claude_home / "projects" / "p").mkdir(parents=True)
         (self.claude_home / "projects" / "p" / f"{sid}.jsonl").write_text("{}\n")
@@ -216,7 +221,7 @@ class SquadUp(unittest.TestCase):
         (self.proj / "one" / "zz-a-file").write_text("")
         self.up("start", "One")
         self.wait(lambda: (self.proj / "one" / "argv").exists(), "a start")
-        self.assertEqual((self.proj / "one" / "argv").read_text().split()[2:], ["--x", "*"])
+        self.assertEqual((self.proj / "one" / "argv").read_text().split()[2:], ["--name", "One", "--x", "*"])
 
     def test_up_from_inside_another_tmux_server_still_uses_the_default_server(self):
         # TMUX_TMPDIR makes a private "default" server; TMUX points at another private server, as in a pane there
@@ -263,6 +268,81 @@ class SquadUp(unittest.TestCase):
         page = ts.render(snap)
         self.assertIn("One", page)
         self.assertIn("Done: all tests pass.", page)
+
+
+class Export(unittest.TestCase):
+    """tmux-squad export: a squad-up folder from a tailshare squad's members on this machine."""
+
+    def setUp(self):
+        import json
+        import sqlite3
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="tsx"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for d in ("app", "ios"):
+            (self.tmp / d).mkdir()
+        self.db = self.tmp / "bus.db"
+        con = sqlite3.connect(self.db)
+        con.executescript("CREATE TABLE squads(owner, id, doc, deleted);"
+                          "CREATE TABLE squad_members(owner, squad, id, doc, deleted);"
+                          "CREATE TABLE agents(id, squad, harness, last_seen);")
+        con.execute("INSERT INTO squads VALUES('me', 'sq_1', ?, 0)", (json.dumps({"name": "My Squad"}),))
+        def m(mid, name, folder, host="air", kind="claude", opts=None, instr="", order=0):
+            con.execute("INSERT INTO squad_members VALUES('me', 'sq_1', ?, ?, 0)", (mid, json.dumps({
+                "name": name, "kind": kind, "host": host, "folder": folder, "order": order, "instructions": instr,
+                "start": {"options": opts or {}}})))
+        m("m_pm", "PM", str(self.tmp / "app"), instr="You lead.", opts={"model": "opus", "effort": "high"}, order=1)
+        m("m_dev", "Dev", str(self.tmp / "ios"), opts={"skip_permissions": True, "add_dirs": ["/x y"]}, order=2)
+        m("m_cx", "Cx", str(self.tmp / "ios"), kind="codex", opts={"effort": "low"}, instr="Be brief.", order=3)
+        m("m_far", "Far", str(self.tmp / "app"), host="other")
+        m("m_gone", "Gone", str(self.tmp / "nope"))
+        tag = lambda mid: json.dumps({"id": "sq_1", "member": mid}, sort_keys=True)
+        con.executemany("INSERT INTO agents VALUES(?,?,?,?)", [
+            ("old-pm", tag("m_pm"), "claude", 1), ("new-pm", tag("m_pm"), "claude", 2), ("cx-1", tag("m_cx"), "codex", 1)])
+        con.commit()
+        con.close()
+
+    def test_writes_the_squad_file_instructions_and_resume_ids(self):
+        out = ts.export("My Squad", "air", self.tmp / "sq", self.db)
+        sq = self.tmp / "sq" / ".squad"
+        lines = (sq / "squad").read_text().splitlines()
+        self.assertIn("squad MySquad", lines)
+        self.assertIn("env TAILSHARE_SQUAD=sq_1", lines)
+        self.assertIn(f"agent PM claude {self.tmp / 'app'} keep --effort=high --model=opus", lines)
+        self.assertIn(f"agent Dev claude {self.tmp / 'ios'} keep --dangerously-skip-permissions", lines)
+        self.assertIn(f'agent Cx codex {self.tmp / "ios"} keep --config=model_reasoning_effort=low', lines)
+        self.assertFalse(any(" Far " in x or " Gone " in x for x in lines))
+        self.assertEqual(out["skipped"], ["Gone"])
+        self.assertEqual(out["left_out"]["Dev"], ["add_dirs"])  # a space squad-up cannot pass
+        self.assertIn("AGENTS.md", out["left_out"]["Cx"][0])
+        pm = (sq / "PM.md").read_text()
+        self.assertTrue(pm.startswith("You lead.\n\n## Reporting"))
+        self.assertTrue((sq / "Dev.md").read_text().startswith("## Reporting"))
+        self.assertFalse((sq / "Cx.md").exists())
+        self.assertEqual((sq / "state" / "PM.id").read_text().strip(), "new-pm")
+        self.assertEqual((sq / "state" / "Cx.id").read_text().strip(), "cx-1")
+        self.assertFalse((sq / "state" / "Dev.id").exists())
+        self.assertTrue(os.access(sq / "squad-up", os.X_OK))
+
+    def test_never_overwrites_a_squad_file_and_needs_one_squad(self):
+        ts.export("sq_1", "air", self.tmp / "sq", self.db)
+        with self.assertRaises(ValueError):
+            ts.export("sq_1", "air", self.tmp / "sq", self.db)
+        with self.assertRaises(ValueError):
+            ts.export("Nope", "air", self.tmp / "sq2", self.db)
+        with self.assertRaises(ValueError):
+            ts.export("sq_1", "nohost", self.tmp / "sq3", self.db)
+
+    def test_hooks_find_the_member_by_squad_and_agent_name(self):
+        from tailshare import agent
+
+        self.assertEqual(agent.member_named("sq_1", "PM", self.db), "m_pm")
+        self.assertEqual(agent.member_named("sq_1", "Nobody", self.db), "")
+        self.assertEqual(agent.member_named("sq_1", "PM", self.tmp / "missing.db"), "")
+        with unittest.mock.patch.dict(os.environ, {"TAILSHARE_SQUAD": "sq_1", "SQUAD_AGENT": "Dev"}, clear=False), \
+                unittest.mock.patch.object(agent.bus, "STATE_DIR", self.tmp):
+            os.environ.pop("TAILSHARE_MEMBER", None)
+            self.assertEqual(agent.squad_tag(), {"id": "sq_1", "member": "m_dev"})
 
 
 class Reader(unittest.TestCase):

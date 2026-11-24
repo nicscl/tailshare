@@ -61,6 +61,24 @@ time (a lock whose owner died is taken over), and a window `up` just created cou
 
 The script finds the squad by walking up from the current folder, or from `-C <folder>`.
 
+Each agent runs with `SQUAD_NAME` and `SQUAD_AGENT` set, and Claude gets `--name <Agent>`.
+
+## Moving a squad off the old start path
+
+`tailshare tmux-squad export <squad> [--dir DIR]` writes a squad-up folder (default `~/squads/<name>`) for that
+tailshare squad's members on this machine:
+- `.squad/squad`, with `env TAILSHARE_SQUAD=<id>` and one `agent` line per member, using its folder and its start
+  options (model, effort, permission mode and so on).
+- `.squad/<Name>.md` for each Claude member: its instructions plus the reporting section the old path added.
+- `.squad/state/<Name>.id`: the member's last session, so `squad-up up` resumes it with its history.
+
+It never overwrites a squad file, and it lists anything it left out (an option squad-up cannot pass, or Codex
+instructions, which belong in the folder's AGENTS.md). With `TAILSHARE_SQUAD` set, the bus hooks match
+`SQUAD_AGENT` to the member of that name, so the agent shows up in its squad as before.
+
+The old start path is **off** since 2026-11-19 (see [start.md](start.md)): no start key, keep-running or revive
+starts anything.
+
 ## Convention (what tailshare and Hive read)
 
 | option | on | value |
@@ -120,7 +138,7 @@ cannot read it through DNS rebinding.
 
 ## Not in this step
 
-- The SSH gate and admin key.
+- The SSH gate and admin key. Until then Hive's Start, Reopen and Stop do not work; watching and typing do.
 - Hive.
 - The bus member list from tmux.
 - Per-squad own pages.

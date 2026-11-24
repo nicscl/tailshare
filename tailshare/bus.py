@@ -1235,7 +1235,7 @@ class Bus:
 
     # -- running --------------------------------------------------------------
     def _loop(self) -> None:
-        from . import keep, revive
+        from . import keep, revive, start
 
         was_online: set[str] = set()
         last_hello = last_revive = last_keep = 0.0
@@ -1265,13 +1265,17 @@ class Bus:
                     self._pruned = now
             except Exception as e:  # noqa: BLE001
                 log(f"delivery loop: {e!r}")
-            if time.time() - last_revive >= revive.CHECK:
+            try:
+                old = not start.retired()  # the old start path: off unless start.json says "legacy": true
+            except Exception:  # noqa: BLE001
+                old = False
+            if old and time.time() - last_revive >= revive.CHECK:
                 last_revive = time.time()
                 try:
                     revive.tick(self)
                 except Exception as e:  # noqa: BLE001
                     log(f"revive: {e!r}")
-            if self.keep_due or woke or back or time.time() - last_keep >= keep.CHECK:
+            if old and (self.keep_due or woke or back or time.time() - last_keep >= keep.CHECK):
                 self.keep_due = False
                 last_keep = time.time()
                 try:
@@ -1476,7 +1480,8 @@ def start_bus() -> Bus | None:
     try:  # sessions a device starts are launched here, in the user's GUI session (start.via_bus)
         from . import start as start_mod
 
-        start_mod.serve_launches()
+        if not start_mod.retired():
+            start_mod.serve_launches()
     except Exception as e:  # noqa: BLE001
         log(f"start: cannot take launches: {e!r}")
     try:
