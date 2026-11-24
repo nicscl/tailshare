@@ -274,6 +274,11 @@ def member_args(kind: str, opts: dict) -> tuple[list[str], list[str]]:
     return out, left
 
 
+def _transcript(sid: str) -> bool:
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    return any((home / "projects").glob(f"*/{sid}.jsonl"))
+
+
 def export(squad: str, host: str, folder: Path | None = None, db: Path | None = None) -> dict:
     """Write a squad-up folder for the members of tailshare squad `squad` (name or id) that run on `host`: the squad
     file, each Claude member's instructions (with the reporting section the old path added) and each member's last
@@ -301,10 +306,13 @@ def export(squad: str, host: str, folder: Path | None = None, db: Path | None = 
         last = {}
         for m in members:
             tag = json.dumps({"id": h["id"], "member": m["id"]}, sort_keys=True)
-            r = con.execute("SELECT id FROM agents WHERE squad=? AND harness=? ORDER BY last_seen DESC LIMIT 1",
-                            (tag, m.get("kind") or "claude")).fetchone()
-            if r and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", r["id"] or ""):
-                last[m["name"]] = r["id"]
+            kind = m.get("kind") or "claude"
+            for r in con.execute("SELECT id FROM agents WHERE squad=? AND harness=? ORDER BY last_seen DESC LIMIT 20",
+                                 (tag, kind)):
+                # a Claude session that never wrote a transcript cannot be resumed: take the last one that did
+                if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", r["id"] or "") and (kind != "claude" or _transcript(r["id"])):
+                    last[m["name"]] = r["id"]
+                    break
     finally:
         con.close()
     name = re.sub(r"[^A-Za-z0-9._-]", "", hdoc.get("name") or "") or "Squad"
